@@ -1,0 +1,14 @@
+{
+  "display_name": "隐填 · 私密信息收集管理",
+  "display_description": "离线邀请、端到端加密、本地 OpenVINO 复核和数据最小化报告",
+  "detail_describe": "职能部门批量生成带独立认证令牌的离线邀请，员工本地填写并加密证件信息，管理端使用任务密钥在本机解密并通过 OpenVINO OCR 复核；报告保留 employee_id/name，但不含表单敏感值。",
+  "name": "yintian-skill",
+  "icon": "",
+  "use_cases": [
+    "生成供职能人员私聊发送的个性化离线邀请并接收加密提交",
+    "用 OpenVINO 本地复核身份证附件与员工手填字段",
+    "生成保留姓名/员工号但不含表单敏感值的 XLSX/JSON 进度表"
+  ],
+  "author": "vc999999999",
+  "version": "3.1.0"
+}

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "yintian-vault": {
+      "command": "/绝对路径/yintian-skill/.venv/bin/python",
+      "args": ["/绝对路径/yintian-skill/scripts/mcp_server.py"],
+      "cwd": "/绝对路径/yintian-skill",
+      "env": {
+        "YINTIAN_OCR_DEVICE": "AUTO",
+        "YINTIAN_VAULT_DIR": "/绝对路径/隐填任务目录"
+      }
+    }
+  }
+}

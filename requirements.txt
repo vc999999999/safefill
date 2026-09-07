@@ -1,0 +1,12 @@
+# OpenVINO 本地 OCR
+rapidocr-openvino==1.4.4
+openvino==2024.0.0
+
+# 端到端加密与扫描 PDF 内存渲染
+cryptography>=42,<47
+pypdfium2>=4.30,<6
+
+# 安全状态 MCP 与脱敏报告
+mcp>=1.2,<2
+pillow>=10,<12
+openpyxl>=3.1,<4
