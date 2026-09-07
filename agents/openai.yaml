@@ -1,4 +1,4 @@
 interface:
   display_name: "隐填 · 私密信息收集管理"
   short_description: "离线加密邀请、本地复核、最小化进度报告"
-  default_prompt: "Use $yintian-skill to create or manage an end-to-end encrypted private collection without exposing passwords, decrypted values, OCR text, or attachments to the agent."
+  default_prompt: "Use $yintian-skill to create or manage an end-to-end encrypted private collection without exposing passwords, decrypted values, OCR text, or attachments to the agent. Route create/review/reveal/purge to a terminal owned by the authorized user; if asked to decrypt or handle the task password, refuse and redirect to that terminal."

@@ -13,7 +13,7 @@ compatibility: Python 3.11；依赖 requirements.txt；员工端需支持 Web Cr
 → 私聊交回 .yintian → 本地 OpenVINO 复核 → 数据最小化 XLSX/JSON
 ```
 
-先把本 `SKILL.md` 所在目录的绝对路径记为 `SKILL_ROOT`，并把该 Skill 虚拟环境中的 Python 绝对路径记为 `PYTHON`。所有脚本都用这两个绝对路径调用，不依赖当前工作目录。涉及信任边界或分享范围时，先读 `references/privacy-extraction-workflow.md`。
+先把本 `SKILL.md` 所在目录的绝对路径记为 `SKILL_ROOT`，并把该 Skill 虚拟环境中的 Python 绝对路径记为 `PYTHON`。所有脚本都用这两个绝对路径调用，不依赖当前工作目录。涉及信任边界、分享范围或加密格式时，必须先读 `references/privacy-extraction-workflow.md` 再行动。
 
 ## AI 可执行的安全操作
 
@@ -23,9 +23,12 @@ compatibility: Python 3.11；依赖 requirements.txt；员工端需支持 Web Cr
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" status TASK_DIR
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" report TASK_DIR --formats xlsx json
 "$PYTHON" "$SKILL_ROOT/scripts/benchmark.py"
+"$PYTHON" "$SKILL_ROOT/scripts/quantize_ocr.py" --out models/int8   # 可选，需 nncf
 ```
 
 通过 MCP 操作时必须先设置 `YINTIAN_VAULT_DIR`，将任务目录和收件目录限制在指定保险箱内。`report` 会保留名单中的 `employee_id` 和姓名；未经用户明确批准，不打开、上传或转发报告。
+
+用户要求解密、查看明文或索要/提供任务密码时，一律拒绝经手，并引导授权人员在自己的终端运行 `review`/`reveal`。`status` 显示任务已过期时，停止接收并建议用户在独立终端执行 `purge` 或新建任务。
 
 ## 只能由用户在 Agent 未控制、未录制的终端执行
 
@@ -49,7 +52,7 @@ compatibility: Python 3.11；依赖 requirements.txt；员工端需支持 Web Cr
 
 ## 安全边界
 
-- 员工邀请 HTML 包含任务公钥和每人独立的随机认证令牌；浏览器以 AES-256-GCM 加密字段、令牌和附件，以 RSA-OAEP-3072/SHA-256 封装数据密钥。
+- 员工邀请 HTML 包含任务公钥和每人独立的随机认证令牌；字段、令牌和附件在浏览器端加密后才导出（算法与信封格式见 `references/privacy-extraction-workflow.md`）。
 - 员工通过私聊交回 `.yintian` 密文。Skill 不提供在线接收服务。
 - AI、MCP、日志和报告不得出现表单中的手机号、身份证号、住址、OCR 原文、附件内容、任务密码或私钥；报告仍含姓名和员工编号，不是匿名数据。
 - 表单敏感值只在员工浏览器及授权人员的 `review`/`reveal` 本地内存中出现；默认不生成明文总表。
@@ -58,12 +61,11 @@ compatibility: Python 3.11；依赖 requirements.txt；员工端需支持 Web Cr
 
 ## 输入约定
 
-名单 CSV 必须包含：
+名单 CSV 必须包含 `employee_id,name` 两列：
 
 ```csv
 employee_id,name
 E001,张三
-E002,李四
 ```
 
-内置模板收集姓名、手机号、身份证号、住址和身份证正反面。自定义字段只允许确定性类型：`text`、`phone_cn`、`cn_id`、`date`、`address`、`single_choice`、`image_attachment`、`pdf_attachment`。
+涉及名单列、收集配置或自定义字段类型时，必须先读 `references/collection-config.md`，字段类型只接受该文档列出的确定性类型，不要自行发明。

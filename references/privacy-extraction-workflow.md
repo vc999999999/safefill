@@ -35,3 +35,11 @@
 - Required missing fields, invalid values, mismatched roster names, changed notice/template hashes, OCR disagreement, and low OCR confidence require review.
 - OCR never overwrites an employee-entered value automatically.
 - Decrypted image bytes and rendered PDF pages remain in memory; no plaintext temporary files are created.
+
+## Cryptography and envelope format
+
+- Invite HTML carries the task public key (RSA-OAEP-3072/SHA-256) and a per-invite random authentication token; the token is stored server-side only as a SHA-256 hash and compared in constant time.
+- The browser encrypts fields, token, and attachments with AES-256-GCM (128-bit tag); the data key is wrapped with RSA-OAEP-3072/SHA-256. The AAD binds format version, task ID, invite ID, schema hash, and key ID.
+- The envelope's `algorithms` field is validated strictly at ingest; mismatches are rejected as invalid submissions.
+- The task private key is stored encrypted with the one-time task password (PKCS#8 PBES2 via `cryptography`'s BestAvailableEncryption).
+- `.yintian-task` packages are plain ZIPs with a SHA-256 manifest: it detects transport corruption but does not authenticate malicious tampering. Export as `yintian-task/2`; legacy `yintian-task/1` packages are importable but read-only for new submissions.
