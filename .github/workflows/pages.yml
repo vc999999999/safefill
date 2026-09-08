@@ -1,0 +1,46 @@
+name: Publish workflow atlas
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - yintian-skill/assets/flowchart.html
+      - 隐填-论坛富文本.html
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/configure-pages@v5
+      - name: Prepare public pages only
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/yintian-pages"
+          cp yintian-skill/assets/flowchart.html "$RUNNER_TEMP/yintian-pages/flowchart.html"
+          cp yintian-skill/assets/flowchart.html "$RUNNER_TEMP/yintian-pages/index.html"
+          cp '隐填-论坛富文本.html' "$RUNNER_TEMP/yintian-pages/article.html"
+          touch "$RUNNER_TEMP/yintian-pages/.nojekyll"
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/yintian-pages
+      - name: Publish
+        id: deployment
+        uses: actions/deploy-pages@v4

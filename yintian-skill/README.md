@@ -2,6 +2,8 @@
 
 群里统一发模板，员工各自加密交回，授权 HR 在本地复核并整理 Excel。对应的填写者是同级目录 yintian-fill；本文件夹本身可独立安装。
 
+[双 Skill 协作全景](https://vc999999999.github.io/yintian/flowchart.html)：交互查看主流程、识别回退、数据权限和工程分工。页面源码为 assets/flowchart.html，由 GitHub Actions 发布，保持项目顶层布局不变。
+
 ## 安装
 
 在本文件夹中运行，要求 Python 3.11+：
