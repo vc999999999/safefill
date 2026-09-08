@@ -23,3 +23,8 @@ jobs:
         # 与本地 pytest 环境保持一致，避免 CI 与被测代码依赖漂移。
       - run: pip install -r requirements-dev.txt
       - run: pytest scripts/ -q
+      # 填写端 Skill：测试 import 根仓 scripts/ 需 PYTHONPATH 指向仓库根（命名空间包）
+      - name: pytest yintian-fill（填写端 Skill）
+        run: pytest yintian-fill/scripts/ -q
+        env:
+          PYTHONPATH: ${{ github.workspace }}

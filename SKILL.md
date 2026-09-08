@@ -30,22 +30,27 @@ metadata:
 "$PYTHON" "$SKILL_ROOT/scripts/cleanup.py" TASK_DIR --apply      # 实际删除孤儿临时文件、死锁和 __pycache__
 ```
 
+任务按 `create --mode` 分双模式，上述 ingest/status/report/distribute/cleanup 等命令对两模式通用：**directed 定向型**一人一独立认证令牌，邀请私聊逐人发送；**group 群发型**无令牌，全员共用同一份 `FORM.yintian-form` 表单定义，提交信封以 `GRP-<employee_id>` 标识，身份没有令牌绑定，靠复核时名单比对兜底。
+
 通过 MCP 操作时必须先设置 `YINTIAN_VAULT_DIR`，将任务目录和收件目录限制在指定保险箱内。MCP 暴露 `openvino_status`、`ingest_encrypted_submissions`、`collection_status`、`generate_redacted_report`、`verify_invites`、`list_pending_reminders` 与 `cleanup_temp_files`。`report` 会保留名单中的 `employee_id` 和姓名；未经用户明确批准，不打开、上传或转发报告。分发与催办仅处理名单级标识（姓名、工号、邀请文件名），不读取或输出密文、认证令牌或表单敏感值；分发与催办文案只含邀请单页文件名，不泄露系统物理绝对路径。
 
 用户要求解密、查看明文或索要/提供任务密码时，一律拒绝经手，并引导授权人员在自己的终端运行 `review`/`reveal`。`status` 显示任务已过期时，停止接收并建议用户在独立终端执行 `purge` 或新建任务。
 
 ## 只能由用户在 Agent 未控制、未录制的终端执行
 
-`isatty()` 只能确认终端可交互，不能证明操作者是人。Agent 不得启动、旁观或捕获下列命令。`create` 会显示一次不可恢复的任务密码；`review`/`reveal` 会读取密码或明文；`export-task` 会显示一次性交接密码，`import-task` 会交互询问交接密码：
+`isatty()` 只能确认终端可交互，不能证明操作者是人。Agent 不得启动、旁观或捕获下列命令。`create` 会显示一次不可恢复的任务密码；`review`/`reveal` 会读取密码或明文；`export-task` 会显示一次性交接密码，`import-task` 会交互询问交接密码；`export-clear` 会用 getpass 询问任务密码、要求再次输入任务 ID 确认，并生成含明文值的 XLSX 总表：
 
 ```bash
-"$PYTHON" "$SKILL_ROOT/scripts/collection.py" create --roster roster.csv --config collection.json --out tasks/
+"$PYTHON" "$SKILL_ROOT/scripts/collection.py" create --roster roster.csv --config collection.json --out tasks/ [--mode directed|group]
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" review TASK_DIR
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" reveal TASK_DIR INVITE_ID
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" purge TASK_DIR
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" export-task TASK_DIR --out task.yintian-task
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" import-task task.yintian-task --out tasks/
+"$PYTHON" "$SKILL_ROOT/scripts/collection.py" export-clear TASK_DIR --out result.xlsx --fields ... --purpose "..." --recipient "..."
 ```
+
+`export-clear` 的边界：`--fields` 白名单逐列列出要导出的字段，可用 `--mask last4|mid4` 对指定字段脱敏；`--purpose`/`--recipient` 必填，写明用途与接收方。生成的明文 Excel 只在 HR 本机落盘（0600），用完即删；Agent 不得代跑、不得经手密码、不得打开或转发产物。
 
 导出的交接包是整体加密认证的 `yintian-task/3`（scrypt 派生密钥 + AES-256-GCM，密码错误或任何篡改都会在导入时直接拒绝）。交接密码只显示一次、丢失不可恢复，必须通过另一安全渠道单独告知接收方，不得与交接包同渠道发送；任务密码绝不随交接包发送。导入端兼容旧的 `yintian-task/1`、`yintian-task/2` 明文包，但会打印"未加密、不能认证来源，仅在信任渠道下导入"的显著告警。到期清理只删除指定任务目录，外部收件、交接包、备份和磁盘残留需另行处理。
 
@@ -57,12 +62,13 @@ metadata:
 
 ## 安全边界
 
-- 员工邀请 HTML 包含任务公钥和每人独立的随机认证令牌；字段、令牌和附件在浏览器端加密后才导出（算法与信封格式见 `references/privacy-extraction-workflow.md`）。
+- 员工邀请包含任务公钥；directed 模式每份邀请内嵌每人独立的随机认证令牌，group 模式无令牌。字段、令牌和附件在浏览器端（或员工侧 yintian-fill Skill 本地）加密后才导出（算法与信封格式见 `references/privacy-extraction-workflow.md`）。
 - 任务私钥以 `yintian-key/1` 信封存储（scrypt + AES-256-GCM 包裹 PKCS#8）；任务交接包导出为整体加密认证的 `yintian-task/3`，旧版 v1/v2 明文包仅兼容导入并告警。
 - 同一邀请的提交版本数有上限（默认 10，可用 `YINTIAN_MAX_VERSIONS_PER_INVITE` 调整），超限提交直接拒绝存储，不影响已有版本。
 - 员工通过私聊交回 `.yintian` 密文。Skill 不提供在线接收服务。
 - AI、MCP、日志和报告不得出现表单中的手机号、身份证号、住址、OCR 原文、附件内容、任务密码或私钥；报告仍含姓名和员工编号，不是匿名数据。
-- 表单敏感值只在员工浏览器及授权人员的 `review`/`reveal` 本地内存中出现；默认不生成明文总表。
+- 表单敏感值只在员工浏览器及授权人员的 `review`/`reveal` 本地内存中出现；默认不生成明文总表。唯一例外是 `export-clear`：职能接收方是授权数据终点，明文 XLSX 只在 HR 本机落盘（0600）并附显著明文警告；系统无法管控文件落盘后的传播，这一点必须如实向用户声明。
+- 填写端另有独立的 yintian-fill Skill（员工侧）：读取 `yintian-form/1` JSON 离线填写加密，产出同构 `.yintian` 信封；明文只在员工本机出现。
 - 任务到达保存期限后停止 ingest、review、report、export 和 reveal；用户通过任务 ID 二次确认删除任务目录。
 
 ## 输入约定

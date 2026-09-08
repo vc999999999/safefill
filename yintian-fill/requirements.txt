@@ -1,0 +1,7 @@
+# 端到端加密（钉版与收集端一致）
+cryptography>=50,<51
+
+# 可选：scan-idcard 本地 OCR（不安装不影响 inspect/seal）
+# rapidocr-openvino 1.4.4 自身钉 openvino<=2024.0.0，二者必须保持一致
+# rapidocr-openvino==1.4.4
+# openvino==2024.0.0

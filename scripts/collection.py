@@ -28,6 +28,10 @@ LEGACY_TASK_PACKAGE_VERSION = "yintian-task/1"
 TASK_PACKAGE_VERSION = "yintian-task/2"
 ENCRYPTED_TASK_PACKAGE_VERSION = "yintian-task/3"
 KEY_ENVELOPE_VERSION = "yintian-key/1"
+FORM_FORMAT_VERSION = "yintian-form/1"
+GROUP_INVITE_PREFIX = "GRP-"
+TASK_MODES = {"directed", "group"}
+MASK_RULES = {"last4", "mid4"}
 LEGACY_KEY_PEM_PREFIX = b"-----BEGIN ENCRYPTED PRIVATE KEY-----"
 SCRYPT_N = 2**15
 SCRYPT_R = 8
@@ -192,6 +196,8 @@ def load_task(task_dir: str | Path) -> tuple[Path, dict[str, Any]]:
         raise ValueError("task.json 中的 task_id 无效")
     if task.get("format_version") not in {LEGACY_FORMAT_VERSION, FORMAT_VERSION}:
         raise ValueError("任务格式版本不受支持")
+    if task.get("mode", "directed") not in TASK_MODES:
+        raise ValueError("task.json 中的 mode 无效")
     required = ("key_id", "title", "purpose", "deadline", "retention_until", "contact", "correction", "template_version", "schema_hash", "notice_hash", "fields")
     if any(key not in task for key in required) or not isinstance(task["fields"], list):
         raise ValueError("task.json 缺少必要配置")
@@ -208,6 +214,24 @@ def load_task(task_dir: str | Path) -> tuple[Path, dict[str, Any]]:
 def require_current_format(task: dict[str, Any], action: str) -> None:
     if task["format_version"] != FORMAT_VERSION:
         raise RuntimeError(f"旧版任务不支持{action}；请新建 v2 任务继续收集")
+
+
+def task_mode(task: dict[str, Any]) -> str:
+    """任务模式只从本地 task.json 读取（load_task 已校验取值），提交信封与载荷无法伪造。"""
+    return task.get("mode", "directed")
+
+
+def group_invite_id(employee_id: str) -> str:
+    return GROUP_INVITE_PREFIX + employee_id
+
+
+def parse_group_employee_id(invite_id: str) -> str:
+    if not invite_id.startswith(GROUP_INVITE_PREFIX):
+        raise ValueError("group 提交的 invite_id 必须以 GRP- 开头")
+    employee_id = invite_id[len(GROUP_INVITE_PREFIX):]
+    if not employee_id or employee_id != employee_id.strip() or len(employee_id) > 128 or any(ord(char) < 0x20 for char in employee_id):
+        raise ValueError("group 提交的 invite_id 格式无效")
+    return employee_id
 
 
 @contextmanager
@@ -298,7 +322,9 @@ def default_config() -> dict[str, Any]:
     }
 
 
-def validate_config(config: dict[str, Any]) -> dict[str, Any]:
+def validate_config(config: dict[str, Any], mode: str = "directed") -> dict[str, Any]:
+    if mode not in TASK_MODES:
+        raise ValueError("mode 必须是 directed 或 group")
     for key in ("title", "purpose", "deadline", "retention_until", "contact", "correction", "template_version", "fields"):
         if not config.get(key):
             raise ValueError(f"配置缺少必填项: {key}")
@@ -332,6 +358,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         seen.add(field_id)
     if "name" not in seen:
         raise ValueError("任务字段必须包含 id=name 的姓名字段")
+    if mode == "group" and "employee_id" not in seen:
+        raise ValueError("group 模式任务字段必须包含 id=employee_id 的工号字段（无令牌模式下身份靠工号+姓名与名单比对）")
     result = dict(config)
     result["fields"] = fields
     return result
@@ -464,10 +492,13 @@ def cmd_init_config(args) -> dict[str, Any]:
     return {"config": str(out.resolve())}
 
 
-def create_task(roster_path: Path, config_path: Path, out_parent: Path, password: str, require_terminal: bool = True) -> dict[str, Any]:
+def create_task(roster_path: Path, config_path: Path, out_parent: Path, password: str, require_terminal: bool = True, mode: str = "directed") -> dict[str, Any]:
     if require_terminal:
         require_tty("create")
-    config = validate_config(load_json(config_path))
+    if mode == "group":
+        print("风险提示：group 群发模式没有个人认证令牌，任何拿到表单的人都可以冒名为任何工号提交；"
+              "身份仅靠复核时名单比对（工号+姓名）标记并由人工兜底，高敏感场景请改用 directed 模式。", file=sys.stderr)
+    config = validate_config(load_json(config_path), mode=mode)
     roster = read_roster(roster_path)
     task_id = "YT-" + datetime.now().strftime("%Y%m%d") + "-" + random_id("", 6)
     root = out_parent.expanduser().resolve() / task_id
@@ -484,6 +515,7 @@ def create_task(roster_path: Path, config_path: Path, out_parent: Path, password
     notice_hash = sha256_bytes(canonical(notice))
     task = {
         "format_version": FORMAT_VERSION,
+        "mode": mode,
         "task_id": task_id,
         "key_id": key_id,
         "title": config["title"],
@@ -503,18 +535,28 @@ def create_task(roster_path: Path, config_path: Path, out_parent: Path, password
     atomic_write(root / "private.pem.enc", private_pem)
     atomic_write(root / "roster.csv", roster_path.read_bytes())
 
-    template = (Path(__file__).resolve().parents[1] / "assets" / "invite_template.html").read_text(encoding="utf-8")
     db_rows, index_rows = [], []
-    for item in roster:
-        invite_id = random_id("INV-", 10)
-        invite_token = secrets.token_urlsafe(32)
-        invite_name = invite_id + ".html"
-        invite_config = dict(task)
-        invite_config.update({"invite_id": invite_id, "invite_token": invite_token, "name": item["name"], "public_key_pem": public_pem.decode("ascii")})
-        atomic_write(root / "invites" / invite_name, render_invite(template, invite_config).encode("utf-8"))
-        created_at = now_iso()
-        db_rows.append({**item, "invite_id": invite_id, "token_hash": sha256_bytes(invite_token.encode()), "created_at": created_at})
-        index_rows.append({**item, "invite_id": invite_id, "invite_file": f"invites/{invite_name}"})
+    if mode == "group":
+        form = {"format": FORM_FORMAT_VERSION, **task, "public_key_pem": public_pem.decode("ascii")}
+        dump_json(root / "FORM.yintian-form", form)
+        for item in roster:
+            invite_id = group_invite_id(item["employee_id"])
+            parse_group_employee_id(invite_id)  # 创建期闭环校验：名单工号必须能构成合法的 GRP- 标识
+            db_rows.append({**item, "invite_id": invite_id, "token_hash": sha256_bytes(secrets.token_bytes(32)), "created_at": now_iso()})
+            index_rows.append({**item, "invite_id": invite_id, "invite_file": "FORM.yintian-form"})
+    else:
+        template = (Path(__file__).resolve().parents[1] / "assets" / "invite_template.html").read_text(encoding="utf-8")
+        for item in roster:
+            invite_id = random_id("INV-", 10)
+            invite_token = secrets.token_urlsafe(32)
+            invite_name = invite_id + ".html"
+            invite_config = dict(task)
+            invite_config.update({"invite_id": invite_id, "invite_token": invite_token, "name": item["name"], "public_key_pem": public_pem.decode("ascii")})
+            atomic_write(root / "invites" / invite_name, render_invite(template, invite_config).encode("utf-8"))
+            dump_json(root / "invites" / (invite_id + ".yintian-form"), {"format": FORM_FORMAT_VERSION, **invite_config})
+            created_at = now_iso()
+            db_rows.append({**item, "invite_id": invite_id, "token_hash": sha256_bytes(invite_token.encode()), "created_at": created_at})
+            index_rows.append({**item, "invite_id": invite_id, "invite_file": f"invites/{invite_name}"})
     index_path = root / "invite-index.csv"
     index_buffer = io.StringIO()
     writer = csv.DictWriter(index_buffer, fieldnames=["employee_id", "name", "invite_id", "invite_file"])
@@ -528,7 +570,7 @@ def create_task(roster_path: Path, config_path: Path, out_parent: Path, password
 def cmd_create(args) -> dict[str, Any]:
     require_tty("create")
     password = generate_password()
-    result = create_task(Path(args.roster), Path(args.config), Path(args.out), password, require_terminal=False)
+    result = create_task(Path(args.roster), Path(args.config), Path(args.out), password, require_terminal=False, mode=getattr(args, "mode", "directed"))
     print_once_secret("任务密码（仅显示一次，丢失不可恢复）：", password, "请通过独立安全渠道交给授权处理人员，不要写入任务目录或聊天提示词。")
     return result
 
@@ -544,7 +586,9 @@ def validate_envelope_header(envelope: dict[str, Any], task: dict[str, Any]) -> 
     if envelope["schema_hash"] != task["schema_hash"] or envelope["key_id"] != task["key_id"]:
         raise ValueError("提交包字段模板或公钥不匹配")
     invite_id = envelope["invite_id"]
-    if not INVITE_ID_RE.fullmatch(invite_id):
+    if task_mode(task) == "group":
+        parse_group_employee_id(invite_id)
+    elif not INVITE_ID_RE.fullmatch(invite_id):
         raise ValueError("invite_id 格式无效")
     for key in ("encrypted_key_b64", "iv_b64", "ciphertext_b64"):
         base64.b64decode(envelope[key], validate=True)
@@ -662,7 +706,7 @@ def validate_payload(task: dict[str, Any], invite: sqlite3.Row, payload: dict[st
     if payload.get("consent_confirmed") is not True:
         conflicts.append("consent")
     token = payload.get("invite_token", "")
-    if not isinstance(token, str) or not secrets.compare_digest(sha256_bytes(token.encode()), invite["token_hash"]):
+    if task_mode(task) == "directed" and (not isinstance(token, str) or not secrets.compare_digest(sha256_bytes(token.encode()), invite["token_hash"])):
         raise ValueError("邀请认证令牌无效")
     if normalize_submitted_at(payload.get("submitted_at")) is None:
         conflicts.append("submitted_at")
@@ -717,6 +761,8 @@ def validate_payload(task: dict[str, Any], invite: sqlite3.Row, payload: dict[st
         raise ValueError("附件总大小超过 15MB")
     if normalize_value("text", values.get("name", "")) != invite["name"]:
         conflicts.append("name_roster_mismatch")
+    if task_mode(task) == "group" and normalize_value("text", values.get("employee_id", "")) != invite["employee_id"]:
+        conflicts.append("employee_id_roster_mismatch")
     return sorted(set(missing)), sorted(set(conflicts)), attachment_items
 
 
@@ -981,6 +1027,149 @@ def cmd_reveal(args) -> dict[str, Any] | None:
     return None
 
 
+def parse_export_fields(task: dict[str, Any], raw_fields: str | None) -> list[str]:
+    if not raw_fields or not raw_fields.strip():
+        raise ValueError("必须用 --fields 显式声明导出字段白名单（逗号分隔的字段 id）")
+    field_defs = {field["id"]: field for field in task["fields"]}
+    field_ids = []
+    for part in raw_fields.split(","):
+        field_id = part.strip()
+        if not field_id or field_id in {"employee_id", "name"}:
+            continue  # employee_id/name 默认附带，无需在白名单中重复声明
+        field = field_defs.get(field_id)
+        if field is None:
+            raise ValueError(f"导出字段不在任务字段中: {field_id}")
+        if field["type"] in ATTACHMENT_TYPES:
+            raise ValueError(f"附件字段不支持明文导出: {field_id}")
+        if field_id in field_ids:
+            raise ValueError(f"导出字段重复: {field_id}")
+        field_ids.append(field_id)
+    if not field_ids:
+        raise ValueError("导出字段白名单为空（employee_id/name 默认附带，无需声明）")
+    return field_ids
+
+
+def parse_mask_specs(specs: list[str] | None) -> dict[str, str]:
+    masks = {}
+    for spec in specs or []:
+        field_id, sep, rule = spec.partition("=")
+        field_id, rule = field_id.strip(), rule.strip()
+        if not sep or not FIELD_ID_RE.fullmatch(field_id) or rule not in MASK_RULES:
+            raise ValueError(f"脱敏规则无效（应为 字段id=last4|mid4）: {spec}")
+        masks[field_id] = rule
+    return masks
+
+
+def mask_value(rule: str, value: Any) -> str:
+    text = str(value)
+    if rule == "last4":
+        return "*" * (len(text) - 4) + text[-4:] if len(text) > 4 else "*" * len(text)
+    if rule == "mid4":
+        return text[:3] + "****" + text[-4:] if len(text) > 7 else "*" * len(text)
+    raise ValueError(f"不支持的脱敏规则: {rule}")
+
+
+def collect_clear_rows(root: Path, task: dict[str, Any], private_key, field_ids: list[str], masks: dict[str, str]) -> list[dict[str, str]]:
+    """内存解密全部 current+valid 提交（与 review 相同的解密/校验路径），只保留白名单字段。"""
+    field_defs = {field["id"]: field for field in task["fields"]}
+    with closing(connect_db(root)) as db, db:
+        rows = db.execute(
+            "SELECT s.*,i.employee_id,i.name,i.token_hash FROM submissions s JOIN invites i ON i.invite_id=s.invite_id WHERE s.id=i.current_submission_id AND s.status IN ('verified','needs_review') ORDER BY i.employee_id"
+        ).fetchall()
+    output = []
+    for row in rows:
+        payload = decrypt_envelope(root, task, root / row["path"], private_key, row["invite_id"])
+        validate_payload(task, row, payload)  # 导出前再跑一次完整校验，密文任何损坏都直接中止
+        values = payload.get("values", {})
+        record = {}
+        for column, raw in (("employee_id", row["employee_id"]), ("name", row["name"])):
+            rule = masks.get(column)
+            record[column] = mask_value(rule, raw) if rule and raw else raw
+        for field_id in field_ids:
+            value = normalize_value(field_defs[field_id]["type"], values.get(field_id, ""))
+            rule = masks.get(field_id)
+            record[field_id] = mask_value(rule, value) if rule and value else value
+        output.append(record)
+    return output
+
+
+def write_clear_export(root: Path, task: dict[str, Any], rows: list[dict[str, str]], field_ids: list[str], masks: dict[str, str],
+                       out: str | Path, formats: list[str], purpose: str, recipient: str) -> dict[str, str]:
+    """把已解密的明文行落盘为 XLSX/JSON（0600，字符串单元格防公式注入）；不产出任何加密出口信封。"""
+    unknown = set(formats) - {"xlsx", "json"}
+    if unknown:
+        raise ValueError(f"不支持的导出格式: {sorted(unknown)}")
+    requested_out = Path(out).expanduser()
+    if requested_out.is_symlink():
+        raise ValueError("导出路径不能是符号链接")
+    out_path = requested_out.resolve()
+    if out_path == root or root in out_path.parents:
+        raise ValueError("导出路径不能位于任务目录内")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    columns = ["employee_id", "name"] + field_ids
+    written = {}
+    if "json" in formats:
+        path = out_path.with_suffix(".json")
+        dump_json(path, {"task_id": task["task_id"], "exported_at": now_iso(), "purpose": purpose, "recipient": recipient, "fields": columns, "masks": masks, "rows": rows})
+        os.chmod(path, 0o600)
+        written["json"] = str(path)
+    if "xlsx" in formats:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+
+        path = out_path.with_suffix(".xlsx")
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "明文导出"
+        sheet.append(columns)
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+        for row_index, record in enumerate(rows, start=2):
+            for column_index, key in enumerate(columns, start=1):
+                cell = sheet.cell(row_index, column_index, str(record.get(key, "")))
+                cell.data_type = "s"
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        workbook.save(path)
+        os.chmod(path, 0o600)
+        written["xlsx"] = str(path)
+    return written
+
+
+def cmd_export_clear(args) -> dict[str, Any]:
+    require_tty("export-clear")
+    root, task = load_task(args.task_dir)
+    require_current_format(task, "明文导出")
+    if task_expired(task):
+        raise RuntimeError("任务已超过保存期限，禁止明文导出；请执行清理")
+    field_ids = parse_export_fields(task, getattr(args, "fields", None))
+    masks = parse_mask_specs(getattr(args, "mask", None))
+    unknown_mask = set(masks) - ({"employee_id", "name"} | set(field_ids))
+    if unknown_mask:
+        raise ValueError(f"脱敏规则指向未导出的字段: {sorted(unknown_mask)}")
+    formats = sorted({part.strip().lower() for value in (args.formats or ["xlsx"]) for part in value.split(",") if part.strip()})
+    password = getpass.getpass("任务密码: ")
+    try:
+        private_key = unlock_private_key(root, password)
+    except Exception as exc:
+        raise RuntimeError("任务密码错误或私钥损坏") from exc
+    rows = collect_clear_rows(root, task, private_key, field_ids, masks)
+    purpose, recipient = (getattr(args, "purpose", "") or "").strip(), (getattr(args, "recipient", "") or "").strip()
+    print("\n=== 明文导出确认 ===")
+    print(f"任务: {task['task_id']}（{task['title']}）")
+    print(f"导出字段: {', '.join(['employee_id', 'name'] + field_ids)}")
+    print(f"脱敏规则: {', '.join(f'{key}={rule}' for key, rule in sorted(masks.items())) or '无（白名单字段全部明文）'}")
+    print(f"数据行数: {len(rows)}")
+    print(f"用途: {purpose or '（未填写）'}")
+    print(f"接收方: {recipient or '（未填写）'}")
+    typed = input(f"输入任务 ID {task['task_id']} 以确认导出明文: ").strip()
+    if typed != task["task_id"]:
+        raise RuntimeError("任务 ID 不匹配，已取消导出")
+    written = write_clear_export(root, task, rows, field_ids, masks, args.out, formats, purpose, recipient)
+    print("警告：明文已落盘，用后请删除，系统无法管控后续传播。", file=sys.stderr)
+    return {"task_id": task["task_id"], "rows": len(rows), **written}
+
+
 def build_task_package(task_dir: str | Path) -> tuple[bytes, dict[str, Any]]:
     """在内存中构建任务交接 ZIP（明文，含名单标识），供加密导出或测试复用。"""
     root, task = load_task(task_dir)
@@ -1226,7 +1415,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("init-config", help="生成基础身份信息收集配置")
     p.add_argument("--out", required=True); p.add_argument("--force", action="store_true"); p.set_defaults(func=cmd_init_config)
     p = sub.add_parser("create", help="创建任务并批量生成离线邀请")
-    p.add_argument("--roster", required=True); p.add_argument("--config", required=True); p.add_argument("--out", required=True); p.set_defaults(func=cmd_create)
+    p.add_argument("--roster", required=True); p.add_argument("--config", required=True); p.add_argument("--out", required=True)
+    p.add_argument("--mode", choices=["directed", "group"], default="directed", help="directed 逐人定向邀请（默认）；group 单份表单群发、无个人令牌，可冒名提交，仅靠复核名单比对兜底")
+    p.set_defaults(func=cmd_create)
     p = sub.add_parser("ingest", help="接收 .yintian 密文提交")
     p.add_argument("task_dir"); p.add_argument("submissions_dir"); p.set_defaults(func=cmd_ingest)
     p = sub.add_parser("review", help="本地解密、校验和 OpenVINO OCR 复核")
@@ -1243,6 +1434,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("package"); p.add_argument("--out", required=True); p.set_defaults(func=cmd_import)
     p = sub.add_parser("purge", help="删除任务目录；不保证擦除备份或磁盘残留")
     p.add_argument("task_dir"); p.add_argument("--allow-early", action="store_true"); p.set_defaults(func=cmd_purge)
+    p = sub.add_parser(
+        "export-clear",
+        help="【仅限人类授权操作员在本人终端运行，禁止 Agent 代跑】把白名单字段的当前有效提交解密导出为明文 XLSX/JSON（需任务密码并输入任务 ID 二次确认）",
+        description="仅限人类授权操作员在本人交互终端运行，禁止 Agent 代跑或旁观。明文导出是最后一道出口：只导出 --fields 白名单字段（name/employee_id 默认附带），落盘 0600，系统无法管控后续传播。",
+    )
+    p.add_argument("task_dir")
+    p.add_argument("--out", required=True, help="导出文件路径（多格式时按后缀派生同名 .xlsx/.json）")
+    p.add_argument("--fields", required=True, help="逗号分隔的导出字段 id 白名单，仅限非附件字段；name/employee_id 默认附带")
+    p.add_argument("--mask", action="append", default=[], metavar="字段id=规则", help="脱敏规则 last4（保留后四位）或 mid4（保留前3后4），可重复；未声明字段明文导出")
+    p.add_argument("--purpose", default="", help="本次明文导出的用途，回显确认并写入 JSON 元数据")
+    p.add_argument("--recipient", default="", help="明文接收方，回显确认并写入 JSON 元数据")
+    p.add_argument("--formats", nargs="+", default=["xlsx"], help="导出格式：xlsx、json（默认 xlsx）")
+    p.set_defaults(func=cmd_export_clear)
     return parser
 
 

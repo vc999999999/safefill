@@ -1,0 +1,14 @@
+{
+  "display_name": "隐填 · 填写端",
+  "display_description": "员工本机填写需求格式文件、遮罩证件扫描候选、加密产出 .yintian 密文",
+  "detail_describe": "员工在自己电脑上由 AI 协助完成隐填收集：inspect 核对任务编号与公钥指纹，scan-idcard 本地 OCR 给出遮罩候选，seal 按与浏览器邀请页字节级同构的信封格式本机加密；明文不出本机，只交回 .yintian 密文。",
+  "name": "yintian-fill",
+  "icon": "",
+  "use_cases": [
+    "收到 yintian-form 需求格式文件后先 inspect 核对任务编号、告知内容与公钥指纹",
+    "用 scan-idcard 本地 OCR 提取遮罩候选并自行确认后写入 values.json",
+    "用 seal 本机加密产出与浏览器邀请页同构的 .yintian 密文并私聊交回"
+  ],
+  "author": "vc999999999",
+  "version": "1.0.0"
+}

@@ -39,11 +39,28 @@ def invite_token(task_dir: Path, invite_id: str) -> str:
     return json.loads(html.split(marker, 1)[1].split("</script>", 1)[0])["invite_token"]
 
 
-def make_envelope(task_dir: Path, invite_id: str, values: dict, attachments: dict | None = None, overrides: dict | None = None) -> dict:
+def wrap_payload(task_dir: Path, invite_id: str, payload: dict) -> dict:
+    """把载荷按 yintian-submission/2 加密成信封（RSA-OAEP 包裹随机 AES-256 密钥，AAD 绑定信封头）。"""
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+    task = collection.load_json(task_dir / "task.json")
+    aes = AESGCM.generate_key(bit_length=256)
+    iv = bytes(range(12))
+    envelope = {
+        "format_version": task["format_version"], "task_id": task["task_id"], "invite_id": invite_id,
+        "schema_hash": task["schema_hash"], "key_id": task["key_id"],
+        "algorithms": {"content": "AES-256-GCM", "key_wrap": "RSA-OAEP-3072-SHA256"},
+    }
+    public = serialization.load_pem_public_key((task_dir / "public.pem").read_bytes())
+    wrapped = public.encrypt(aes, padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+    ciphertext = AESGCM(aes).encrypt(iv, json.dumps(payload, ensure_ascii=False).encode(), collection.aad_for(envelope))
+    envelope.update(encrypted_key_b64=base64.b64encode(wrapped).decode(), iv_b64=base64.b64encode(iv).decode(), ciphertext_b64=base64.b64encode(ciphertext).decode())
+    return envelope
+
+
+def make_envelope(task_dir: Path, invite_id: str, values: dict, attachments: dict | None = None, overrides: dict | None = None) -> dict:
     task = collection.load_json(task_dir / "task.json")
     payload = {
         "format_version": task["format_version"],
@@ -60,18 +77,7 @@ def make_envelope(task_dir: Path, invite_id: str, values: dict, attachments: dic
     }
     if overrides:
         payload.update(overrides)
-    aes = AESGCM.generate_key(bit_length=256)
-    iv = bytes(range(12))
-    envelope = {
-        "format_version": task["format_version"], "task_id": task["task_id"], "invite_id": invite_id,
-        "schema_hash": task["schema_hash"], "key_id": task["key_id"],
-        "algorithms": {"content": "AES-256-GCM", "key_wrap": "RSA-OAEP-3072-SHA256"},
-    }
-    public = serialization.load_pem_public_key((task_dir / "public.pem").read_bytes())
-    wrapped = public.encrypt(aes, padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
-    ciphertext = AESGCM(aes).encrypt(iv, json.dumps(payload, ensure_ascii=False).encode(), collection.aad_for(envelope))
-    envelope.update(encrypted_key_b64=base64.b64encode(wrapped).decode(), iv_b64=base64.b64encode(iv).decode(), ciphertext_b64=base64.b64encode(ciphertext).decode())
-    return envelope
+    return wrap_payload(task_dir, invite_id, payload)
 
 
 def make_scenario(tmp: Path) -> types.SimpleNamespace:
@@ -893,6 +899,267 @@ def test_imported_task_dir_permissions(tmp_path: Path) -> None:
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
     for sub in ("invites", "submissions", "reports", f"submissions/{ns.invite_id}"):
         assert stat.S_IMODE((root / sub).stat().st_mode) == 0o700, sub
+
+
+def make_group_scenario(tmp: Path) -> types.SimpleNamespace:
+    """创建 group 模式任务（无令牌、单份 FORM.yintian-form、E001/E002 两名员工），返回常用路径与常量。"""
+    config = collection.default_config()
+    config["purpose"] = "为依法办理员工商业保险收集必要身份资料"
+    config["contact"] = "人事部王老师，内线 8001"
+    config["correction"] = "在截止日前联系人事部王老师撤回原提交并重新提交"
+    config["deadline"] = "2098-12-31T23:59:59Z"
+    config["retention_until"] = "2099-12-31T23:59:59Z"
+    config["fields"] = [
+        {"id": "name", "label": "姓名", "type": "text", "required": True, "sensitive": False},
+        {"id": "employee_id", "label": "工号", "type": "text", "required": True, "sensitive": False},
+        {"id": "phone", "label": "手机号", "type": "phone_cn", "required": True, "sensitive": True},
+        {"id": "id_number", "label": "身份证号", "type": "cn_id", "required": True, "sensitive": True},
+        {"id": "address", "label": "住址", "type": "address", "required": True, "sensitive": True},
+    ]
+    config_path = tmp / "group-config.json"
+    collection.dump_json(config_path, config)
+    roster = tmp / "group-roster.csv"
+    with roster.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream); writer.writerow(["employee_id", "name"]); writer.writerow(["E001", "张三"]); writer.writerow(["E002", "李四"])
+    warning = io.StringIO()
+    with contextlib.redirect_stderr(warning):
+        created = collection.create_task(roster, config_path, tmp / "group-tasks", PASSWORD, require_terminal=False, mode="group")
+    assert "冒名" in warning.getvalue()  # group 创建必须打印可冒名风险提示
+    task_dir = Path(created["task_dir"])
+    values = {"name": "张三", "employee_id": "E001", "phone": "13800138000", "id_number": VALID_ID, "address": "北京市朝阳区"}
+    incoming = tmp / "group-incoming"; incoming.mkdir()
+    return types.SimpleNamespace(tmp=tmp, config_path=config_path, roster=roster, created=created, task_dir=task_dir, task_id=created["task_id"], values=values, incoming=incoming)
+
+
+def make_group_envelope(task_dir: Path, employee_id: str, values: dict, overrides: dict | None = None) -> dict:
+    """构造 group 模式提交：invite_id=GRP-<employee_id>，载荷不含 invite_token。"""
+    task = collection.load_json(task_dir / "task.json")
+    invite_id = collection.group_invite_id(employee_id)
+    payload = {
+        "format_version": task["format_version"],
+        "task_id": task["task_id"],
+        "invite_id": invite_id,
+        "schema_hash": task["schema_hash"],
+        "notice_hash": task["notice_hash"],
+        "template_version": task["template_version"],
+        "submitted_at": collection.now_iso(),
+        "consent_confirmed": True,
+        "values": values,
+        "attachments": {},
+    }
+    if overrides:
+        payload.update(overrides)
+    return wrap_payload(task_dir, invite_id, payload)
+
+
+def submit_group(ns: types.SimpleNamespace, employee_id: str, filename: str, values: dict | None = None, **kwargs) -> None:
+    collection.dump_json(ns.incoming / filename, make_group_envelope(ns.task_dir, employee_id, values if values is not None else ns.values, **kwargs))
+
+
+def test_directed_invite_form_matches_html_config(tmp_path: Path) -> None:
+    ns = make_scenario(tmp_path)
+    form = collection.load_json(ns.task_dir / "invites" / f"{ns.invite_id}.yintian-form")
+    assert form["format"] == collection.FORM_FORMAT_VERSION == "yintian-form/1"
+    assert form["mode"] == "directed"
+    html = (ns.task_dir / "invites" / f"{ns.invite_id}.html").read_text(encoding="utf-8")
+    marker = '<script id="cfg" type="application/json">'
+    embedded = json.loads(html.split(marker, 1)[1].split("</script>", 1)[0])
+    for key in ("invite_id", "invite_token", "key_id", "schema_hash", "notice_hash", "task_id", "public_key_pem"):
+        assert form[key] == embedded[key], key  # .yintian-form 与 HTML 内嵌配置是同一份数据
+    assert form["invite_id"] == ns.invite_id and form["invite_token"] == invite_token(ns.task_dir, ns.invite_id)
+    assert "yintian-form/1 的人类可读渲染版" in html  # 真伪核对区已标注渲染关系
+
+
+def test_group_create_layout(tmp_path: Path) -> None:
+    ns = make_group_scenario(tmp_path)
+    task = collection.load_json(ns.task_dir / "task.json")
+    assert task["mode"] == "group"
+    form = collection.load_json(ns.task_dir / "FORM.yintian-form")
+    assert form["format"] == "yintian-form/1" and form["mode"] == "group"
+    assert "invite_id" not in form and "invite_token" not in form and "name" not in form  # 单份群发，无任何个人标识与令牌
+    assert form["key_id"] == task["key_id"] and form["public_key_pem"] == (ns.task_dir / "public.pem").read_text(encoding="utf-8")
+    assert [field["id"] for field in form["fields"]] == [field["id"] for field in task["fields"]]
+    assert not list((ns.task_dir / "invites").glob("*"))  # group 模式不生成个人邀请文件
+    index_rows = list(csv.DictReader((ns.task_dir / "invite-index.csv").open(encoding="utf-8-sig")))
+    assert [row["invite_id"] for row in index_rows] == ["GRP-E001", "GRP-E002"]
+    with closing_db(ns.task_dir) as db:
+        stored = [row[0] for row in db.execute("SELECT invite_id FROM invites ORDER BY employee_id")]
+    assert stored == ["GRP-E001", "GRP-E002"]  # 名单照常入库，invite_id 采用 GRP- 约定
+
+
+def test_group_config_requires_employee_id_field(tmp_path: Path) -> None:
+    config = collection.default_config()
+    config["purpose"] = "为依法办理员工商业保险收集必要身份资料"
+    config["contact"] = "人事部王老师，内线 8001"
+    config["correction"] = "在截止日前联系人事部王老师撤回原提交并重新提交"
+    config["deadline"] = "2098-12-31T23:59:59Z"
+    config["retention_until"] = "2099-12-31T23:59:59Z"
+    config_path = tmp_path / "config.json"
+    collection.dump_json(config_path, config)
+    roster = tmp_path / "roster.csv"
+    roster.write_text("employee_id,name\nE001,张三\n", encoding="utf-8")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        assert_raises(ValueError, lambda: collection.create_task(roster, config_path, tmp_path / "blocked", PASSWORD, require_terminal=False, mode="group"), "group 模式缺少 employee_id 字段必须拒绝创建")
+    assert "冒名" in err.getvalue()  # 拒绝前也已如实提示风险
+    assert not (tmp_path / "blocked").exists()
+    created = collection.create_task(roster, config_path, tmp_path / "ok", PASSWORD, require_terminal=False)  # 默认 directed 不受影响
+    assert collection.load_json(Path(created["task_dir"]) / "task.json")["mode"] == "directed"
+
+
+def test_group_ingest_review_and_export_clear(tmp_path: Path) -> None:
+    from openpyxl import load_workbook
+
+    ns = make_group_scenario(tmp_path)
+    submit_group(ns, "E001", "one.yintian")
+    assert collection.ingest_task(ns.task_dir, ns.incoming)["accepted"] == 1
+    assert collection.review_task(ns.task_dir, PASSWORD) == {"verified": 1, "needs_review": 0, "invalid": 0}
+    rows = collection.report_rows(ns.task_dir)
+    assert rows[0]["status"] == "verified" and rows[0]["submission_version"] == 1
+    out = ns.tmp / "group-result.xlsx"
+    args = types.SimpleNamespace(task_dir=str(ns.task_dir), out=str(out), fields="phone,id_number", mask=["id_number=last4"], purpose="保险办理", recipient="保险公司对接人", formats=["xlsx"])
+    with fake_tty(input_func=lambda prompt="": ns.task_id, getpass_func=lambda prompt="": PASSWORD):
+        result = collection.cmd_export_clear(args)
+    assert result["rows"] == 1
+    sheet = load_workbook(result["xlsx"]).active
+    assert [cell.value for cell in sheet[1]] == ["employee_id", "name", "phone", "id_number"]
+    assert [sheet.cell(2, index).value for index in range(1, 5)] == ["E001", "张三", "13800138000", "**************1230"]
+
+
+def test_group_identity_mismatch_flagged(tmp_path: Path) -> None:
+    ns = make_group_scenario(tmp_path)
+    submit_group(ns, "E001", "01-wrong-emp.yintian", values=dict(ns.values, employee_id="E002"))  # 冒用他人工号
+    submit_group(ns, "E001", "02-wrong-name.yintian", values=dict(ns.values, name="李四"))  # 错姓名
+    assert collection.ingest_task(ns.task_dir, ns.incoming)["accepted"] == 2
+    assert collection.review_task(ns.task_dir, PASSWORD)["needs_review"] == 2
+    with closing_db(ns.task_dir) as db:
+        conflicts = [json.loads(row[0]) for row in db.execute("SELECT conflict_fields FROM submissions WHERE invite_id='GRP-E001' ORDER BY version")]
+    assert "employee_id_roster_mismatch" in conflicts[0] and "name_roster_mismatch" not in conflicts[0]
+    assert "name_roster_mismatch" in conflicts[1] and "employee_id_roster_mismatch" not in conflicts[1]
+
+
+def test_group_version_cap_per_employee(tmp_path: Path) -> None:
+    ns = make_group_scenario(tmp_path)
+    for index in range(collection.MAX_VERSIONS_PER_INVITE):
+        submit_group(ns, "E001", f"e001-{index:02d}.yintian")
+    assert collection.ingest_task(ns.task_dir, ns.incoming)["accepted"] == collection.MAX_VERSIONS_PER_INVITE
+    submit_group(ns, "E001", "e001-overflow.yintian")
+    overflow = collection.ingest_task(ns.task_dir, ns.incoming)
+    assert overflow["accepted"] == 0 and overflow["rejected"] == 1  # 超限拒绝且不覆盖已有版本
+    other_values = {"name": "李四", "employee_id": "E002", "phone": "13900139000", "id_number": VALID_ID, "address": "上海市黄浦区"}
+    submit_group(ns, "E002", "e002-01.yintian", values=other_values)
+    assert collection.ingest_task(ns.task_dir, ns.incoming)["accepted"] == 1  # 版本上限按工号维度计数，他人不受影响
+    with closing_db(ns.task_dir) as db:
+        assert db.execute("SELECT COUNT(*) FROM submissions WHERE invite_id='GRP-E001'").fetchone()[0] == collection.MAX_VERSIONS_PER_INVITE
+        assert db.execute("SELECT COUNT(*) FROM submissions WHERE invite_id='GRP-E002'").fetchone()[0] == 1
+
+
+def test_envelope_mode_isolation(tmp_path: Path) -> None:
+    ns = make_group_scenario(tmp_path)
+    directed_dir = tmp_path / "directed"; directed_dir.mkdir()
+    directed_ns = make_scenario(directed_dir)
+    assert collection.task_mode({}) == "directed"  # 旧任务没有 mode 键，默认 directed
+    collection.dump_json(ns.incoming / "inv-style.yintian", make_envelope(directed_ns.task_dir, directed_ns.invite_id, directed_ns.values))
+    assert collection.ingest_task(ns.task_dir, ns.incoming)["rejected"] == 1  # group 任务只接受 GRP- 标识
+    collection.dump_json(directed_ns.incoming / "grp-style.yintian", make_group_envelope(directed_ns.task_dir, "E001", directed_ns.values))
+    assert collection.ingest_task(directed_ns.task_dir, directed_ns.incoming)["rejected"] == 1  # directed 任务只接受 INV- 标识
+    submit(directed_ns, "no-token.yintian", overrides={"invite_token": None})
+    assert collection.ingest_task(directed_ns.task_dir, directed_ns.incoming)["accepted"] == 1
+    assert collection.review_task(directed_ns.task_dir, PASSWORD)["invalid"] == 1  # directed 模式令牌缺失仍判 invalid，校验链未松动
+
+
+def export_clear_args(ns: types.SimpleNamespace, out: Path, **overrides) -> types.SimpleNamespace:
+    base = dict(task_dir=str(ns.task_dir), out=str(out), fields="phone,id_number,address", mask=["id_number=last4", "phone=mid4"],
+                purpose="办理员工商业保险", recipient="保险公司对接人", formats=["xlsx", "json"])
+    base.update(overrides)
+    return types.SimpleNamespace(**base)
+
+
+def test_export_clear_end_to_end(tmp_path: Path) -> None:
+    from openpyxl import load_workbook
+
+    ns = make_scenario(tmp_path)
+    submit_accepted(ns)
+    assert collection.review_task(ns.task_dir, PASSWORD)["needs_review"] == 1  # 缺证件附件；needs_review 仍属 current+valid
+    capture = TtyCapture()
+    warning = io.StringIO()
+    with fake_tty(input_func=lambda prompt="": ns.task_id, getpass_func=lambda prompt="": PASSWORD, capture=capture), contextlib.redirect_stderr(warning):
+        result = collection.cmd_export_clear(export_clear_args(ns, ns.tmp / "result.xlsx"))
+    assert result["rows"] == 1 and set(result) >= {"xlsx", "json"}
+    shown = capture.getvalue()
+    for expected in (ns.task_id, "phone", "id_number=last4", "phone=mid4", "办理员工商业保险", "保险公司对接人", "数据行数: 1"):
+        assert expected in shown, expected  # 导出前完整回显任务/字段/脱敏/行数/用途/接收方
+    assert "系统无法管控后续传播" in warning.getvalue()
+    sheet = load_workbook(result["xlsx"]).active
+    assert [cell.value for cell in sheet[1]] == ["employee_id", "name", "phone", "id_number", "address"]
+    row = [sheet.cell(2, index).value for index in range(1, 6)]
+    assert row == ["=1+1", "张三", "138****8000", "**************1230", "北京市朝阳区"]
+    assert all(sheet.cell(2, index).data_type == "s" for index in range(1, 6))  # 字符串单元格防公式注入
+    document = collection.load_json(Path(result["json"]))
+    assert document["rows"] == [dict(zip(["employee_id", "name", "phone", "id_number", "address"], row))]
+    assert document["purpose"] == "办理员工商业保险" and document["recipient"] == "保险公司对接人"
+    json_text = Path(result["json"]).read_text(encoding="utf-8")
+    assert VALID_ID not in json_text and "13800138000" not in json_text and "北京市朝阳区" in json_text  # 脱敏生效、未声明字段明文
+    assert "effective_date" not in json_text  # 白名单外字段不导出
+    if os.name != "nt":
+        assert stat.S_IMODE(Path(result["xlsx"]).stat().st_mode) == 0o600
+        assert stat.S_IMODE(Path(result["json"]).stat().st_mode) == 0o600
+
+
+def test_export_clear_non_tty_rejected(tmp_path: Path) -> None:
+    ns = make_scenario(tmp_path)
+    submit_accepted(ns)
+    collection.review_task(ns.task_dir, PASSWORD)
+    with non_tty():
+        assert_raises(RuntimeError, lambda: collection.cmd_export_clear(export_clear_args(ns, ns.tmp / "blocked.xlsx")), "非 TTY 环境必须拒绝明文导出")
+    assert not (ns.tmp / "blocked.xlsx").exists()
+
+
+def test_export_clear_wrong_password_rejected(tmp_path: Path) -> None:
+    ns = make_scenario(tmp_path)
+    submit_accepted(ns)
+    collection.review_task(ns.task_dir, PASSWORD)
+    with fake_tty(input_func=forbidden_prompt, getpass_func=lambda prompt="": "wrong-password"):
+        assert_raises(RuntimeError, lambda: collection.cmd_export_clear(export_clear_args(ns, ns.tmp / "wrong-pass.xlsx")), "错误任务密码必须拒绝明文导出")
+    assert not (ns.tmp / "wrong-pass.xlsx").exists()
+
+
+def test_export_clear_expired_rejected(tmp_path: Path) -> None:
+    ns = make_scenario(tmp_path)
+    submit_accepted(ns)
+    collection.review_task(ns.task_dir, PASSWORD)
+    expire_task(ns.task_dir)
+    with fake_tty(input_func=forbidden_prompt, getpass_func=forbidden_prompt):
+        assert_raises(RuntimeError, lambda: collection.cmd_export_clear(export_clear_args(ns, ns.tmp / "expired.xlsx")), "过期任务必须拒绝明文导出且不出现交互提示")
+    assert not (ns.tmp / "expired.xlsx").exists()
+
+
+def test_export_clear_confirm_mismatch_cancels(tmp_path: Path) -> None:
+    ns = make_scenario(tmp_path)
+    submit_accepted(ns)
+    collection.review_task(ns.task_dir, PASSWORD)
+    with fake_tty(input_func=lambda prompt="": "YT-00000000-WRONG", getpass_func=lambda prompt="": PASSWORD):
+        assert_raises(RuntimeError, lambda: collection.cmd_export_clear(export_clear_args(ns, ns.tmp / "cancelled.xlsx")), "任务 ID 不匹配必须取消导出")
+    assert not (ns.tmp / "cancelled.xlsx").exists() and not (ns.tmp / "cancelled.json").exists()
+
+
+def test_export_clear_fields_and_mask_validation(tmp_path: Path) -> None:
+    ns = make_scenario(tmp_path)
+    parser = collection.build_parser()
+    assert_raises(SystemExit, lambda: parser.parse_args(["export-clear", str(ns.task_dir), "--out", "x.xlsx"]), "缺 --fields 必须拒绝")
+    task = collection.load_task(ns.task_dir)[1]
+    assert_raises(ValueError, lambda: collection.parse_export_fields(task, ""), "空白字段名单必须拒绝")
+    assert_raises(ValueError, lambda: collection.parse_export_fields(task, "no_such_field"), "未知字段必须拒绝")
+    assert_raises(ValueError, lambda: collection.parse_export_fields(task, "id_front"), "附件字段必须拒绝")
+    assert_raises(ValueError, lambda: collection.parse_export_fields(task, "name"), "只含默认附带字段的名单必须拒绝")
+    assert collection.parse_export_fields(task, "phone,name,employee_id") == ["phone"]  # 身份列默认附带，重复声明被归并
+    assert_raises(ValueError, lambda: collection.parse_mask_specs(["phone=bad"]), "未知脱敏规则必须拒绝")
+    assert_raises(ValueError, lambda: collection.parse_mask_specs(["phone"]), "缺规则的脱敏声明必须拒绝")
+    assert collection.mask_value("last4", VALID_ID) == "**************1230"
+    assert collection.mask_value("mid4", "13800138000") == "138****8000"
+    assert collection.mask_value("last4", "123") == "***" and collection.mask_value("mid4", "1234567") == "*******"
+    with fake_tty(input_func=forbidden_prompt, getpass_func=forbidden_prompt):
+        assert_raises(ValueError, lambda: collection.cmd_export_clear(export_clear_args(ns, ns.tmp / "m.xlsx", mask=["effective_date=last4"])), "脱敏指向未导出字段必须在交互前拒绝")
 
 
 def main() -> None:

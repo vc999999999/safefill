@@ -1,49 +1,63 @@
 """隐填 · 自动化测试全量套件入口。
 
-自动发现并执行 scripts/ 下全部 test_*.py（与 pytest 的收集范围一致，
-无需手工维护清单），支持直接运行：
+自动发现并执行仓库内全部 scripts 测试目录下的 test_*.py（收集端 scripts/
+与填写端 yintian-fill/scripts/，与 pytest 的收集范围一致，无需手工维护清单），
+支持直接运行：
     python scripts/run_tests.py
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPTS_DIR.parent
 
 TEST_TIMEOUT_SECONDS = 300
 
 
 def discover_test_scripts() -> list[Path]:
-    return sorted(SCRIPTS_DIR.glob("test_*.py"))
+    # 单一事实源：仓库根 scripts/ + 各 Skill 子目录的 scripts/（如 yintian-fill/scripts/）
+    test_dirs = {SCRIPTS_DIR}
+    test_dirs |= {d for d in REPO_ROOT.glob("*/scripts") if d.is_dir()}
+    scripts: list[Path] = []
+    for d in sorted(test_dirs):
+        scripts.extend(sorted(d.glob("test_*.py")))
+    return scripts
 
 
 def run_all() -> int:
     python = sys.executable
     scripts = discover_test_scripts()
+    # 子目录 Skill 的测试可能 import 根仓 scripts/，统一把仓库根放进 PYTHONPATH
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     print("=" * 60)
     print("开始执行隐填全量工程自检与测试套件")
     print(f"Python 解释器: {python}")
-    print(f"工作目录: {SCRIPTS_DIR}")
-    print(f"发现 {len(scripts)} 个测试模块: {', '.join(p.name for p in scripts)}")
+    print(f"工作目录: {REPO_ROOT}")
+    print(f"发现 {len(scripts)} 个测试模块: {', '.join(str(p.relative_to(REPO_ROOT)) for p in scripts)}")
     print("=" * 60)
 
     failed = []
     skipped_total = 0
     for script_path in scripts:
-        print(f"\n>>> 正在运行: {script_path.name} ...")
+        rel = str(script_path.relative_to(REPO_ROOT))
+        print(f"\n>>> 正在运行: {rel} ...")
         try:
             proc = subprocess.run(
                 [python, str(script_path)],
-                cwd=str(SCRIPTS_DIR.parent),
+                cwd=str(REPO_ROOT),
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=TEST_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
-            print(f"[FAIL] {script_path.name} 超过 {TEST_TIMEOUT_SECONDS} 秒未结束，按失败处理")
-            failed.append(script_path.name)
+            print(f"[FAIL] {rel} 超过 {TEST_TIMEOUT_SECONDS} 秒未结束，按失败处理")
+            failed.append(rel)
             continue
 
         if proc.stdout:
@@ -54,10 +68,10 @@ def run_all() -> int:
             1 for line in proc.stdout.splitlines() if line.startswith("SKIP:")
         )
         if proc.returncode != 0:
-            print(f"[FAIL] {script_path.name} 返回非零退出码: {proc.returncode}")
-            failed.append(script_path.name)
+            print(f"[FAIL] {rel} 返回非零退出码: {proc.returncode}")
+            failed.append(rel)
         else:
-            print(f"[OK] {script_path.name} 通过")
+            print(f"[OK] {rel} 通过")
 
     print("\n" + "=" * 60)
     if failed:

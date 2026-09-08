@@ -48,21 +48,27 @@ python scripts/collection.py init-config --out collection.json
 python scripts/collection.py create \
   --roster roster.csv \
   --config collection.json \
-  --out tasks/
+  --out tasks/ \
+  --mode directed        # 或 --mode group（默认 directed）
 ```
+
+双模式说明：
+
+- **directed 定向型（默认）**：为每人生成带独立随机认证令牌的 `INV-*.html` 和一份 `INV-*.yintian-form` JSON；身份有令牌绑定，适合身份证号等高敏感定向收集。
+- **group 群发型**：不生成令牌，全员共用单份 `FORM.yintian-form` JSON（无个人邀请文件）；提交信封以 `GRP-<employee_id>` 标识，版本上限按工号计数；身份没有令牌绑定，任何拿到表单的人都能为任何工号提交，靠复核时名单比对兜底，只适合低敏感、群公告分发的场景。
 
 命令会：
 
 - 生成 RSA-OAEP-3072 任务密钥；
 - 用随机任务密码以 scrypt 派生密钥、AES-256-GCM 包裹私钥（`yintian-key/1` 信封）；
-- 为每人生成一个文件名不含姓名、带独立随机认证令牌的 `INV-*.html`；
+- directed 模式为每人生成一个文件名不含姓名、带独立随机认证令牌的 `INV-*.html` 和 `INV-*.yintian-form` JSON；group 模式只生成一份 `FORM.yintian-form` JSON；
 - 生成本地 `invite-index.csv`。
 
 任务密码只显示一次，丢失不可恢复。不要将密码放入聊天、命令参数、任务目录或在线文档。
 
 ### 4. 私聊发出邀请并收回密文
 
-员工使用新版 Chrome/Edge 打开自己的 HTML：
+员工侧是双通道填写：有 AI 环境的员工用配套的 yintian-fill Skill 读取 `.yintian-form` JSON，在本机离线填写并加密；没有 AI 环境的员工用新版 Chrome/Edge 打开邀请 HTML（兜底通道）。两通道产出的 `.yintian` 信封同构，收集端 `ingest` 无差别接收。HTML 通道流程：
 
 1. 本地填写并选择 JPG/PNG/WebP/PDF 附件；
 2. 查看遮罩预览并确认告知；
@@ -96,6 +102,23 @@ python scripts/collection.py report tasks/YT-... --formats xlsx json
 - 比较手填值和 OCR 候选，冲突只进入人工复核，不自动覆盖。
 
 报告只包含员工编号、姓名、状态、缺失/冲突字段名和时间，不包含手机号、身份证号、住址、邀请认证令牌、OCR 原文、附件或密钥。它仍含直接身份标识，只能上传到已获批且访问受控的平台。
+
+### 5b. 导出交付（export-clear）
+
+确需把明文汇总交给下游（如行政订酒店）时，使用 `export-clear`——只能由职能人员在自己未被 Agent 控制或录制的终端运行，Agent 不得代跑、不得经手密码：
+
+```bash
+python scripts/collection.py export-clear tasks/YT-... \
+  --out result.xlsx \
+  --fields name phone_cn id_card \
+  --mask last4 \
+  --purpose "行政统一订酒店" --recipient "行政部 王五"
+```
+
+- `--fields` 白名单逐列指定导出字段；`--mask last4|mid4` 对导出值脱敏（保留后 4 位 / 遮蔽中间 4 位），只导出确有必要的数据；
+- `--purpose` / `--recipient` 必填，作为交付审计说明；
+- getpass 交互询问任务密码，并要求再次输入任务 ID 二次确认；
+- 明文 XLSX 只在本机落盘（0600 权限），命令会打印显著的明文警告。**系统无法管控文件落盘后的传播**：用后请立即删除，仅通过获批渠道交付给 `--recipient` 指定的接收方。
 
 ### 6. 按需人工查看
 
@@ -152,10 +175,27 @@ python scripts/mcp_server.py
 
 MCP 拒绝访问 `YINTIAN_VAULT_DIR` 之外的任务目录和收件目录。
 
+## 配套：填写端 Skill yintian-fill
+
+`yintian-fill/` 是员工侧的独立 Skill，与本收集端构成双 Skill 闭环：
+
+```text
+yintian-skill（HR/职能侧）          yintian-fill（员工侧）
+create --mode directed|group  →   分发 .yintian-form JSON
+                              →   fill.py inspect    查看表单字段与告知
+                                  fill.py scan-idcard 本地 OCR 读取证件
+                                  fill.py seal       本机加密封口
+                              ←   产出同构 .yintian 信封，私聊交回
+ingest / review / report
+```
+
+- 它读取 `yintian-form/1` JSON（directed 模式为每人一份 `INV-*.yintian-form`，group 模式为共用的 `FORM.yintian-form`），在员工本机离线填写并加密，产出与浏览器 HTML 同构的 `.yintian` 信封；group 模式信封 `invite_id` 为 `GRP-<employee_id>`。
+- 明文只在员工本机出现；没有 AI 环境的员工仍可用邀请 HTML 兜底。
+
 ## 测试
 
 ```bash
-python scripts/run_tests.py     # 自动发现并运行全部 scripts/test_*.py（需先安装 requirements.txt 依赖）
+python scripts/run_tests.py     # 自动发现并运行全部 scripts/test_*.py（含 yintian-fill/scripts/，需先安装 requirements.txt 依赖）
 # 也可单独直跑任一模块：
 python scripts/test_ocr_matcher.py
 python scripts/test_distribute.py
@@ -164,6 +204,7 @@ python scripts/test_mcp_vault.py
 python scripts/test_collection.py
 # 或使用 pytest（安装 requirements-dev.txt 后）：
 python -m pytest scripts/ -q
+PYTHONPATH=. python -m pytest yintian-fill/scripts/ -q   # 填写端：import 根仓 scripts/ 需仓库根在 PYTHONPATH
 ```
 
 依赖缺失时不静默假绿：pytest 下相关用例按 skip 处理，`run_tests.py` 汇总会显示跳过数量；单个模块直跑时也会明确打印 SKIP 而非 PASS。
