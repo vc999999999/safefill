@@ -10,7 +10,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        # 项目目标版本为 3.11（info.json / SKILL.md）；OCR 栈 rapidocr-openvino 1.4.4
+        # 依赖 openvino<=2024.0.0，该版本没有 3.12 的 wheel，故 3.12 不可支持，不加进矩阵。
+        python-version: ["3.11"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
