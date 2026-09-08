@@ -14,6 +14,9 @@ def _resolve_model_path(model_path: str) -> str:
     candidate = Path(config.MODEL_DIR).expanduser() / Path(str(model_path)).name
     if candidate.is_file():
         return str(candidate)
+    ir_candidate = candidate.with_suffix(".xml")
+    if ir_candidate.is_file():
+        return str(ir_candidate)
     return model_path
 
 
@@ -21,15 +24,26 @@ def _core_type():
     try:
         from openvino import Core
     except ImportError:
-        from openvino.runtime import Core
+        try:
+            from openvino.runtime import Core
+        except ImportError as exc:
+            raise RuntimeError(
+                "未安装 OpenVINO 后端。请执行 pip install -r requirements.txt；"
+                "纯文本材料无需 OCR 依赖。"
+            ) from exc
     return Core
 
 
 def runtime_info() -> dict[str, Any]:
     """返回 OpenVINO 版本、可用设备和选定设备，不加载 OCR 模型。"""
-    import openvino
+    Core = _core_type()
+    try:
+        import openvino
 
-    core = _core_type()()
+        version = getattr(openvino, "__version__", "unknown")
+    except ImportError:
+        version = "unknown"
+    core = Core()
     devices = list(core.available_devices)
     details = []
     for device in devices:
@@ -39,7 +53,7 @@ def runtime_info() -> dict[str, Any]:
             name = device
         details.append({"id": device, "name": name})
     return {
-        "openvino_version": getattr(openvino, "__version__", "unknown"),
+        "openvino_version": version,
         "requested_device": config.OCR_DEVICE,
         "available_devices": details,
     }

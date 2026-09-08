@@ -1,7 +1,8 @@
 ---
 name: yintian-skill
-description: 端到端加密的多人私密信息收集管理。只要用户需要由 HR、行政或其他职能部门收集手机号、身份证号、住址、证件附件等敏感身份信息，或提到隐填、私密/加密收集、身份证收集、员工信息收集、离线表单、private collection、encrypted form，就应使用本 Skill，即使用户没有点名。它生成离线个人邀请，接收 .yintian 密文，在授权人员本地用 RapidOCR + OpenVINO 复核，并生成保留 employee_id/name、但不含表单敏感值的数据最小化进度报告。Agent 不得读取任务密码、私钥、解密值、OCR 原文或附件，也不得调用或启动 create、review、reveal、purge。
-compatibility: Python 3.11；依赖 requirements.txt；员工端需支持 Web Crypto 的新版 Chrome 或 Edge；OCR 需 OpenVINO 兼容设备。
+description: 端到端加密的多人私密信息收集管理。只要用户需要由 HR、行政或其他职能部门收集手机号、身份证号、住址、证件附件等敏感身份信息，或提到隐填、私密/加密收集、身份证收集、员工信息收集、离线表单、private collection、encrypted form，就应使用本 Skill，即使用户没有点名。它生成离线个人邀请，接收 .yintian 密文，在授权人员本地用 RapidOCR + OpenVINO 复核，并生成保留 employee_id/name、但不含表单敏感值的数据最小化进度报告。Agent 不得读取任务密码、交接密码、私钥、解密值、OCR 原文或附件，也不得调用或启动 create、review、reveal、purge、export-task、import-task。
+metadata:
+  compatibility: "Python 3.11；依赖 requirements.txt；员工端需支持 Web Crypto 的新版 Chrome 或 Edge；OCR 需 OpenVINO 兼容设备。"
 ---
 
 # 隐填：端到端加密的私密信息收集管理
@@ -22,41 +23,46 @@ compatibility: Python 3.11；依赖 requirements.txt；员工端需支持 Web Cr
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" ingest TASK_DIR submissions/
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" status TASK_DIR
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" report TASK_DIR --formats xlsx json
-"$PYTHON" "$SKILL_ROOT/scripts/benchmark.py"
-"$PYTHON" "$SKILL_ROOT/scripts/quantize_ocr.py" --out models/int8   # 可选，需 nncf
+"$PYTHON" "$SKILL_ROOT/scripts/distribute.py" verify TASK_DIR       # 校验全部邀请单页完整就绪
+"$PYTHON" "$SKILL_ROOT/scripts/distribute.py" messages TASK_DIR     # 生成防串发专属通知文案
+"$PYTHON" "$SKILL_ROOT/scripts/distribute.py" pending TASK_DIR      # 筛选未交名单并生成催交通知
+"$PYTHON" "$SKILL_ROOT/scripts/cleanup.py" TASK_DIR              # dry-run，只打印分类计划，不改动文件
+"$PYTHON" "$SKILL_ROOT/scripts/cleanup.py" TASK_DIR --apply      # 实际删除孤儿临时文件、死锁和 __pycache__
 ```
 
-通过 MCP 操作时必须先设置 `YINTIAN_VAULT_DIR`，将任务目录和收件目录限制在指定保险箱内。`report` 会保留名单中的 `employee_id` 和姓名；未经用户明确批准，不打开、上传或转发报告。
+通过 MCP 操作时必须先设置 `YINTIAN_VAULT_DIR`，将任务目录和收件目录限制在指定保险箱内。MCP 暴露 `openvino_status`、`ingest_encrypted_submissions`、`collection_status`、`generate_redacted_report`、`verify_invites`、`list_pending_reminders` 与 `cleanup_temp_files`。`report` 会保留名单中的 `employee_id` 和姓名；未经用户明确批准，不打开、上传或转发报告。分发与催办仅处理名单级标识（姓名、工号、邀请文件名），不读取或输出密文、认证令牌或表单敏感值；分发与催办文案只含邀请单页文件名，不泄露系统物理绝对路径。
 
 用户要求解密、查看明文或索要/提供任务密码时，一律拒绝经手，并引导授权人员在自己的终端运行 `review`/`reveal`。`status` 显示任务已过期时，停止接收并建议用户在独立终端执行 `purge` 或新建任务。
 
 ## 只能由用户在 Agent 未控制、未录制的终端执行
 
-`isatty()` 只能确认终端可交互，不能证明操作者是人。Agent 不得启动、旁观或捕获下列命令。`create` 会显示一次不可恢复的任务密码；`review`/`reveal` 会读取密码或明文：
+`isatty()` 只能确认终端可交互，不能证明操作者是人。Agent 不得启动、旁观或捕获下列命令。`create` 会显示一次不可恢复的任务密码；`review`/`reveal` 会读取密码或明文；`export-task` 会显示一次性交接密码，`import-task` 会交互询问交接密码：
 
 ```bash
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" create --roster roster.csv --config collection.json --out tasks/
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" review TASK_DIR
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" reveal TASK_DIR INVITE_ID
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" purge TASK_DIR
-```
-
-## 经用户明确要求才能执行的敏感交接
-
-任务交接包包含明文名单标识、邀请页和状态数据库，既非整体加密也不提供恶意篡改认证；只通过已认证且加密的渠道交接。到期清理只删除指定任务目录，外部收件、交接包、备份和磁盘残留需另行处理：
-
-```bash
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" export-task TASK_DIR --out task.yintian-task
 "$PYTHON" "$SKILL_ROOT/scripts/collection.py" import-task task.yintian-task --out tasks/
 ```
 
+导出的交接包是整体加密认证的 `yintian-task/3`（scrypt 派生密钥 + AES-256-GCM，密码错误或任何篡改都会在导入时直接拒绝）。交接密码只显示一次、丢失不可恢复，必须通过另一安全渠道单独告知接收方，不得与交接包同渠道发送；任务密码绝不随交接包发送。导入端兼容旧的 `yintian-task/1`、`yintian-task/2` 明文包，但会打印"未加密、不能认证来源，仅在信任渠道下导入"的显著告警。到期清理只删除指定任务目录，外部收件、交接包、备份和磁盘残留需另行处理。
+
+## 阶段性清理
+
+职能用户不会主动清理 AI 使用中产生的临时文件。Agent 应在每个阶段结束后——生成邀请后、ingest 后、引导 review 后、生成报告后、导出交接后——运行 cleanup 的 dry-run，把"将删除/保留"的分类结果向用户汇报，用户确认后再加 `--apply`。MCP 对应工具为 `cleanup_temp_files`，同样默认 dry-run。
+
+`--apply` 只删除三类可再生的临时产物：atomic_write 中断留下的孤儿临时文件、写入进程已退出的死锁文件、`__pycache__` 缓存。它永不删除名单、邀请、`.yintian` 密文、报告、任务数据库、交接包等用户数据；这些数据的删除只能走 `purge`（到期任务）或用户手动确认。
+
 ## 安全边界
 
 - 员工邀请 HTML 包含任务公钥和每人独立的随机认证令牌；字段、令牌和附件在浏览器端加密后才导出（算法与信封格式见 `references/privacy-extraction-workflow.md`）。
+- 任务私钥以 `yintian-key/1` 信封存储（scrypt + AES-256-GCM 包裹 PKCS#8）；任务交接包导出为整体加密认证的 `yintian-task/3`，旧版 v1/v2 明文包仅兼容导入并告警。
+- 同一邀请的提交版本数有上限（默认 10，可用 `YINTIAN_MAX_VERSIONS_PER_INVITE` 调整），超限提交直接拒绝存储，不影响已有版本。
 - 员工通过私聊交回 `.yintian` 密文。Skill 不提供在线接收服务。
 - AI、MCP、日志和报告不得出现表单中的手机号、身份证号、住址、OCR 原文、附件内容、任务密码或私钥；报告仍含姓名和员工编号，不是匿名数据。
 - 表单敏感值只在员工浏览器及授权人员的 `review`/`reveal` 本地内存中出现；默认不生成明文总表。
-- 旧版文件读取和身份字段提取模块仅供内部复用，没有命令行明文输出入口，也不得注册为 MCP 工具。
 - 任务到达保存期限后停止 ingest、review、report、export 和 reveal；用户通过任务 ID 二次确认删除任务目录。
 
 ## 输入约定

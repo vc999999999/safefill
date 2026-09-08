@@ -1,4 +1,4 @@
-"""隐填 · 用 NNCF 对 RapidOCR 的 det/cls/rec IR 模型做 INT8 训练后量化。"""
+"""隐填 · 用 NNCF 对 RapidOCR 的 det/cls/rec 模型做 INT8 训练后量化。"""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,13 @@ from pathlib import Path
 
 # det/cls/rec 各自的校准输入尺寸 (高, 宽)
 INPUT_SHAPES = {"det": (640, 640), "cls": (48, 192), "rec": (48, 320)}
+# 实测 det(DBNet)/rec(SVTR) 对激活 PTQ 极度敏感（检测丢行、CTC 解码全空），
+# 只能用 INT8 权重压缩；cls 用含校准数据的完整 PTQ
+WEIGHTS_ONLY_KINDS = {"det", "rec"}
+# RapidOCR det 预处理约定：长边不超过 960、边长 32 对齐、ImageNet 归一化
+DET_LIMIT = 960
+DET_MEAN = (0.485, 0.456, 0.406)
+DET_STD = (0.229, 0.224, 0.225)
 CALIB_COUNT = 40
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 # 常见中文字体，都找不到时退回 PIL 默认字体的纯 ASCII 文本行
@@ -25,7 +32,7 @@ def _import_deps():
         import nncf
         import openvino as ov
     except ImportError:
-        sys.exit('缺少量化依赖，请执行 pip install "nncf>=2.9" 后重试')
+        sys.exit('缺少量化依赖，请执行 pip install -r requirements-quantization.txt 后重试')
     return nncf, ov
 
 
@@ -36,14 +43,16 @@ def _find_models() -> dict[str, Path]:
         sys.exit("未安装 rapidocr-openvino，请执行 pip install -r requirements.txt")
     package = Path(rapidocr_openvino.__file__).resolve().parent
     found: dict[str, Path] = {}
-    for xml in sorted(package.rglob("*.xml")):
+    # 1.4.4 随包发布的是 .onnx（OpenVINO 直接读取），更老的包才是 IR .xml
+    candidates = sorted(package.rglob("*.xml")) or sorted(package.rglob("*.onnx"))
+    for xml in candidates:
         name = xml.name.lower()
         for kind in INPUT_SHAPES:
             if kind in name and kind not in found:
                 found[kind] = xml
     missing = [kind for kind in INPUT_SHAPES if kind not in found]
     if missing:
-        sys.exit(f"在 {package} 内未找到 {', '.join(missing)} 模型的 .xml 文件")
+        sys.exit(f"在 {package} 内未找到 {', '.join(missing)} 模型的 .xml/.onnx 文件")
     return found
 
 
@@ -98,12 +107,28 @@ def _load_calib_images(calib_dir: str | None, count: int) -> list:
     return images
 
 
-def _preprocess(image, size: tuple[int, int]):
+def _paste(canvas, resized) -> None:
+    canvas[: resized.shape[0], : resized.shape[1]] = resized
+
+
+def _preprocess(image, kind: str, size: tuple[int, int]):
+    """与 RapidOCR 推理预处理一致：等比缩放 + 零填充，而不是直接 squash。"""
     import numpy as np
 
     height, width = size
-    array = np.asarray(image.resize((width, height)), dtype=np.float32) / 255.0
-    array = (array - 0.5) / 0.5
+    src_w, src_h = image.size
+    array = np.zeros((height, width, 3), dtype=np.float32)
+    if kind == "det":
+        ratio = min(DET_LIMIT / max(src_h, src_w), 1.0)
+        new_h = min(max(32, int(np.ceil(src_h * ratio / 32)) * 32), height)
+        new_w = min(max(32, int(np.ceil(src_w * ratio / 32)) * 32), width)
+        _paste(array, np.asarray(image.resize((new_w, new_h)), dtype=np.float32) / 255.0)
+        array = (array - np.array(DET_MEAN, dtype=np.float32)) / np.array(DET_STD, dtype=np.float32)
+    else:
+        # cls/rec：等比缩放到高 48，宽不足时右侧补零，归一化到 [-1, 1]
+        new_w = min(max(1, int(np.ceil(src_w * height / src_h))), width)
+        _paste(array, np.asarray(image.resize((new_w, height)), dtype=np.float32) / 255.0)
+        array = (array - 0.5) / 0.5
     return array.transpose(2, 0, 1)[None]
 
 
@@ -129,18 +154,21 @@ def quantize(calib_dir: str | None, out: str, count: int) -> list[dict]:
         model = core.read_model(str(xml))
         if len(model.inputs) != 1:
             sys.exit(f"{xml.name} 不是单输入模型，暂不支持自动量化")
-        input_name = model.inputs[0].get_any_name()
-        dataset = nncf.Dataset(
-            images,
-            lambda image: {input_name: _preprocess(image, size)},
-        )
-        quantized = nncf.quantize(
-            model,
-            dataset,
-            preset=nncf.QuantizationPreset.MIXED,
-            subset_size=len(images),
-        )
-        out_xml = out_dir / xml.name
+        if kind in WEIGHTS_ONLY_KINDS:
+            quantized = nncf.compress_weights(model, mode=nncf.CompressWeightsMode.INT8_SYM)
+        else:
+            input_name = model.inputs[0].get_any_name()
+            dataset = nncf.Dataset(
+                images,
+                lambda image: {input_name: _preprocess(image, kind, size)},
+            )
+            quantized = nncf.quantize(
+                model,
+                dataset,
+                preset=nncf.QuantizationPreset.MIXED,
+                subset_size=len(images),
+            )
+        out_xml = out_dir / f"{xml.stem}.xml"
         ov.save_model(quantized, str(out_xml))
         results.append(
             {

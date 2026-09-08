@@ -1,0 +1,23 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --upgrade pip
+        # 按 requirements-dev.txt 安装（其内部 -r requirements.txt 拉齐全部运行时依赖），
+        # 与本地 pytest 环境保持一致，避免 CI 与被测代码依赖漂移。
+      - run: pip install -r requirements-dev.txt
+      - run: pytest scripts/ -q

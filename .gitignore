@@ -6,3 +6,6 @@ tasks/
 collection.json
 *.yintian
 *.yintian-task
+
+.coverage
+.ruff_cache/

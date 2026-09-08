@@ -1,0 +1,3 @@
+-r requirements.txt
+nncf>=2.19,<3
+numpy>=1.24,<3

@@ -26,16 +26,36 @@ FORMAT_VERSION = "yintian-submission/2"
 LEGACY_FORMAT_VERSION = "yintian-submission/1"
 LEGACY_TASK_PACKAGE_VERSION = "yintian-task/1"
 TASK_PACKAGE_VERSION = "yintian-task/2"
+ENCRYPTED_TASK_PACKAGE_VERSION = "yintian-task/3"
+KEY_ENVELOPE_VERSION = "yintian-key/1"
+LEGACY_KEY_PEM_PREFIX = b"-----BEGIN ENCRYPTED PRIVATE KEY-----"
+SCRYPT_N = 2**15
+SCRYPT_R = 8
+SCRYPT_P = 1
 ALLOWED_TYPES = {"text", "phone_cn", "cn_id", "date", "address", "single_choice", "image_attachment", "pdf_attachment"}
 ATTACHMENT_TYPES = {"image_attachment", "pdf_attachment"}
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_TOTAL_BYTES = 15 * 1024 * 1024
 MAX_PDF_PAGES = 20
+PDF_RENDER_SCALE = 2
 MAX_ENVELOPE_BYTES = 32 * 1024 * 1024
+MAX_V3_ENVELOPE_BYTES = 200 * 1024 * 1024
+V3_SNIFF_BYTES = 1024 * 1024
 MAX_PACKAGE_FILES = 20_000
 MAX_PACKAGE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_PACKAGE_MEMBER_BYTES = 128 * 1024 * 1024
 MAX_IMAGE_PIXELS = int(os.getenv("YINTIAN_MAX_IMAGE_PIXELS", "40000000"))
+
+
+def positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+MAX_VERSIONS_PER_INVITE = positive_int_env("YINTIAN_MAX_VERSIONS_PER_INVITE", 10)
 TASK_ID_RE = re.compile(r"^YT-[0-9]{8}-[A-Z0-9]{6}$")
 INVITE_ID_RE = re.compile(r"^INV-[A-Z0-9]{10}$")
 FIELD_ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
@@ -92,10 +112,19 @@ def sha256_file(path: Path) -> str:
 
 def atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-        stream.write(data)
-        temp = Path(stream.name)
-    temp.replace(path)
+    temp: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+            temp = Path(stream.name)
+            stream.write(data)
+        temp.replace(path)
+    except BaseException:
+        if temp is not None:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+        raise
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -117,6 +146,27 @@ def generate_password(length: int = 28) -> str:
         value = "".join(secrets.choice(alphabet) for _ in range(length))
         if any(c.islower() for c in value) and any(c.isupper() for c in value) and any(c.isdigit() for c in value):
             return value
+
+
+def open_control_terminal():
+    """打开控制终端用于显示一次性密码（POSIX 用 /dev/tty，Windows 用 CON）；打不开时返回 None。"""
+    try:
+        return open("CON" if os.name == "nt" else "/dev/tty", "w", encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def print_once_secret(heading: str, secret: str, footnote: str) -> None:
+    """一次性密码只写控制终端；控制终端不可用时回退 stderr，绝不写可能被管道采集的 stdout。"""
+    stream = open_control_terminal()
+    try:
+        target = stream if stream is not None else sys.stderr
+        print(f"\n{heading}", file=target)
+        print(secret, file=target)
+        print(footnote + "\n", file=target)
+    finally:
+        if stream is not None:
+            stream.close()
 
 
 def require_tty(action: str) -> None:
@@ -179,13 +229,17 @@ def task_lock(root: Path):
 
 
 def connect_db(root: Path) -> sqlite3.Connection:
-    db = sqlite3.connect(root / "state.sqlite3")
+    db = sqlite3.connect(root / "state.sqlite3", timeout=5.0)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA foreign_keys=ON")
     return db
 
 
 def init_db(root: Path, rows: list[dict[str, str]]) -> None:
+    db_path = root / "state.sqlite3"
+    if os.name != "nt":
+        os.close(os.open(db_path, os.O_CREAT | os.O_WRONLY, 0o600))
     with closing(connect_db(root)) as db, db:
         db.executescript(
             """
@@ -303,6 +357,81 @@ def read_roster(path: Path) -> list[dict[str, str]]:
     return rows
 
 
+def derive_scrypt_key(password: str, salt: bytes, n: int = SCRYPT_N, r: int = SCRYPT_R, p: int = SCRYPT_P) -> bytes:
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+    return Scrypt(salt=salt, length=32, n=n, r=r, p=p).derive(password.encode("utf-8"))
+
+
+def validate_kdf_params(kdf: Any) -> tuple[bytes, int, int, int]:
+    if not isinstance(kdf, dict) or kdf.get("name") != "scrypt":
+        raise ValueError("KDF 参数不受支持")
+    try:
+        salt = base64.b64decode(kdf.get("salt", ""), validate=True)
+        n, r, p = int(kdf["n"]), int(kdf["r"]), int(kdf["p"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("KDF 参数无效") from exc
+    if len(salt) != 16 or not (2**10 <= n <= 2**16 and n & (n - 1) == 0) or not (1 <= r <= 8 and 1 <= p <= 2):
+        raise ValueError("KDF 参数超出允许范围")
+    return salt, n, r, p
+
+
+def aes_gcm_seal(format_name: str, plaintext: bytes, password: str, aad: bytes | None = None) -> dict[str, Any]:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    salt, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
+    key = derive_scrypt_key(password, salt)
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext, aad if aad is not None else format_name.encode("utf-8"))
+    return {
+        "format": format_name,
+        "kdf": {"name": "scrypt", "salt": base64.b64encode(salt).decode("ascii"), "n": SCRYPT_N, "r": SCRYPT_R, "p": SCRYPT_P},
+        "cipher": "AES-256-GCM",
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+    }
+
+
+def aes_gcm_open(envelope: dict[str, Any], password: str, aad: bytes) -> bytes:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    if not isinstance(envelope, dict) or envelope.get("cipher") != "AES-256-GCM":
+        raise ValueError("加密信封格式不受支持")
+    salt, n, r, p = validate_kdf_params(envelope.get("kdf"))
+    try:
+        nonce = base64.b64decode(envelope["nonce"], validate=True)
+        ciphertext = base64.b64decode(envelope["ciphertext"], validate=True)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("加密信封缺少 nonce 或密文") from exc
+    if len(nonce) != 12:
+        raise ValueError("加密信封 nonce 无效")
+    key = derive_scrypt_key(password, salt, n, r, p)
+    return AESGCM(key).decrypt(nonce, ciphertext, aad)
+
+
+def encrypt_private_key(private_der: bytes, password: str) -> bytes:
+    envelope = aes_gcm_seal(KEY_ENVELOPE_VERSION, private_der, password)
+    return json.dumps(envelope, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+
+
+def decrypt_private_key(envelope: dict[str, Any], password: str) -> bytes:
+    if envelope.get("format") != KEY_ENVELOPE_VERSION:
+        raise ValueError("私钥信封格式不受支持")
+    return aes_gcm_open(envelope, password, KEY_ENVELOPE_VERSION.encode("utf-8"))
+
+
+def valid_private_key_blob(data: bytes) -> bool:
+    blob = data.lstrip()
+    if blob.startswith(LEGACY_KEY_PEM_PREFIX):
+        return True
+    if blob.startswith(b"{"):
+        try:
+            envelope = json.loads(blob)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        return isinstance(envelope, dict) and envelope.get("format") == KEY_ENVELOPE_VERSION
+    return False
+
+
 def generate_keys(password: str) -> tuple[bytes, bytes, str]:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
@@ -311,8 +440,8 @@ def generate_keys(password: str) -> tuple[bytes, bytes, str]:
     public = private.public_key()
     public_pem = public.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
     public_der = public.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-    private_pem = private.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.BestAvailableEncryption(password.encode()))
-    return public_pem, private_pem, hashlib.sha256(public_der).hexdigest()[:24]
+    private_der = private.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    return public_pem, encrypt_private_key(private_der, password), hashlib.sha256(public_der).hexdigest()[:24]
 
 
 def safe_json_for_html(value: Any) -> str:
@@ -372,8 +501,7 @@ def create_task(roster_path: Path, config_path: Path, out_parent: Path, password
     dump_json(root / "task.json", task)
     atomic_write(root / "public.pem", public_pem)
     atomic_write(root / "private.pem.enc", private_pem)
-    shutil.copyfile(roster_path, root / "roster.csv")
-    os.chmod(root / "roster.csv", 0o600)
+    atomic_write(root / "roster.csv", roster_path.read_bytes())
 
     template = (Path(__file__).resolve().parents[1] / "assets" / "invite_template.html").read_text(encoding="utf-8")
     db_rows, index_rows = [], []
@@ -388,11 +516,11 @@ def create_task(roster_path: Path, config_path: Path, out_parent: Path, password
         db_rows.append({**item, "invite_id": invite_id, "token_hash": sha256_bytes(invite_token.encode()), "created_at": created_at})
         index_rows.append({**item, "invite_id": invite_id, "invite_file": f"invites/{invite_name}"})
     index_path = root / "invite-index.csv"
-    with index_path.open("w", encoding="utf-8-sig", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=["employee_id", "name", "invite_id", "invite_file"])
-        writer.writeheader()
-        writer.writerows([{key: csv_text(value) for key, value in row.items()} for row in index_rows])
-    os.chmod(index_path, 0o600)
+    index_buffer = io.StringIO()
+    writer = csv.DictWriter(index_buffer, fieldnames=["employee_id", "name", "invite_id", "invite_file"])
+    writer.writeheader()
+    writer.writerows([{key: csv_text(value) for key, value in row.items()} for row in index_rows])
+    atomic_write(index_path, index_buffer.getvalue().encode("utf-8-sig"))
     init_db(root, db_rows)
     return {"task_id": task_id, "task_dir": str(root), "invite_count": len(index_rows)}
 
@@ -401,9 +529,7 @@ def cmd_create(args) -> dict[str, Any]:
     require_tty("create")
     password = generate_password()
     result = create_task(Path(args.roster), Path(args.config), Path(args.out), password, require_terminal=False)
-    print("\n任务密码（仅显示一次，丢失不可恢复）：")
-    print(password)
-    print("请通过独立安全渠道交给授权处理人员，不要写入任务目录或聊天提示词。\n")
+    print_once_secret("任务密码（仅显示一次，丢失不可恢复）：", password, "请通过独立安全渠道交给授权处理人员，不要写入任务目录或聊天提示词。")
     return result
 
 
@@ -450,6 +576,9 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path) -> dict[str, 
                 invite_id = validate_envelope_header(envelope, task)
                 if not db.execute("SELECT 1 FROM invites WHERE invite_id=?", (invite_id,)).fetchone():
                     raise ValueError("invite_id 不属于当前任务")
+                existing_versions = db.execute("SELECT COUNT(*) FROM submissions WHERE invite_id=?", (invite_id,)).fetchone()[0]
+                if existing_versions >= MAX_VERSIONS_PER_INVITE:
+                    raise ValueError(f"该邀请的提交版本数已达上限 {MAX_VERSIONS_PER_INVITE}，拒绝继续存储")
                 version = db.execute("SELECT COALESCE(MAX(version),0)+1 FROM submissions WHERE invite_id=?", (invite_id,)).fetchone()[0]
                 target_dir = root / "submissions" / invite_id
                 target_dir.mkdir(parents=True, exist_ok=True)
@@ -475,7 +604,14 @@ def cmd_ingest(args) -> dict[str, Any]:
 def unlock_private_key(root: Path, password: str):
     from cryptography.hazmat.primitives import serialization
 
-    return serialization.load_pem_private_key((root / "private.pem.enc").read_bytes(), password=password.encode())
+    data = (root / "private.pem.enc").read_bytes()
+    blob = data.lstrip()
+    if blob.startswith(b"{"):
+        private_der = decrypt_private_key(json.loads(data), password)
+        return serialization.load_der_private_key(private_der, password=None)
+    if not blob.startswith(LEGACY_KEY_PEM_PREFIX):
+        raise ValueError("私钥文件既不是 yintian-key/1 信封，也不是加密的 PKCS#8 PEM，拒绝解锁")
+    return serialization.load_pem_private_key(data, password=password.encode())
 
 
 def aad_for(envelope: dict[str, Any]) -> bytes:
@@ -516,7 +652,7 @@ def normalize_value(field_type: str, value: str) -> str:
 
 
 def validate_payload(task: dict[str, Any], invite: sqlite3.Row, payload: dict[str, Any]) -> tuple[list[str], list[str], list[dict[str, Any]]]:
-    from identity_extract import validate_chinese_id
+    from ocr_matcher import validate_chinese_id
 
     missing, conflicts, attachment_items = [], [], []
     if payload.get("notice_hash") != task["notice_hash"]:
@@ -610,10 +746,11 @@ def ocr_attachment(item: dict[str, Any]) -> tuple[str, list[str]]:
             for page_index in range(min(len(document), MAX_PDF_PAGES)):
                 page = document[page_index]
                 width, height = page.get_size()
-                if width * height * 4 > MAX_IMAGE_PIXELS:
+                rendered_w, rendered_h = width * PDF_RENDER_SCALE, height * PDF_RENDER_SCALE
+                if rendered_w * rendered_h > MAX_IMAGE_PIXELS:
                     flags.append("pdf_pixel_limit")
                     continue
-                bitmap = page.render(scale=2)
+                bitmap = page.render(scale=PDF_RENDER_SCALE)
                 image = bitmap.to_pil()
                 buffer = io.BytesIO()
                 image.save(buffer, format="PNG")
@@ -630,9 +767,14 @@ def ocr_attachment(item: dict[str, Any]) -> tuple[str, list[str]]:
     return "", []
 
 
+def is_identity_attachment_field(field_id: str) -> bool:
+    """附件字段按下划线分词后含整词 front/back 才视为证件正反面（避免误伤 backdrop、feedback_scan 等）。"""
+    return any(part in {"front", "back"} for part in field_id.split("_"))
+
+
 def compare_ocr(payload: dict[str, Any], attachments: list[dict[str, Any]], field_defs: list[dict[str, Any]]) -> list[str]:
-    """按字段类型与 front/back 语义匹配 OCR 结果与填写值，不依赖具体字段 id。"""
-    from identity_extract import _extract_from_text
+    """按字段类型匹配填写值；对 id 分词后含整词 front/back 的附件字段做 OCR 身份要素比对。"""
+    from ocr_matcher import extract_from_text as _extract_from_text
 
     fields: dict[str, list[Any]] = {}
     flags: list[str] = []
@@ -640,7 +782,7 @@ def compare_ocr(payload: dict[str, Any], attachments: list[dict[str, Any]], fiel
     checks = []
     for field in field_defs:
         field_id, field_type = field["id"], field["type"]
-        if field_type in ATTACHMENT_TYPES and ("front" in field_id or "back" in field_id):
+        if field_type in ATTACHMENT_TYPES and is_identity_attachment_field(field_id):
             identity_field_ids.add(field_id)
         if field_id == "name":
             checks.append((field_id, "name", "text"))
@@ -834,12 +976,13 @@ def cmd_reveal(args) -> dict[str, Any] | None:
     for field_id, items in payload.get("attachments", {}).items():
         for item in items:
             print(f"- {terminal_text(field_id)}: {terminal_text(item.get('name'))} ({terminal_text(item.get('type'))}, {terminal_text(item.get('size'))} bytes)")
-    input("\n查看完毕后按 Enter 清空当前屏幕（终端历史可能仍保留内容）…")
-    print("\033[2J\033[H", end="", flush=True)
+    input("\n查看完毕后按 Enter 清空当前屏幕与终端回滚缓冲区…")
+    print("\033[2J\033[3J\033[H", end="", flush=True)
     return None
 
 
-def export_task(task_dir: str | Path, out: str | Path) -> dict[str, Any]:
+def build_task_package(task_dir: str | Path) -> tuple[bytes, dict[str, Any]]:
+    """在内存中构建任务交接 ZIP（明文，含名单标识），供加密导出或测试复用。"""
     root, task = load_task(task_dir)
     if task_expired(task):
         raise RuntimeError("任务已超过保存期限，禁止导出；请执行清理")
@@ -857,6 +1000,24 @@ def export_task(task_dir: str | Path, out: str | Path) -> dict[str, Any]:
         raise ValueError("任务内容超过交接包安全上限")
     manifest = {path.relative_to(root).as_posix(): sha256_file(path) for path in files}
     metadata = {"package_version": TASK_PACKAGE_VERSION, "task_id": task["task_id"], "created_at": now_iso(), "manifest": manifest}
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("package.json", json.dumps(metadata, ensure_ascii=False, indent=2))
+        for path in files:
+            archive.write(path, task["task_id"] + "/" + path.relative_to(root).as_posix())
+    return buffer.getvalue(), {"task_id": task["task_id"], "files": len(files)}
+
+
+def task_package_aad(task_id: str) -> bytes:
+    return f"{ENCRYPTED_TASK_PACKAGE_VERSION}:{task_id}".encode("utf-8")
+
+
+def export_task(task_dir: str | Path, out: str | Path, handoff_password: str | None = None) -> dict[str, Any]:
+    root, task = load_task(task_dir)
+    zip_bytes, info = build_task_package(root)
+    password = handoff_password if handoff_password is not None else generate_password()
+    envelope = aes_gcm_seal(ENCRYPTED_TASK_PACKAGE_VERSION, zip_bytes, password, aad=task_package_aad(task["task_id"]))
+    envelope["task_id"] = task["task_id"]
     requested_out = Path(out).expanduser()
     if requested_out.is_symlink():
         raise ValueError("导出路径不能是符号链接")
@@ -867,20 +1028,21 @@ def export_task(task_dir: str | Path, out: str | Path) -> dict[str, Any]:
     with tempfile.NamedTemporaryFile(dir=out_path.parent, delete=False) as stream:
         temp_path = Path(stream.name)
     try:
-        with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("package.json", json.dumps(metadata, ensure_ascii=False, indent=2))
-            for path in files:
-                archive.write(path, task["task_id"] + "/" + path.relative_to(root).as_posix())
+        temp_path.write_bytes(json.dumps(envelope, ensure_ascii=False, indent=2).encode("utf-8") + b"\n")
         os.chmod(temp_path, 0o600)
         temp_path.replace(out_path)
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise
-    return {"task_id": task["task_id"], "package": str(out_path), "files": len(files)}
+    return {"task_id": task["task_id"], "package": str(out_path), "files": info["files"], "handoff_password": password}
 
 
 def cmd_export(args) -> dict[str, Any]:
-    return export_task(args.task_dir, args.out)
+    require_tty("export-task")
+    result = export_task(args.task_dir, args.out)
+    password = result.pop("handoff_password")
+    print_once_secret("交接密码（仅显示一次，丢失不可恢复）：", password, "请通过另一独立安全渠道告知接收方；不要与交接包同渠道发送，也不要写入任务目录或聊天提示词。")
+    return result
 
 
 def read_package_member(archive: zipfile.ZipFile, name: str, remaining: int) -> bytes:
@@ -896,11 +1058,43 @@ def read_package_member(archive: zipfile.ZipFile, name: str, remaining: int) -> 
                 raise ValueError("任务包解压后超过安全上限")
 
 
-def import_task(package: str | Path, out_parent: str | Path) -> dict[str, Any]:
+def open_task_package(package_path: Path, handoff_password: str | None = None) -> tuple[zipfile.ZipFile, bool]:
+    """打开交接包，返回 (archive, encrypted)。
+
+    yintian-task/3 加密信封先按 stat 尺寸拒绝超限文件，再解密认证；旧版明文 ZIP 打印警告后直接打开。
+    嗅探窗口内全为空白且尺寸未超限的内容按 v3 信封处理，避免大段前导空白被误判为明文包。
+    """
+    size = package_path.stat().st_size
+    with package_path.open("rb") as stream:
+        prefix = stream.read(V3_SNIFF_BYTES).lstrip()
+    if prefix.startswith(b"{") or not prefix:
+        if size > MAX_V3_ENVELOPE_BYTES:
+            raise ValueError("交接包信封超过 200MB 安全上限，拒绝读取")
+        try:
+            envelope = json.loads(package_path.read_bytes())
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError("交接包信封无效") from exc
+        if not isinstance(envelope, dict) or envelope.get("format") != ENCRYPTED_TASK_PACKAGE_VERSION:
+            raise ValueError("交接包格式不受支持")
+        task_id = envelope.get("task_id")
+        if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
+            raise ValueError("交接包 task_id 无效")
+        password = handoff_password if handoff_password is not None else getpass.getpass("交接密码: ")
+        try:
+            zip_bytes = aes_gcm_open(envelope, password, task_package_aad(task_id))
+        except Exception as exc:
+            raise ValueError("交接密码错误或交接包已被篡改，拒绝导入") from exc
+        return zipfile.ZipFile(io.BytesIO(zip_bytes)), True
+    print("警告：导入的是未加密的明文交接包（yintian-task/1 或 yintian-task/2），不能认证来源；仅在信任渠道下导入。", file=sys.stderr)
+    return zipfile.ZipFile(package_path), False
+
+
+def import_task(package: str | Path, out_parent: str | Path, handoff_password: str | None = None, confirm_plaintext=None) -> dict[str, Any]:
     package_path, parent = Path(package).expanduser().resolve(), Path(out_parent).expanduser().resolve()
     if package_path.stat().st_size > MAX_PACKAGE_BYTES:
         raise ValueError("任务包超过安全上限")
-    with zipfile.ZipFile(package_path) as archive:
+    archive, encrypted = open_task_package(package_path, handoff_password)
+    with archive:
         package_info = archive.getinfo("package.json")
         if package_info.file_size > 1024 * 1024:
             raise ValueError("任务包清单过大")
@@ -909,6 +1103,8 @@ def import_task(package: str | Path, out_parent: str | Path) -> dict[str, Any]:
         package_version = metadata.get("package_version")
         if package_version not in {LEGACY_TASK_PACKAGE_VERSION, TASK_PACKAGE_VERSION} or not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
             raise ValueError("任务包格式无效")
+        if not encrypted and confirm_plaintext is not None and not confirm_plaintext(task_id):
+            raise RuntimeError("未加密的明文交接包未经人工确认，已取消导入")
         raw_manifest = metadata.get("manifest")
         if not isinstance(raw_manifest, dict) or len(raw_manifest) > MAX_PACKAGE_FILES:
             raise ValueError("任务包清单无效或文件过多")
@@ -973,7 +1169,7 @@ def import_task(package: str | Path, out_parent: str | Path) -> dict[str, Any]:
 
             public_key = serialization.load_pem_public_key((target / "public.pem").read_bytes())
             public_der = public_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-            if hashlib.sha256(public_der).hexdigest()[:24] != imported_task["key_id"] or not (target / "private.pem.enc").read_bytes().startswith(b"-----BEGIN ENCRYPTED PRIVATE KEY-----"):
+            if hashlib.sha256(public_der).hexdigest()[:24] != imported_task["key_id"] or not valid_private_key_blob((target / "private.pem.enc").read_bytes()):
                 raise ValueError("任务包密钥材料无效")
             roster = read_roster(target / "roster.csv")
             with (target / "invite-index.csv").open("r", encoding="utf-8-sig", newline="") as stream:
@@ -990,11 +1186,20 @@ def import_task(package: str | Path, out_parent: str | Path) -> dict[str, Any]:
         except Exception:
             shutil.rmtree(target, ignore_errors=True)
             raise
+    if os.name != "nt":
+        for directory in [target, *(path for path in target.rglob("*") if path.is_dir())]:
+            os.chmod(directory, 0o700)
     return {"task_id": task_id, "task_dir": str(target)}
 
 
+def confirm_plaintext_import(task_id: str) -> bool:
+    typed = input(f"该交接包未加密且无法认证来源；输入任务 ID {task_id} 确认导入: ").strip()
+    return typed == task_id
+
+
 def cmd_import(args) -> dict[str, Any]:
-    return import_task(args.package, args.out)
+    require_tty("import-task")
+    return import_task(args.package, args.out, confirm_plaintext=confirm_plaintext_import)
 
 
 def cmd_purge(args) -> dict[str, Any]:
@@ -1032,9 +1237,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("task_dir"); p.add_argument("--formats", nargs="+", default=["xlsx", "json"]); p.set_defaults(func=cmd_report)
     p = sub.add_parser("reveal", help="人工终端按需查看一份明文")
     p.add_argument("task_dir"); p.add_argument("invite_id"); p.set_defaults(func=cmd_reveal)
-    p = sub.add_parser("export-task", help="导出含名单标识的敏感任务交接包")
+    p = sub.add_parser("export-task", help="导出加密的敏感任务交接包（yintian-task/3，一次性交接密码仅显示一次）")
     p.add_argument("task_dir"); p.add_argument("--out", required=True); p.set_defaults(func=cmd_export)
-    p = sub.add_parser("import-task", help="导入敏感任务交接包")
+    p = sub.add_parser("import-task", help="导入任务交接包（加密包需交互输入交接密码；v1/v2 明文旧包需输入任务 ID 二次确认）")
     p.add_argument("package"); p.add_argument("--out", required=True); p.set_defaults(func=cmd_import)
     p = sub.add_parser("purge", help="删除任务目录；不保证擦除备份或磁盘残留")
     p.add_argument("task_dir"); p.add_argument("--allow-early", action="store_true"); p.set_defaults(func=cmd_purge)

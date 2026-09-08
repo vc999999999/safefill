@@ -41,4 +41,4 @@ E002,李四
 
 ## OCR 交叉校验的字段匹配
 
-复核时按字段**类型**而非 id 匹配 OCR 证据：`cn_id` 对证件号、`phone_cn` 对手机号、`address` 对住址、`name` 对姓名；含 `front`/`back` 语义的附件字段视为证件正反面。自定义字段 id 不影响比对。OCR 与手填值冲突只进入人工复核，永不自动覆盖。
+复核时按字段**类型**而非 id 匹配 OCR 证据：`cn_id` 对证件号、`phone_cn` 对手机号、`address` 对住址、`name` 对姓名；附件字段 id 按下划线分词后含整词 `front`/`back`（如 `id_front`、`id_card_back`、`front`）才视为证件正反面，`backdrop`、`feedback_scan` 这类仅含子串的 id 不触发证件 OCR 比对。自定义字段 id 不影响比对。OCR 与手填值冲突只进入人工复核，永不自动覆盖。
