@@ -1,10 +1,10 @@
-> 3.5.0 可选识别的模式、宿主授权与 Python 边界以 [recognition.md](recognition.md) 为准；此前的“Agent 不接触原始附件”限制，仅对该文档明确授权的填写者原件识别入口作例外。收集者解密权限不变。
-
 # 本人终端操作
 
 敏感命令只在本人控制且未被 Agent 录制的终端运行。TTY 只能排除普通重定向，不能识别人类；同一操作系统账号下的其他程序不是强隔离边界。
 
 ## HR
+
+以下命令在收集者 Skill 目录内运行。
 
 1. 运行 `python scripts/collection.py doctor`。用 `init-config --mode group --out collection.json` 生成配置，填写用途、联系人、更正方式、期限，准备 `employee_id,name` 名单。
 2. 创建：`python scripts/collection.py create --roster roster.csv --config collection.json --out tasks --mode group`。
@@ -42,6 +42,6 @@
 
 ## 员工
 
-见 [填写端](../yintian-fill/README.md)。保险柜保存可复用字段及附件字节，日常填写不创建明文临时文件；不自动接管外部密码管理器或扫描磁盘。
+使用填写者 Skill `yintian-fill`。保险柜保存可复用字段及附件字节，日常填写不创建明文临时文件；不自动接管外部密码管理器或扫描磁盘。
 
 旧数据库迁移会把旧自动通过记录转为待重新复核，以免沿用旧版宽松 OCR 判断；用 review --retry-needs-review 重新核验。邀请和密文本身不改写。

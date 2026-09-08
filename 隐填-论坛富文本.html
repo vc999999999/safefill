@@ -1,14 +1,14 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>隐填：群里统一收，隐私各自守</title>
 <style>*{box-sizing:border-box}body{margin:0;color:#30444c;background:#eaf0ef;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:16px}.toolbar{position:sticky;top:0;z-index:2;background:#fff;border-bottom:1px solid #dce6e4;padding:14px 24px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}button{border:0;border-radius:6px;background:#087c79;color:#fff;font:inherit;padding:10px 17px;cursor:pointer}button:focus-visible{outline:3px solid #85c7c2;outline-offset:3px}.hint{font-size:13px;color:#60777e}.page{max-width:920px;margin:30px auto;padding:48px 58px 54px;background:#fff;border:1px solid #dce6e4;border-radius:8px}@media(max-width:640px){.page{margin:0;padding:26px 20px;border:0;border-radius:0}.toolbar{padding:12px 20px}table{display:block;overflow-x:auto}article h1{font-size:28px!important}}@media print{body{background:#fff}.toolbar{display:none}.page{border:0;margin:0;padding:0;max-width:none}h2,h3{break-after:avoid}tr{break-inside:avoid}}</style></head><body>
 <div class="toolbar"><button type="button" id="copy">复制论坛富文本</button><span class="hint" id="status" role="status" aria-live="polite">正文已排版 · Demo 视频位已预留 · 发布前插入实际视频</span></div>
-<main class="page"><article id="article" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;font-size:16px;color:#30444c;line-height:1.95;"><p style="font-size:12px;font-weight:700;letter-spacing:1.5px;color:#087c79;margin:0 0 12px;">AGENTIC PC · SKILLS · HYBRID AI</p>
+<main class="page"><article id="article" style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;font-size:16px;color:#30444c;line-height:1.95;"><p style="font-size:12px;font-weight:700;letter-spacing:1.5px;color:#087c79;margin:0 0 12px;">PRIVATE COLLECTION · TWO SKILLS · LOCAL FIRST</p>
 <h1 style="font-size:34px;line-height:1.45;margin:0 0 14px;color:#102e3c;">隐填：群里统一收，隐私各自守</h1>
-<p style="font-size:17px;line-height:1.8;margin:0 0 28px;color:#567078;">双 Skill × 个人保险柜 × 本地复核：面向 AI PC 的私密填报工作流</p>
+<p style="font-size:17px;line-height:1.8;margin:0 0 28px;color:#567078;">双 Skill × 个人保险柜 × 本地复核：从群内收集到 Excel，隐私有边界的填报工作流</p>
 <blockquote style="margin:0 0 22px;padding:18px 22px;border-left:4px solid #087c79;background:#f1f7f7;font-size:19px;line-height:1.85;color:#1c454b;">“请大家把手机号、身份证号和住址填进这张表，今天下班前收齐。”</blockquote>
 <p style="margin:0 0 18px;line-height:1.95;">这是一条再普通不过的工作群通知。真正让人犹豫的是下一步：打开表格，前面同事的资料也映入眼帘。填写一份信息，为什么需要同时获得查看其他人信息的权限？</p>
 <p style="margin:0 0 18px;line-height:1.95;">我做 <strong style="font-weight:700;color:#102e3c;">隐填（Yintian）</strong>，想把这个日常环节重新设计一遍：<strong style="font-weight:700;color:#102e3c;">HR 统一组织，员工各自填写，资料以密文交回，授权人员在本地得到 Excel。</strong></p>
 <p style="margin:0 0 18px;line-height:1.95;">为此，我把系统拆成两个能围绕同一任务协作的 Skill：一个面向收集者，一个面向填写者。公共模板连接两端，个人保险柜减少重复录入，本地程序完成验证、加密和复核。Agent 负责推进任务，敏感数据按明确的本地操作流程处理。</p>
-<p style="margin:0 0 18px;line-height:1.95;"><strong style="font-weight:700;color:#102e3c;">当前本地版本：3.4.0｜2 个 Skill｜主 Prompt 各 36 行｜149 项测试＋5 项子测试通过。</strong></p>
+<p style="margin:0 0 18px;line-height:1.95;"><strong style="font-weight:700;color:#102e3c;">当前本地版本：3.5.0｜2 个 Skill｜主 Prompt 各 37 行｜165 项测试＋17 项子测试通过。</strong></p>
 <div style="margin:28px 0;border:2px dashed #779d9d;background:#eff8f7;padding:32px 24px;text-align:center;border-radius:10px;">
 <p style="font-size:34px;line-height:1;margin:0 0 14px;color:#087c79;">▶</p>
 <p style="font-size:21px;font-weight:700;margin:0 0 8px;color:#163c40;">Demo 视频插入位置</p>
@@ -60,7 +60,7 @@
 <p style="margin:0 0 18px;line-height:1.95;">最终，HR 选择需要导出的字段，填写用途及接收方，在本地确认后生成 Excel。<strong style="font-weight:700;color:#102e3c;">只有每人最新且已通过的提交会被纳入总表。</strong> 需要时还可以对身份证号等字段选择遮罩规则。</p>
 <h2 style="font-size:25px;line-height:1.6;margin:42px 0 20px;padding-bottom:12px;border-bottom:1px solid #dce8e6;color:#102e3c;">三、技术：把协作交给 Agent，把关键规则落实到代码</h2>
 <h3 style="font-size:19px;line-height:1.7;margin:28px 0 14px;color:#153e46;">1. 两份短 Prompt，配合可验证的 Python 能力</h3>
-<p style="margin:0 0 18px;line-height:1.95;">隐填的两份主 Prompt 各 36 行，用来说明角色、适用场景、工具选择和敏感操作的交接方式。具体命令与配置细节按需读取参考文档。</p>
+<p style="margin:0 0 18px;line-height:1.95;">隐填的两份主 Prompt 各 37 行，用来说明角色、适用场景、工具选择和敏感操作的交接方式。具体命令与配置细节按需读取参考文档。</p>
 <table style="width:100%;border-collapse:collapse;margin:20px 0 24px;font-size:14px;line-height:1.8;text-align:left;">
 <tr>
 <th style="border:1px solid #dbe6e6;padding:11px 13px;vertical-align:top;background:#eff6f5;color:#214c50;">Prompt 负责</th>
@@ -89,10 +89,10 @@
 <p style="margin:0 0 18px;line-height:1.95;">个人保险柜使用 <strong style="font-weight:700;color:#102e3c;">scrypt 派生密钥与 AES-256-GCM</strong> 保存字段和值、附件字节。提交时，为内容生成随机 AES 密钥，再用收集方的 RSA 公钥通过 <strong style="font-weight:700;color:#102e3c;">RSA-OAEP</strong> 包装该密钥。</p>
 <p style="margin:0 0 18px;line-height:1.95;">新版群发信封还带有 <strong style="font-weight:700;color:#102e3c;">HMAC-SHA256</strong> 认证标签，覆盖信封头和密文。收件端验证通过后才落盘并计入版本，解密后继续核对令牌、名单、任务与模板。</p>
 <p style="margin:0 0 18px;line-height:1.95;">个人凭据证明持有本任务的个人秘密，不能证明证件真伪，也无法阻止本人主动转借。因此，身份认证、证据复核和公钥核对分别承担各自的责任。</p>
-<h3 style="font-size:19px;line-height:1.7;margin:28px 0 14px;color:#153e46;">3. Hybrid AI：让本地算力处理有明确边界的工作</h3>
-<p style="margin:0 0 18px;line-height:1.95;">隐填采用的分工是：<strong style="font-weight:700;color:#102e3c;">任务理解、步骤协调和进度沟通由宿主 Agent 完成；保险柜取值、加密、附件复核和明文汇总在本地完成。</strong> 当宿主采用云端模型时，设计上无需把完整证件影像、保险柜内容或明文总表送进对话上下文。</p>
+<h3 style="font-size:19px;line-height:1.7;margin:28px 0 14px;color:#153e46;">3. 本地优先，直接复用宿主 Agent 的识别能力</h3>
+<p style="margin:0 0 18px;line-height:1.95;">隐填采用的分工是：<strong style="font-weight:700;color:#102e3c;">任务理解、步骤协调和已授权原件的识别由宿主 Agent 完成；保险柜取值、加密、规则校验和明文汇总在本地完成。</strong> 本地 OCR 可用时优先处理；不可用时，可直接使用宿主已有的看图能力，无需另配 API Key。本人须先授权所选原件：云端宿主会处理这些附件，保险柜密码、整库内容和明文总表仍留在本地。</p>
 <p style="margin:0 0 18px;line-height:1.95;">项目保留 <strong style="font-weight:700;color:#102e3c;">RapidOCR / OpenVINO</strong> 本地 OCR 接入，以及 CPU、GPU、NPU、AUTO 设备配置和量化、基准测试入口。对 AI PC 而言，附件识别与复核是明确的端侧计算任务：有输入、有结构化结果，也有需要测量的延迟与准确率。</p>
-<p style="margin:0 0 18px;line-height:1.95;">这些入口为 Intel Core Ultra 平台验证提供了基础。当前验证环境未运行真实 OCR，也没有 Intel GPU/NPU 或 INT8 收益数据，本文不把接口存在当成加速效果已经证实。</p>
+<p style="margin:0 0 18px;line-height:1.95;">识别方式可以按附件选择本地优先、仅本地、Agent 或人工。Agent 候选与模板和附件摘要绑定，随提交一同加密；即使候选与填写值一致，也须由授权 HR 对照原件确认。宿主不支持看图或本人不授权时，人工流程仍可继续。Intel GPU/NPU 和 INT8 收益仍待实机验证。</p>
 <p style="margin:0 0 18px;line-height:1.95;">短 Prompt、按需加载参考文档、返回结构化状态，旨在减少上下文中的无关内容。实际 token 使用和模型行为通过率，需要通过宿主工具中的执行记录另行测量。</p>
 <h3 style="font-size:19px;line-height:1.7;margin:28px 0 14px;color:#153e46;">4. 工程化体现在出错之后还能怎样处理</h3>
 <p style="margin:0 0 18px;line-height:1.95;">隐填把输入错误、OCR 问题和运行故障分开处理：缺必填、格式错误、身份不符或缺少告知确认，不能人工放行；人工确认仅裁定 OCR 问题；文件访问或依赖故障可以修复后重试。人工结案保留操作者、时间、提交版本和原因记录，普通重试不会覆盖它。</p>
@@ -107,11 +107,11 @@
 </tr>
 <tr>
 <td style="border:1px solid #dbe6e6;padding:11px 13px;vertical-align:top;">自动化回归</td>
-<td style="border:1px solid #dbe6e6;padding:11px 13px;vertical-align:top;">macOS / Python 3.11：149 项测试、5 项子测试通过</td>
+<td style="border:1px solid #dbe6e6;padding:11px 13px;vertical-align:top;">macOS / Python 3.11：165 项测试、17 项子测试通过</td>
 </tr>
 <tr>
-<td style="border:1px solid #dbe6e6;padding:11px 13px;vertical-align:top;">原测试入口</td>
-<td style="border:1px solid #dbe6e6;padding:11px 13px;vertical-align:top;">9 个模块全部通过，0 跳过</td>
+<td style="border:1px solid #dbe6e6;padding:11px 13px;vertical-align:top;">无需硬件的完整操作链路</td>
+<td style="border:1px solid #dbe6e6;padding:11px 13px;vertical-align:top;">未安装 RapidOCR/OpenVINO、未配置 API；真实 CLI、宿主看图、浏览器下载、Tk 复核、Excel 与交接导入已跑通</td>
 </tr>
 <tr>
 <td style="border:1px solid #dbe6e6;padding:11px 13px;vertical-align:top;">数据链路</td>
@@ -131,5 +131,5 @@
 </tr>
 </table>
 <p style="margin:0 0 18px;line-height:1.95;">当前成果覆盖软件闭环和合成数据回归。比赛指定 Agent 平台中的完整录屏、Intel Core Ultra 实机与本地模型推理、真实证件准确率、跨平台运行和实际用户效果，仍需要补充各自的现场或实测证据。</p>
-<p style="margin:0 0 18px;line-height:1.95;">项目仓库：<a href="https://github.com/vc999999999/yintian" style="color:#087c79;text-decoration:underline;">vc999999999/yintian</a>。本文按当前本地 3.4.0 实现撰写。</p></article></main>
+<p style="margin:0 0 18px;line-height:1.95;">项目仓库：<a href="https://github.com/vc999999999/yintian" style="color:#087c79;text-decoration:underline;">vc999999999/yintian</a>。本文对应 3.5.0；交付目录只包含收集者 Skill、填写者 Skill 和本文。</p></article></main>
 <script>const button=document.getElementById('copy'),status=document.getElementById('status'),article=document.getElementById('article');button.addEventListener('click',async()=>{button.disabled=true;const html='<html><body>'+article.outerHTML+'</body></html>';try{if(!navigator.clipboard?.write||typeof ClipboardItem==='undefined')throw new Error('fallback');await navigator.clipboard.write([new ClipboardItem({'text/html':new Blob([html],{type:'text/html'}),'text/plain':new Blob([article.innerText],{type:'text/plain'})})]);status.textContent='已复制正文。粘贴到论坛富文本编辑器，再替换 Demo 视频位。';}catch(error){const selection=window.getSelection(),previous=[];for(let i=0;i<selection.rangeCount;i++)previous.push(selection.getRangeAt(i));const range=document.createRange();range.selectNodeContents(article);selection.removeAllRanges();selection.addRange(range);const listener=event=>{event.clipboardData.setData('text/html',html);event.clipboardData.setData('text/plain',article.innerText);event.preventDefault();};document.addEventListener('copy',listener);let ok=false;try{ok=document.execCommand('copy');}catch(_){}finally{document.removeEventListener('copy',listener);}if(ok){selection.removeAllRanges();for(const saved of previous)selection.addRange(saved);status.textContent='已复制正文。粘贴到论坛富文本编辑器，再替换 Demo 视频位。';}else status.textContent='已选中正文。请按 Ctrl+C / ⌘C 复制，再粘贴到论坛编辑器。';}finally{button.disabled=false;}});</script></body></html>

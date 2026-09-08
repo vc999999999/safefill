@@ -1,30 +1,17 @@
 name: tests
-
 on:
   push:
   pull_request:
-
 jobs:
   pytest:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # 项目目标版本为 3.11（info.json / SKILL.md）；OCR 栈 rapidocr-openvino 1.4.4
-        # 依赖 openvino<=2024.0.0，该版本没有 3.12 的 wheel，故 3.12 不可支持，不加进矩阵。
-        python-version: ["3.11"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-      - run: python -m pip install --upgrade pip
-        # 按 requirements-dev.txt 安装（其内部 -r requirements.txt 拉齐全部运行时依赖），
-        # 与本地 pytest 环境保持一致，避免 CI 与被测代码依赖漂移。
-      - run: pip install -r requirements-dev.txt
-      - run: pytest scripts/ -q
-      # 填写端 Skill：测试 import 根仓 scripts/ 需 PYTHONPATH 指向仓库根（命名空间包）
-      - name: pytest yintian-fill（填写端 Skill）
-        run: pytest yintian-fill/scripts/ -q
+          python-version: "3.11"
+      - run: python -m pip install -r yintian-skill/requirements-dev.txt
+      - run: python -m pytest yintian-skill/scripts -q -p no:cacheprovider
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          PYTHONDONTWRITEBYTECODE: "1"
+      - run: node yintian-skill/tests/browser_contract.cjs

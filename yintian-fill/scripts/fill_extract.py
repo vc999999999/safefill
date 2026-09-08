@@ -11,23 +11,8 @@ from typing import Any
 
 
 def _import_ocr_matcher():
-    try:
-        import ocr_matcher
-        return ocr_matcher
-    except ImportError:
-        pass
-    repo_scripts = Path(__file__).resolve().parents[2] / "scripts"
-    if (repo_scripts / "ocr_matcher.py").is_file():
-        if str(repo_scripts) not in sys.path:
-            sys.path.insert(0, str(repo_scripts))
-        try:
-            import ocr_matcher
-            return ocr_matcher
-        except ImportError:
-            pass
-    raise RuntimeError(
-        "找不到收集端 scripts/ocr_matcher.py；请在完整隐填仓库内使用本 Skill（yintian-fill/ 应与收集端 scripts/ 同级）"
-    )
+    import ocr_matcher
+    return ocr_matcher
 
 
 ocr_matcher = _import_ocr_matcher()

@@ -10,6 +10,7 @@ import types
 import unittest
 from unittest.mock import patch
 
+import collection
 import fill
 import vault
 import collection

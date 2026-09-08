@@ -9,7 +9,7 @@ metadata:
 
 目标：群内统一发模板，员工本机加密交回，授权 HR 本地汇总 Excel。
 
-以本文件目录为 `SKILL_ROOT`，使用已安装依赖的 Python 绝对路径。员工收到模板要填写时，转到 `yintian-fill/SKILL.md`。
+以本文件目录为 `SKILL_ROOT`，使用已安装依赖的 Python 绝对路径。员工收到模板要填写时，使用同级 `yintian-fill` Skill（填写者）。
 
 1. 根据用户已给出的用途、字段、期限和名单准备任务配置，只补问缺失项。配置规则见 [collection-config.md](references/collection-config.md)。
 2. 交给 HR 在自己的终端创建任务。群发只发布 `FORM.yintian-form`；每人的 `.yintian-credential` 私下发给对应本人。定向邀请也只能逐人发放。

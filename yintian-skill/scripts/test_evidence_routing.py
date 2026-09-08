@@ -13,7 +13,7 @@ import collection
 import evidence_routing as routing
 import secure_io
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'yintian-fill/scripts'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'yintian-fill/scripts'))
 import fill
 from PIL import Image
 

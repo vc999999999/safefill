@@ -1,25 +1,20 @@
-> 3.5.0 支持通过 `--agent-ocr` 交接宿主 Agent 候选，无需 API。请先阅读 [授权与候选格式](references/recognition.md)。核心脚本依然不联网。
+# 隐填 · 填写者 3.5.0
 
-# 隐填填写端 3.5.0
+从本人的加密保险柜选择模板要求的资料，确认后生成 .yintian 密文。整个文件夹可独立安装，不需要收集者源码。
 
-收到 HR 模板后，让 Skill 查看用途、字段、期限和指纹。密码与真实取值由本人在独立终端输入。
-
-Python 3.11+，安装根目录 `requirements-core.txt`。源码与收集端一起使用；发布包内的填写 Skill 附带公共模块，可单独安装。
+在本文件夹中用 Python 3.11+ 安装并运行：
 
 ```bash
+python -m pip install -r requirements.txt
 python scripts/fill.py inspect FORM.yintian-form --json
 python scripts/fill.py vault-init FORM.yintian-form --vault personal.yintian-vault
-python scripts/fill.py fill FORM.yintian-form --vault personal.yintian-vault --credential GRP-E001.yintian-credential --out reply.yintian
+python scripts/fill.py fill FORM.yintian-form --vault personal.yintian-vault --credential PERSONAL.yintian-credential --out reply.yintian
 ```
 
-源码路径为 `yintian-fill/scripts/fill.py`，上面使用安装后的填写 Skill 目录。定向邀请不传 `--credential`。
+群发模板需要 HR 私下发给本人的凭据；定向模板不传 --credential。先通过独立渠道核对公钥。vault-init、vault-edit、fill、seal 均由本人在独立终端运行，Agent 不旁观密码或保险柜内容。
 
-`vault-init` 隐藏输入字段与指定附件，密码至少 12 字符，输入 `SAVE` 后只保存加密保险柜。`vault-edit` 同样参数更新。附件字节一并加密，不创建明文临时文件。
+保险柜只在本人输入密码后解锁。本次字段按显式映射、同名同类型或唯一语义类型匹配；多候选和缺项交给本人处理。--mapping mapping.json 可以明确指定字段对应关系。
 
-`fill` 只匹配本次字段。本人补缺项、独立核对 HR 指纹、查看本次取值及附件数量，输入任务编号确认后产出密文。取消或失败不产出文件；原保险柜不被本次填报自动改写。
+本地 OCR 为可选能力；需要时额外安装 requirements-ocr.txt。本人明确授权宿主查看指定原件后，Agent 可生成候选；fill 增加 --agent-ocr agent-result.json 即可交接，无需独立 API。云端宿主会处理被授权的附件，详见 [识别授权与格式](references/recognition.md)。
 
-自定义字段用 `--mapping mapping.json`，如 `{"mobile":"phone"}`。多候选不会自动选择；跨类型映射拒绝。
-
-只交回 `.yintian`，不发送保险柜或个人凭据到群里。工具不接管其他密码管理器，不扫描个人磁盘。
-
-手工兼容：`seal FORM --values values.json --credential PERSONAL --out reply.yintian`，仍需本人终端确认；明文 JSON 由本人清理，不交给 Agent。
+只交回 .yintian，不发保险柜、凭据或明文候选到群里。候选须在本人终端另外确认并与资料一起加密；收集者仍须对照原件人工复核。手工 seal --values values.json 保留为兼容入口，本人负责清理明文输入与候选文件。

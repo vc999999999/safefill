@@ -15,3 +15,5 @@ dist/
 *.yintian-credential
 values.json
 personal*.json
+
+.DS_Store

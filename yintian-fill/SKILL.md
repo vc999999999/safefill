@@ -2,7 +2,7 @@
 name: yintian-fill
 description: 员工收到隐填 .yintian-form 或个人邀请后，从自己的加密保险柜本地填写并生成 .yintian 提交。适用于个人私密填报；不处理 HR 汇总、普通文案或他人资料。
 metadata:
-  compatibility: "Python 3.11+；requirements-core.txt；源码需完整仓库，发布包可独立安装。"
+  compatibility: "Python 3.11+；requirements.txt；文件夹可独立安装。"
 ---
 
 # 隐填 · 填写者

@@ -18,7 +18,7 @@ import time
 import zipfile
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(REPO / 'scripts'), str(REPO / 'yintian-fill/scripts')]
+sys.path[:0] = [str(REPO / 'scripts'), str(REPO.parent / 'yintian-fill/scripts')]
 import collection
 import secure_io
 from PIL import Image, ImageDraw, ImageFont
@@ -39,7 +39,7 @@ def main():
         secure_io.atomic_write(root / 'flow-evidence.json', collection.canonical(events))
         print(json.dumps(event, ensure_ascii=False), flush=True)
     def cli(name, arguments, replies=(), gui=False, secret_heading=None):
-        script = REPO / ('tests/gui_cli.py' if gui else 'scripts/collection.py' if name == 'hr' else 'yintian-fill/scripts/fill.py')
+        script = REPO / 'tests/gui_cli.py' if gui else REPO / 'scripts/collection.py' if name == 'hr' else REPO.parent / 'yintian-fill/scripts/fill.py'
         pid, fd = pty.fork()
         if pid == 0:
             os.environ['PYTHONUNBUFFERED'] = '1'

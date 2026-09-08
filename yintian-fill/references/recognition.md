@@ -52,7 +52,7 @@
 员工本人运行：
 
 ```bash
-python yintian-fill/scripts/fill.py fill FORM.yintian-form --vault personal.yintian-vault --credential PERSONAL.yintian-credential --agent-ocr agent-result.json --out reply.yintian
+python /绝对路径/yintian-fill/scripts/fill.py fill FORM.yintian-form --vault personal.yintian-vault --credential PERSONAL.yintian-credential --agent-ocr agent-result.json --out reply.yintian
 ```
 
 也支持兼容 seal 入口的 --agent-ocr。本人先核对公钥、字段和附件，再输入 AGENT 确认候选来源，最后确认任务编号。缺确认、过期、附件或模板不匹配时不生成密文。生成成功后，由本人删除候选明文文件；源附件按本人的保存规则处理。保险柜解锁结果始终不提供给 Agent。

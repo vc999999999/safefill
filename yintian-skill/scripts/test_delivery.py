@@ -26,19 +26,31 @@ class DeliveryTests(unittest.TestCase):
             extracted = root / 'unpacked'
             with zipfile.ZipFile(one) as archive:
                 names = archive.namelist()
-                self.assertTrue(all(name.startswith('yintian-skill/') for name in names))
+                self.assertEqual({name.split('/')[0] for name in names}, {'yintian-skill', 'yintian-fill', package_skill.ARTICLE})
                 self.assertFalse(any('__pycache__' in name or '/test_' in name or
                                      name.endswith(('.yintian-vault', '.yintian-credential', '.yintian', '.sqlite3'))
                                      for name in names))
                 archive.extractall(extracted)
             filler = root / 'independent'
-            shutil.move(extracted / 'yintian-skill/yintian-fill', filler)
+            shutil.move(extracted / 'yintian-fill', filler)
+            collector = root / 'collector-independent'
+            shutil.move(extracted / 'yintian-skill', collector)
             shutil.rmtree(extracted)
             env = os.environ.copy()
             env.pop('PYTHONPATH', None)
             env['PYTHONNOUSERSITE'] = '1'
             env['PYTHONDONTWRITEBYTECODE'] = '1'
             ns = fixtures.make_group_scenario(root)
+            doctor = subprocess.run([sys.executable, str(collector / 'scripts/collection.py'), 'doctor'],
+                                    cwd=collector, env=env, capture_output=True, text=True, check=True, timeout=20)
+            self.assertTrue(json.loads(doctor.stdout)['core_ready'])
+            create = subprocess.run([sys.executable, '-c',
+                'import sys,json;sys.path.insert(0,sys.argv[1]);import collection;from pathlib import Path;'
+                'print(json.dumps(collection.create_task(Path(sys.argv[2]),Path(sys.argv[3]),Path(sys.argv[4]),"Synthetic-isolated-collector",require_terminal=False)))',
+                str(collector / 'scripts'), str(ns.task_dir / 'roster.csv'), str(ns.task_dir / 'task.json'), str(root / 'isolated-created')],
+                cwd=collector, env=env, capture_output=True, text=True, check=True, timeout=20)
+            isolated_task = Path(json.loads(create.stdout)['task_dir'])
+            self.assertTrue(list((isolated_task / 'invites').glob('*.html')))
             inspected = subprocess.run([sys.executable, str(filler / 'scripts/fill.py'), 'inspect',
                                         str(ns.task_dir / 'FORM.yintian-form'), '--json'],
                                        cwd=filler, env=env, capture_output=True, text=True, check=True, timeout=20)

@@ -19,6 +19,7 @@ import tempfile
 import types
 from pathlib import Path
 
+import collection
 import fill
 import fill_extract
 

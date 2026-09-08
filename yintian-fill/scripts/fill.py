@@ -31,18 +31,11 @@ class FillError(Exception):
 
 
 def _bootstrap_repo_scripts() -> None:
-    try:
-        import collection  # noqa: F401
-        import ocr_matcher  # noqa: F401
-        return
-    except ImportError:
-        pass
-    repo_scripts = Path(__file__).resolve().parents[2] / "scripts"
-    if (repo_scripts / "collection.py").is_file() and (repo_scripts / "ocr_matcher.py").is_file():
-        if str(repo_scripts) not in sys.path:
-            sys.path.insert(0, str(repo_scripts))
-        return
-    raise RuntimeError("找不到收集端 scripts/collection.py；请在完整隐填仓库内使用本 Skill（yintian-fill/ 应与收集端 scripts/ 同级）")
+    scripts = Path(__file__).resolve().parent
+    if not all((scripts / name).is_file() for name in ('collection.py', 'ocr_matcher.py', 'secure_io.py', 'evidence_routing.py')):
+        raise RuntimeError("填写者 Skill 安装不完整，请重新复制整个 yintian-fill 文件夹")
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
 
 
 _bootstrap_repo_scripts()

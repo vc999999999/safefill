@@ -32,6 +32,8 @@ Tk 图片/PDF 组件测试另覆盖两页 PDF 和五分钟空闲关闭。测试�
 
 ## 回归与复现
 
+目录整理后再次验证：165 项测试、17 项子用例通过（177.91 秒）；独立收集者建任务、独立填写者提交及 MCP 检查通过。两个 Skill 不依赖旧仓库路径；根目录只保留两端 Skill 与一份富文本 HTML。
+
 最终全量：165 passed、17 subtests passed，175.15 秒。追加 MCP/独立包测试 2 passed；浏览器脚本单测覆盖类型、大小、数量、告知、必填、读取顺序及日期边界；真实 Tk 组件测试通过。两个 Skill 的结构校验及 git diff --check 通过。
 
 - 新识别路由测试覆盖本地优先、四种模式、旧模板、候选缺失/冲突/歧义、错误绑定、超限、路径链接、无确认无产物，以及硬性输入错误不能由模型修复。
@@ -40,13 +42,13 @@ Tk 图片/PDF 组件测试另覆盖两页 PDF 和五分钟空闲关闭。测试�
 - `tests/full_flow.py --out OUT` 为 macOS 合成操作驱动器；在 ready.json 出现后，用宿主识别其指定合成图、写候选，并完成指定 HTML 的浏览器真实下载。`tests/gui_cli.py` 只用于合成测试，不作为生产权限绕过入口，不进入发布包。
 
 ```bash
-python -m pytest -q scripts yintian-fill/scripts
+python -m pytest -q scripts -p no:cacheprovider
 python scripts/run_tests.py
 python tests/full_flow.py --out /absolute/synthetic-run
 node tests/browser_contract.cjs
 ```
 
-本次完整日志、JUnit、浏览器截图、候选原件、Excel 和交接包保存在仓库外的 `../yintian-flow-3.5.0/`。发布包只包含技能运行所需内容，不含这些运行产物、测试驱动器或真实任务。
+历史测试原始产物已随用户要求从项目目录清理；验证摘要保留在本 Skill 的 evals/validation.json。测试脚本仍可复现软件链路，实际数据与日志应输出到项目之外。
 
 ## 未验证的范围
 
