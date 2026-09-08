@@ -1,55 +1,25 @@
-# 隐填 · 填写端（yintian-fill）
+> 3.5.0 支持通过 `--agent-ocr` 交接宿主 Agent 候选，无需 API。请先阅读 [授权与候选格式](references/recognition.md)。核心脚本依然不联网。
 
-员工在自己电脑上填写"隐填"需求格式文件并本机加密，产出 `.yintian` 密文交回发放人。全程离线，明文不出本机。
+# 隐填填写端 3.5.0
 
-## 安装
+收到 HR 模板后，让 Skill 查看用途、字段、期限和指纹。密码与真实取值由本人在独立终端输入。
 
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt   # 仅需 cryptography
-# 可选：证件扫描 OCR
-.venv/bin/pip install rapidocr-openvino==1.4.4 openvino==2024.0.0
-```
-
-本 Skill 复用收集端加密实现，`yintian-fill/` 需与收集端 `scripts/` 同级（完整仓库内即满足）。
-
-## 三分钟上手
+Python 3.11+，安装根目录 `requirements-core.txt`。源码与收集端一起使用；发布包内的填写 Skill 附带公共模块，可单独安装。
 
 ```bash
-# 0. 收到发放人私聊发来的 FORM.yintian-form
-# 1. 先核对：任务编号、公钥指纹须与发放人告知的一致
-.venv/bin/python scripts/fill.py inspect FORM.yintian-form
-
-# 2. 可选：扫描本人证件，候选一律遮罩展示，自己确认取值
-.venv/bin/python scripts/fill.py scan-idcard 证件照.png
-
-# 3. 按 inspect 列出的字段写 values.json
-cat > values.json <<'EOF'
-{
-  "values": {"name": "张三", "phone": "13800138000", "id_number": "110105198503071230", "address": "北京市朝阳区"},
-  "attachments": {"id_front": "front.png", "id_back": "back.png"}
-}
-EOF
-chmod 600 values.json
-
-# 4. 本机加密，产出密文
-.venv/bin/python scripts/fill.py seal FORM.yintian-form --values values.json --out 张三.yintian
-
-# 5. 私聊把 张三.yintian 交回发放人，然后删除 values.json
+python scripts/fill.py inspect FORM.yintian-form --json
+python scripts/fill.py vault-init FORM.yintian-form --vault personal.yintian-vault
+python scripts/fill.py fill FORM.yintian-form --vault personal.yintian-vault --credential GRP-E001.yintian-credential --out reply.yintian
 ```
 
-group（群组）模式没有邀请令牌，`values.json` 顶层另加 `"employee_id": "E001"`，提交标识自动为 `GRP-E001`；directed（定向）模式的邀请编号与令牌已内含在格式文件中。
+源码路径为 `yintian-fill/scripts/fill.py`，上面使用安装后的填写 Skill 目录。定向邀请不传 `--credential`。
 
-## FAQ
+`vault-init` 隐藏输入字段与指定附件，密码至少 12 字符，输入 `SAVE` 后只保存加密保险柜。`vault-edit` 同样参数更新。附件字节一并加密，不创建明文临时文件。
 
-- **填错了怎么办？** 改 values.json 重跑 seal，把新 `.yintian` 再交回一次即可；收集端复核时同一邀请的最新有效版本自动取代旧版本。
-- **seal 报错不产文件？** 校验与收集端复核完全同规则（必填、手机号、身份证校验码、日期、选项、附件 5MB/15MB 上限），错误会一次列全，逐条改完重跑。
-- **没有 OCR 依赖能用吗？** 能。inspect 和 seal 只需要 cryptography；scan-idcard 缺失依赖时会提示安装，也可以直接手动填写。
-- **values.json 能发给发放人参考吗？** 不能。它是明文，只存在于你自己电脑上；交回的只有 `.yintian` 密文，用完请删除 values.json。
-- **格式文件被改过了会怎样？** inspect/seal 会校验字段清单哈希、告知内容哈希与公钥指纹，任一不一致都会拒绝并提示重新索取。
+`fill` 只匹配本次字段。本人补缺项、独立核对 HR 指纹、查看本次取值及附件数量，输入任务编号确认后产出密文。取消或失败不产出文件；原保险柜不被本次填报自动改写。
 
-## 测试
+自定义字段用 `--mapping mapping.json`，如 `{"mobile":"phone"}`。多候选不会自动选择；跨类型映射拒绝。
 
-```bash
-python -m pytest scripts/test_fill.py -q   # 或直接 python scripts/test_fill.py
-```
+只交回 `.yintian`，不发送保险柜或个人凭据到群里。工具不接管其他密码管理器，不扫描个人磁盘。
+
+手工兼容：`seal FORM --values values.json --credential PERSONAL --out reply.yintian`，仍需本人终端确认；明文 JSON 由本人清理，不交给 Agent。

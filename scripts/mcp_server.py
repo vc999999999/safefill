@@ -46,7 +46,11 @@ def _relativize_cleanup_result(result: dict[str, Any]) -> dict[str, Any]:
 @mcp.tool()
 def openvino_status() -> dict[str, Any]:
     """检查本机 OpenVINO 版本和可用推理设备，不读取私密材料。"""
-    return runtime_info()
+    try:
+        return {**runtime_info(), 'available': True, 'required': False}
+    except (ImportError, RuntimeError):
+        return {'available': False, 'required': False, 'code': 'LOCAL_OCR_UNAVAILABLE',
+                'next_step': 'auto 模板可使用本人授权的宿主 Agent 候选或本地人工复核；无需 API Key'}
 
 
 @mcp.tool()

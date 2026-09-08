@@ -6,6 +6,7 @@ import base64
 import csv
 import getpass
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -16,13 +17,21 @@ import sqlite3
 import string
 import sys
 import tempfile
+import unicodedata
 import zipfile
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import secure_io
+import evidence_routing
+
 FORMAT_VERSION = "yintian-submission/2"
+GROUP_FORMAT_VERSION = "yintian-submission/3"
+AUTH_VERSION = "hmac-sha256-token/1"
+CREDENTIAL_FORMAT = "yintian-credential/1"
+DB_VERSION = 1
 LEGACY_FORMAT_VERSION = "yintian-submission/1"
 LEGACY_TASK_PACKAGE_VERSION = "yintian-task/1"
 TASK_PACKAGE_VERSION = "yintian-task/2"
@@ -69,6 +78,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def terminal_text(value):
+    return ''.join(char if unicodedata.category(char) not in {'Cc', 'Cf'} else ' ' for char in str(value))
+
+
 def parse_time(value: str) -> datetime:
     value = value.strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
@@ -107,32 +120,15 @@ def sha256_bytes(value: bytes) -> str:
 
 
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_bytes(secure_io.read_bytes(path, MAX_PACKAGE_MEMBER_BYTES))
 
 
 def atomic_write(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-            temp = Path(stream.name)
-            stream.write(data)
-        temp.replace(path)
-    except BaseException:
-        if temp is not None:
-            try:
-                temp.unlink()
-            except FileNotFoundError:
-                pass
-        raise
+    secure_io.atomic_write(path, data)
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(secure_io.read_bytes(path, MAX_V3_ENVELOPE_BYTES))
 
 
 def dump_json(path: Path, value: Any) -> None:
@@ -187,17 +183,19 @@ def task_late(task: dict[str, Any], received_at: str) -> bool:
 
 
 def load_task(task_dir: str | Path) -> tuple[Path, dict[str, Any]]:
-    root = Path(task_dir).expanduser().resolve()
+    root = secure_io.checked_path(task_dir)
     task_path = root / "task.json"
     if not task_path.is_file():
         raise FileNotFoundError(f"不是有效任务目录: {root}")
     task = load_json(task_path)
     if not TASK_ID_RE.fullmatch(task.get("task_id", "")):
         raise ValueError("task.json 中的 task_id 无效")
-    if task.get("format_version") not in {LEGACY_FORMAT_VERSION, FORMAT_VERSION}:
+    if task.get("format_version") not in {LEGACY_FORMAT_VERSION, FORMAT_VERSION, GROUP_FORMAT_VERSION}:
         raise ValueError("任务格式版本不受支持")
     if task.get("mode", "directed") not in TASK_MODES:
         raise ValueError("task.json 中的 mode 无效")
+    if task.get("format_version") == GROUP_FORMAT_VERSION and (task_mode(task) != "group" or task.get("submission_auth") != AUTH_VERSION):
+        raise ValueError("GROUP_AUTH_REQUIRED: 群发任务缺少认证配置")
     required = ("key_id", "title", "purpose", "deadline", "retention_until", "contact", "correction", "template_version", "schema_hash", "notice_hash", "fields")
     if any(key not in task for key in required) or not isinstance(task["fields"], list):
         raise ValueError("task.json 缺少必要配置")
@@ -205,6 +203,7 @@ def load_task(task_dir: str | Path) -> tuple[Path, dict[str, Any]]:
         raise ValueError("task.json 保存期限无效")
     if sha256_bytes(canonical(task["fields"])) != task["schema_hash"]:
         raise ValueError("task.json 字段模板哈希不匹配")
+    evidence_routing.validate_fields(task["fields"])
     notice = {key: task[key] for key in ("title", "purpose", "deadline", "retention_until", "contact", "correction")}
     if sha256_bytes(canonical(notice)) != task["notice_hash"]:
         raise ValueError("task.json 告知内容哈希不匹配")
@@ -212,13 +211,27 @@ def load_task(task_dir: str | Path) -> tuple[Path, dict[str, Any]]:
 
 
 def require_current_format(task: dict[str, Any], action: str) -> None:
-    if task["format_version"] != FORMAT_VERSION:
+    if task["format_version"] not in {FORMAT_VERSION, GROUP_FORMAT_VERSION}:
         raise RuntimeError(f"旧版任务不支持{action}；请新建 v2 任务继续收集")
+    if task_mode(task) == "group" and task.get("format_version") != GROUP_FORMAT_VERSION:
+        raise RuntimeError("GROUP_AUTH_REQUIRED: 旧群发任务没有个人认证，保留只读；请新建群发任务")
 
 
 def task_mode(task: dict[str, Any]) -> str:
     """任务模式只从本地 task.json 读取（load_task 已校验取值），提交信封与载荷无法伪造。"""
     return task.get("mode", "directed")
+
+
+def valid_invite_identifier(value):
+    if not isinstance(value, str):
+        return False
+    if INVITE_ID_RE.fullmatch(value):
+        return True
+    try:
+        parse_group_employee_id(value)
+        return True
+    except ValueError:
+        return False
 
 
 def group_invite_id(employee_id: str) -> str:
@@ -235,25 +248,22 @@ def parse_group_employee_id(invite_id: str) -> str:
 
 
 @contextmanager
-def task_lock(root: Path):
-    lock = root / ".write.lock"
-    try:
-        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as exc:
-        raise RuntimeError(f"任务正由另一进程写入；如确认上次异常退出，请删除 {lock}") from exc
-    try:
-        os.write(descriptor, f"pid={os.getpid()} time={now_iso()}\n".encode())
-        os.close(descriptor)
+def task_lock(root: Path, *, migration: bool = False):
+    with secure_io.file_lock(root / ".write.lock"):
+        if not migration:
+            with closing(connect_db(root)) as db:
+                if db.execute("PRAGMA user_version").fetchone()[0] != DB_VERSION:
+                    raise RuntimeError("MIGRATION_REQUIRED: 请先运行 collection.py migrate TASK_DIR")
         yield
-    finally:
-        try:
-            lock.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def connect_db(root: Path) -> sqlite3.Connection:
-    db = sqlite3.connect(root / "state.sqlite3", timeout=5.0)
+    path = secure_io.checked_path(root / "state.sqlite3", root)
+    for suffix in ("-wal", "-shm", "-journal"):
+        secure_io.checked_path(str(path) + suffix, root)
+    if not path.is_file():
+        raise FileNotFoundError("DATABASE_MISSING: 任务数据库不存在")
+    db = sqlite3.connect(path, timeout=5.0)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA foreign_keys=ON")
@@ -262,8 +272,7 @@ def connect_db(root: Path) -> sqlite3.Connection:
 
 def init_db(root: Path, rows: list[dict[str, str]]) -> None:
     db_path = root / "state.sqlite3"
-    if os.name != "nt":
-        os.close(os.open(db_path, os.O_CREAT | os.O_WRONLY, 0o600))
+    secure_io.atomic_write(db_path, b"", overwrite=False)
     with closing(connect_db(root)) as db, db:
         db.executescript(
             """
@@ -293,6 +302,16 @@ def init_db(root: Path, rows: list[dict[str, str]]) -> None:
                 consent_confirmed INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(invite_id, version)
             );
+            CREATE TABLE audit (
+                id INTEGER PRIMARY KEY,
+                action TEXT NOT NULL,
+                submission_id INTEGER,
+                at TEXT NOT NULL,
+                result TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                operator TEXT NOT NULL DEFAULT ''
+            );
+            PRAGMA user_version=1;
             """
         )
         db.executemany(
@@ -300,6 +319,69 @@ def init_db(root: Path, rows: list[dict[str, str]]) -> None:
             rows,
         )
     os.chmod(root / "state.sqlite3", 0o600)
+
+
+def audit(db, action, submission_id=None, result="ok", reason="", operator=""):
+    db.execute("INSERT INTO audit(action,submission_id,at,result,reason,operator) VALUES(?,?,?,?,?,?)",
+               (action, submission_id, now_iso(), result, reason, operator))
+
+
+def cmd_migrate(args):
+    root, task = load_task(args.task_dir)
+    require_current_format(task, "迁移")
+    with task_lock(root, migration=True), closing(connect_db(root)) as db:
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version == DB_VERSION:
+            return {"schema_version": version, "changed": False}
+        if version != 0:
+            raise RuntimeError("SCHEMA_UNSUPPORTED: 不支持此数据库版本")
+        backup_path = secure_io.checked_path(root / "migration-backup.sqlite3", root)
+        if backup_path.exists():
+            backup_path = root / ('migration-backup-' + secrets.token_hex(6) + '.sqlite3')
+        secure_io.atomic_write(backup_path, b"", overwrite=False)
+        with sqlite3.connect(backup_path) as backup:
+            db.backup(backup)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, action TEXT NOT NULL, submission_id INTEGER, at TEXT NOT NULL, result TEXT NOT NULL, reason TEXT NOT NULL, operator TEXT NOT NULL DEFAULT '')")
+            db.execute("UPDATE submissions SET status='needs_review',conflict_fields=? WHERE status='verified'", (json.dumps(['runtime:migration_recheck']),))
+            db.execute("UPDATE invites SET status='needs_review' WHERE current_submission_id IN (SELECT id FROM submissions WHERE status='needs_review')")
+            db.execute(f"PRAGMA user_version={DB_VERSION}")
+            audit(db, "migrate", reason="schema_1")
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+    return {"schema_version": DB_VERSION, "changed": True}
+
+
+def cmd_doctor(args):
+    import importlib.util
+    import importlib.metadata
+    modules = {'cryptography': 'cryptography', 'PIL': 'pillow', 'openpyxl': 'openpyxl', 'mcp': 'mcp',
+               'pypdfium2': 'pypdfium2', 'rapidocr_openvino': 'rapidocr-openvino', 'tkinter': None}
+    checks = {}
+    for module, package in modules.items():
+        available = importlib.util.find_spec(module) is not None
+        if module == 'tkinter' and available:
+            try:
+                __import__('tkinter')
+            except ImportError:
+                available = False
+        try:
+            version = importlib.metadata.version(package) if available and package else None
+        except importlib.metadata.PackageNotFoundError:
+            version = None
+        checks[module] = {'available': available, 'version': version}
+    vault_path = getattr(args, 'vault', None)
+    permissions_ok = None
+    if vault_path:
+        path = secure_io.checked_path(vault_path)
+        permissions_ok = path.is_dir() and (os.name == 'nt' or path.stat().st_mode & 0o077 == 0)
+    return {'python': sys.version.split()[0], 'python_supported': sys.version_info >= (3, 11),
+            'dependencies': checks, 'vault_permissions_ok': permissions_ok,
+            'recognition': {'local_optional': True, 'agent': 'host_provided_candidates', 'manual': checks['tkinter']['available'], 'requires_api_key': False},
+            'core_ready': sys.version_info >= (3, 11) and all(checks[k]['available'] for k in ('cryptography', 'PIL', 'openpyxl', 'mcp'))}
 
 
 def default_config() -> dict[str, Any]:
@@ -316,8 +398,8 @@ def default_config() -> dict[str, Any]:
             {"id": "phone", "label": "手机号", "type": "phone_cn", "required": True, "sensitive": True},
             {"id": "id_number", "label": "身份证号", "type": "cn_id", "required": True, "sensitive": True},
             {"id": "address", "label": "住址", "type": "address", "required": True, "sensitive": True},
-            {"id": "id_front", "label": "身份证正面", "type": "image_attachment", "required": True, "sensitive": True},
-            {"id": "id_back", "label": "身份证反面", "type": "image_attachment", "required": True, "sensitive": True},
+            {"id": "id_front", "label": "身份证正面", "type": "image_attachment", "required": True, "sensitive": True, "ocr_fields": ["name", "id_number", "address"], "ocr_backend": "auto"},
+            {"id": "id_back", "label": "身份证反面", "type": "image_attachment", "required": True, "sensitive": True, "ocr_fields": [], "ocr_backend": "auto"},
         ],
     }
 
@@ -359,14 +441,21 @@ def validate_config(config: dict[str, Any], mode: str = "directed") -> dict[str,
     if "name" not in seen:
         raise ValueError("任务字段必须包含 id=name 的姓名字段")
     if mode == "group" and "employee_id" not in seen:
-        raise ValueError("group 模式任务字段必须包含 id=employee_id 的工号字段（无令牌模式下身份靠工号+姓名与名单比对）")
+        raise ValueError("group 模式任务字段必须包含 id=employee_id 的工号字段（个人凭据及名单共同校验身份）")
+    scalar_fields = {field["id"] for field in fields if field["type"] not in ATTACHMENT_TYPES}
+    for field in fields:
+        if "ocr_fields" in field:
+            bindings = field["ocr_fields"]
+            if field["type"] not in ATTACHMENT_TYPES or not isinstance(bindings, list) or any(not isinstance(k, str) or k not in scalar_fields for k in bindings) or len(set(bindings)) != len(bindings):
+                raise ValueError("OCR_BINDING_INVALID: ocr_fields 必须引用不重复的表单值字段")
+    evidence_routing.validate_fields(fields)
     result = dict(config)
     result["fields"] = fields
     return result
 
 
 def read_roster(path: Path) -> list[dict[str, str]]:
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+    with io.StringIO(secure_io.read_bytes(path).decode("utf-8-sig"), newline="") as stream:
         reader = csv.DictReader(stream)
         if not reader.fieldnames or not {"employee_id", "name"}.issubset(reader.fieldnames):
             raise ValueError("名单 CSV 必须包含 employee_id,name 表头")
@@ -488,83 +577,99 @@ def cmd_init_config(args) -> dict[str, Any]:
     out = Path(args.out).expanduser()
     if out.exists() and not args.force:
         raise FileExistsError(f"文件已存在: {out}")
-    dump_json(out, default_config())
+    config = default_config()
+    if getattr(args, 'mode', 'directed') == 'group':
+        config['fields'].insert(0, {'id': 'employee_id', 'label': '工号', 'type': 'text', 'required': True, 'sensitive': False})
+    dump_json(out, config)
     return {"config": str(out.resolve())}
 
 
 def create_task(roster_path: Path, config_path: Path, out_parent: Path, password: str, require_terminal: bool = True, mode: str = "directed") -> dict[str, Any]:
     if require_terminal:
         require_tty("create")
-    if mode == "group":
-        print("风险提示：group 群发模式没有个人认证令牌，任何拿到表单的人都可以冒名为任何工号提交；"
-              "身份仅靠复核时名单比对（工号+姓名）标记并由人工兜底，高敏感场景请改用 directed 模式。", file=sys.stderr)
     config = validate_config(load_json(config_path), mode=mode)
     roster = read_roster(roster_path)
+    if mode == 'group':
+        for person in roster:
+            parse_group_employee_id(group_invite_id(person['employee_id']))
     task_id = "YT-" + datetime.now().strftime("%Y%m%d") + "-" + random_id("", 6)
-    root = out_parent.expanduser().resolve() / task_id
+    root = secure_io.checked_path(out_parent) / task_id
     if root.exists():
         raise FileExistsError(f"任务目录已存在: {root}")
     root.mkdir(parents=True, mode=0o700)
-    (root / "invites").mkdir(mode=0o700)
-    (root / "submissions").mkdir(mode=0o700)
-    (root / "reports").mkdir(mode=0o700)
+    try:
+        (root / "invites").mkdir(mode=0o700)
+        (root / "submissions").mkdir(mode=0o700)
+        (root / "reports").mkdir(mode=0o700)
 
-    public_pem, private_pem, key_id = generate_keys(password)
-    schema_hash = sha256_bytes(canonical(config["fields"]))
-    notice = {key: config[key] for key in ("title", "purpose", "deadline", "retention_until", "contact", "correction")}
-    notice_hash = sha256_bytes(canonical(notice))
-    task = {
-        "format_version": FORMAT_VERSION,
-        "mode": mode,
-        "task_id": task_id,
-        "key_id": key_id,
-        "title": config["title"],
-        "purpose": config["purpose"],
-        "deadline": config["deadline"],
-        "retention_until": config["retention_until"],
-        "contact": config["contact"],
-        "correction": config["correction"],
-        "template_version": config["template_version"],
-        "schema_hash": schema_hash,
-        "notice_hash": notice_hash,
-        "fields": config["fields"],
-        "created_at": now_iso(),
-    }
-    dump_json(root / "task.json", task)
-    atomic_write(root / "public.pem", public_pem)
-    atomic_write(root / "private.pem.enc", private_pem)
-    atomic_write(root / "roster.csv", roster_path.read_bytes())
+        public_pem, private_pem, key_id = generate_keys(password)
+        schema_hash = sha256_bytes(canonical(config["fields"]))
+        notice = {key: config[key] for key in ("title", "purpose", "deadline", "retention_until", "contact", "correction")}
+        notice_hash = sha256_bytes(canonical(notice))
+        task = {
+            "format_version": GROUP_FORMAT_VERSION if mode == "group" else FORMAT_VERSION,
+            "mode": mode,
+            "task_id": task_id,
+            "key_id": key_id,
+            "title": config["title"],
+            "purpose": config["purpose"],
+            "deadline": config["deadline"],
+            "retention_until": config["retention_until"],
+            "contact": config["contact"],
+            "correction": config["correction"],
+            "template_version": config["template_version"],
+            "schema_hash": schema_hash,
+            "notice_hash": notice_hash,
+            "fields": config["fields"],
+            "created_at": now_iso(),
+        }
+        if mode == "group":
+            task["submission_auth"] = AUTH_VERSION
+        dump_json(root / "task.json", task)
+        atomic_write(root / "public.pem", public_pem)
+        atomic_write(root / "private.pem.enc", private_pem)
+        atomic_write(root / "roster.csv", secure_io.read_bytes(roster_path))
 
-    db_rows, index_rows = [], []
-    if mode == "group":
-        form = {"format": FORM_FORMAT_VERSION, **task, "public_key_pem": public_pem.decode("ascii")}
-        dump_json(root / "FORM.yintian-form", form)
-        for item in roster:
-            invite_id = group_invite_id(item["employee_id"])
-            parse_group_employee_id(invite_id)  # 创建期闭环校验：名单工号必须能构成合法的 GRP- 标识
-            db_rows.append({**item, "invite_id": invite_id, "token_hash": sha256_bytes(secrets.token_bytes(32)), "created_at": now_iso()})
-            index_rows.append({**item, "invite_id": invite_id, "invite_file": "FORM.yintian-form"})
-    else:
-        template = (Path(__file__).resolve().parents[1] / "assets" / "invite_template.html").read_text(encoding="utf-8")
-        for item in roster:
-            invite_id = random_id("INV-", 10)
-            invite_token = secrets.token_urlsafe(32)
-            invite_name = invite_id + ".html"
-            invite_config = dict(task)
-            invite_config.update({"invite_id": invite_id, "invite_token": invite_token, "name": item["name"], "public_key_pem": public_pem.decode("ascii")})
-            atomic_write(root / "invites" / invite_name, render_invite(template, invite_config).encode("utf-8"))
-            dump_json(root / "invites" / (invite_id + ".yintian-form"), {"format": FORM_FORMAT_VERSION, **invite_config})
-            created_at = now_iso()
-            db_rows.append({**item, "invite_id": invite_id, "token_hash": sha256_bytes(invite_token.encode()), "created_at": created_at})
-            index_rows.append({**item, "invite_id": invite_id, "invite_file": f"invites/{invite_name}"})
-    index_path = root / "invite-index.csv"
-    index_buffer = io.StringIO()
-    writer = csv.DictWriter(index_buffer, fieldnames=["employee_id", "name", "invite_id", "invite_file"])
-    writer.writeheader()
-    writer.writerows([{key: csv_text(value) for key, value in row.items()} for row in index_rows])
-    atomic_write(index_path, index_buffer.getvalue().encode("utf-8-sig"))
-    init_db(root, db_rows)
-    return {"task_id": task_id, "task_dir": str(root), "invite_count": len(index_rows)}
+        db_rows, index_rows = [], []
+        if mode == "group":
+            form = {"format": "yintian-form/2", **task, "public_key_pem": public_pem.decode("ascii")}
+            dump_json(root / "FORM.yintian-form", form)
+            (root / "credentials").mkdir(mode=0o700)
+            for item in roster:
+                invite_id = group_invite_id(item["employee_id"])
+                parse_group_employee_id(invite_id)  # 创建期闭环校验：名单工号必须能构成合法的 GRP- 标识
+                token = secrets.token_urlsafe(32)
+                dump_json(root / "credentials" / (invite_id + ".yintian-credential"), {
+                    "format": CREDENTIAL_FORMAT, "task_id": task_id, "key_id": key_id,
+                    "invite_id": invite_id, "employee_id": item["employee_id"], "name": item["name"],
+                    "invite_token": token, "schema_hash": schema_hash,
+                })
+                db_rows.append({**item, "invite_id": invite_id, "token_hash": sha256_bytes(token.encode()), "created_at": now_iso()})
+                index_rows.append({**item, "invite_id": invite_id, "invite_file": "FORM.yintian-form"})
+        else:
+            template = (Path(__file__).resolve().parents[1] / "assets" / "invite_template.html").read_text(encoding="utf-8")
+            for item in roster:
+                invite_id = random_id("INV-", 10)
+                invite_token = secrets.token_urlsafe(32)
+                invite_name = invite_id + ".html"
+                invite_config = dict(task)
+                invite_config.update({"invite_id": invite_id, "invite_token": invite_token, "name": item["name"], "public_key_pem": public_pem.decode("ascii")})
+                atomic_write(root / "invites" / invite_name, render_invite(template, invite_config).encode("utf-8"))
+                dump_json(root / "invites" / (invite_id + ".yintian-form"), {"format": FORM_FORMAT_VERSION, **invite_config})
+                created_at = now_iso()
+                db_rows.append({**item, "invite_id": invite_id, "token_hash": sha256_bytes(invite_token.encode()), "created_at": created_at})
+                index_rows.append({**item, "invite_id": invite_id, "invite_file": f"invites/{invite_name}"})
+        index_path = root / "invite-index.csv"
+        index_buffer = io.StringIO()
+        writer = csv.DictWriter(index_buffer, fieldnames=["employee_id", "name", "invite_id", "invite_file"])
+        writer.writeheader()
+        writer.writerows([{key: csv_text(value) for key, value in row.items()} for row in index_rows])
+        atomic_write(index_path, index_buffer.getvalue().encode("utf-8-sig"))
+        init_db(root, db_rows)
+        return {"task_id": task_id, "task_dir": str(root), "invite_count": len(index_rows)}
+    except BaseException:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
 
 
 def cmd_create(args) -> dict[str, Any]:
@@ -579,7 +684,7 @@ def validate_envelope_header(envelope: dict[str, Any], task: dict[str, Any]) -> 
     for key in ("format_version", "task_id", "invite_id", "schema_hash", "key_id", "encrypted_key_b64", "iv_b64", "ciphertext_b64"):
         if not isinstance(envelope.get(key), str) or not envelope[key]:
             raise ValueError(f"提交包缺少字段: {key}")
-    if envelope["format_version"] != FORMAT_VERSION or envelope["task_id"] != task["task_id"]:
+    if envelope["format_version"] != task["format_version"] or envelope["task_id"] != task["task_id"]:
         raise ValueError("提交包属于其他任务或格式版本")
     if envelope.get("algorithms") != {"content": "AES-256-GCM", "key_wrap": "RSA-OAEP-3072-SHA256"}:
         raise ValueError("提交包算法套件不受支持")
@@ -595,49 +700,79 @@ def validate_envelope_header(envelope: dict[str, Any], task: dict[str, Any]) -> 
     return invite_id
 
 
+def submission_auth_tag(envelope, token_hash):
+    content = {key: value for key, value in envelope.items() if key != "auth_tag"}
+    return hmac.new(bytes.fromhex(token_hash), canonical(content), hashlib.sha256).hexdigest()
+
+
+def verify_submission_auth(task, envelope, invite):
+    if task.get("submission_auth") == AUTH_VERSION:
+        tag = envelope.get("auth_tag")
+        if not isinstance(tag, str) or not secrets.compare_digest(tag, submission_auth_tag(envelope, invite["token_hash"])):
+            raise ValueError("SUBMISSION_AUTH_FAILED: 提交者认证失败")
+
+
 def ingest_task(task_dir: str | Path, submissions_dir: str | Path) -> dict[str, Any]:
     root, task = load_task(task_dir)
     require_current_format(task, "接收")
     if task_expired(task):
         raise RuntimeError("任务已超过保存期限，停止接收新提交")
-    source = Path(submissions_dir).expanduser().resolve()
+    source = secure_io.checked_path(submissions_dir)
     if not source.is_dir():
         raise NotADirectoryError(source)
     summary = {"accepted": 0, "duplicates": 0, "rejected": 0, "errors": []}
     with task_lock(root), closing(connect_db(root)) as db, db:
         for index, path in enumerate(sorted(source.glob("*.yintian")), start=1):
             digest = None
+            created_path = None
+            db.execute("SAVEPOINT receive_one")
             try:
                 if not path.is_file() or path.is_symlink():
                     raise ValueError("提交项不是普通文件")
                 if path.stat().st_size > MAX_ENVELOPE_BYTES:
                     raise ValueError("提交包超过 32MB 上限")
-                digest = sha256_file(path)
+                raw = secure_io.read_bytes(path, MAX_ENVELOPE_BYTES)
+                digest = sha256_bytes(raw)
                 if db.execute("SELECT 1 FROM submissions WHERE sha256=?", (digest,)).fetchone():
                     summary["duplicates"] += 1
+                    db.execute("RELEASE receive_one")
                     continue
-                envelope = load_json(path)
+                envelope = json.loads(raw)
                 invite_id = validate_envelope_header(envelope, task)
-                if not db.execute("SELECT 1 FROM invites WHERE invite_id=?", (invite_id,)).fetchone():
+                invite = db.execute("SELECT * FROM invites WHERE invite_id=?", (invite_id,)).fetchone()
+                if not invite:
                     raise ValueError("invite_id 不属于当前任务")
+                verify_submission_auth(task, envelope, invite)
                 existing_versions = db.execute("SELECT COUNT(*) FROM submissions WHERE invite_id=?", (invite_id,)).fetchone()[0]
                 if existing_versions >= MAX_VERSIONS_PER_INVITE:
                     raise ValueError(f"该邀请的提交版本数已达上限 {MAX_VERSIONS_PER_INVITE}，拒绝继续存储")
                 version = db.execute("SELECT COALESCE(MAX(version),0)+1 FROM submissions WHERE invite_id=?", (invite_id,)).fetchone()[0]
-                target_dir = root / "submissions" / invite_id
-                target_dir.mkdir(parents=True, exist_ok=True)
+                target_dir = secure_io.checked_path(root / "submissions" / invite_id, root)
+                target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 target = target_dir / f"v{version:04d}_{digest[:12]}.yintian"
-                shutil.copyfile(path, target)
+                if target.exists() and sha256_file(target) != digest:
+                    raise ValueError("RECOVERY_CONFLICT: 收件路径已存在不同内容")
+                if not target.exists():
+                    created_path = target
+                atomic_write(target, raw)
                 received_at = now_iso()
                 db.execute(
                     "INSERT INTO submissions(invite_id,version,sha256,path,received_at,late,status) VALUES(?,?,?,?,?,?,?)",
                     (invite_id, version, digest, target.relative_to(root).as_posix(), received_at, int(task_late(task, received_at)), "submitted"),
                 )
-                db.execute("UPDATE invites SET status='submitted' WHERE invite_id=? AND status='invited'", (invite_id,))
+                db.execute("UPDATE invites SET status='submitted' WHERE invite_id=?", (invite_id,))
+                audit(db, "ingest", db.execute("SELECT last_insert_rowid()").fetchone()[0])
+                db.execute("RELEASE receive_one")
                 summary["accepted"] += 1
             except Exception as exc:
+                db.execute("ROLLBACK TO receive_one")
+                db.execute("RELEASE receive_one")
+                if created_path is not None:
+                    created_path.unlink(missing_ok=True)
                 summary["rejected"] += 1
-                summary["errors"].append({"file_ref": digest[:12] if digest else f"entry-{index}", "error": type(exc).__name__})
+                summary["errors"].append({"file_ref": digest[:12] if digest else f"entry-{index}", "error": type(exc).__name__,
+                                          "code": "INGEST_IO" if isinstance(exc, OSError) else "SUBMISSION_REJECTED",
+                                          "retryable": isinstance(exc, OSError), "next_action": "retry" if isinstance(exc, OSError) else "check_invitation"})
     return summary
 
 
@@ -648,7 +783,7 @@ def cmd_ingest(args) -> dict[str, Any]:
 def unlock_private_key(root: Path, password: str):
     from cryptography.hazmat.primitives import serialization
 
-    data = (root / "private.pem.enc").read_bytes()
+    data = secure_io.read_bytes(root / "private.pem.enc", 128 * 1024)
     blob = data.lstrip()
     if blob.startswith(b"{"):
         private_der = decrypt_private_key(json.loads(data), password)
@@ -667,8 +802,8 @@ def decrypt_envelope(root: Path, task: dict[str, Any], path: Path, private_key, 
     from cryptography.hazmat.primitives.asymmetric import padding
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-    path = path.resolve()
-    submissions_root = (root / "submissions").resolve()
+    path = secure_io.checked_path(path, root)
+    submissions_root = secure_io.checked_path(root / "submissions", root)
     if submissions_root not in path.parents or not path.is_file():
         raise ValueError("提交路径不在任务 submissions 目录内")
     envelope = load_json(path)
@@ -706,13 +841,17 @@ def validate_payload(task: dict[str, Any], invite: sqlite3.Row, payload: dict[st
     if payload.get("consent_confirmed") is not True:
         conflicts.append("consent")
     token = payload.get("invite_token", "")
-    if task_mode(task) == "directed" and (not isinstance(token, str) or not secrets.compare_digest(sha256_bytes(token.encode()), invite["token_hash"])):
+    if not isinstance(token, str) or not secrets.compare_digest(sha256_bytes(token.encode()), invite["token_hash"]):
         raise ValueError("邀请认证令牌无效")
     if normalize_submitted_at(payload.get("submitted_at")) is None:
         conflicts.append("submitted_at")
     values, attachments = payload.get("values", {}), payload.get("attachments", {})
     if not isinstance(values, dict) or not isinstance(attachments, dict):
         raise ValueError("values/attachments 格式无效")
+    value_ids = {f['id'] for f in task['fields'] if f['type'] not in ATTACHMENT_TYPES}
+    attachment_ids = {f['id'] for f in task['fields'] if f['type'] in ATTACHMENT_TYPES}
+    if set(values) - value_ids or set(attachments) - attachment_ids:
+        raise ValueError('PAYLOAD_FIELDS_INVALID: 提交含模板外字段')
     total_size = 0
     for field in task["fields"]:
         field_id, field_type = field["id"], field["type"]
@@ -736,11 +875,14 @@ def validate_payload(task: dict[str, Any], invite: sqlite3.Row, payload: dict[st
                 if field_type == "image_attachment":
                     from PIL import Image
 
-                    with Image.open(io.BytesIO(raw)) as image:
-                        expected = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}[mime]
-                        if image.format != expected or image.width * image.height > MAX_IMAGE_PIXELS:
-                            raise ValueError(f"图片内容或像素尺寸无效: {field_id}")
-                        image.verify()
+                    try:
+                        with Image.open(io.BytesIO(raw)) as image:
+                            expected = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}[mime]
+                            if image.format != expected or image.width * image.height > MAX_IMAGE_PIXELS:
+                                raise ValueError(f"图片内容或像素尺寸无效: {field_id}")
+                            image.verify()
+                    except (OSError, Image.DecompressionBombError):
+                        raise ValueError('ATTACHMENT_INVALID: 图片数据无效') from None
                 elif not raw.startswith(b"%PDF-"):
                     raise ValueError("PDF 文件头无效")
                 total_size += len(raw)
@@ -763,6 +905,12 @@ def validate_payload(task: dict[str, Any], invite: sqlite3.Row, payload: dict[st
         conflicts.append("name_roster_mismatch")
     if task_mode(task) == "group" and normalize_value("text", values.get("employee_id", "")) != invite["employee_id"]:
         conflicts.append("employee_id_roster_mismatch")
+    if "agent_ocr" in payload:
+        evidence_routing.validate_result(task, attachment_items, payload["agent_ocr"])
+        if payload.get("agent_ocr_confirmed") is not True:
+            conflicts.append("agent_ocr_consent")
+    elif "agent_ocr_confirmed" in payload:
+        conflicts.append("agent_ocr_consent")
     return sorted(set(missing)), sorted(set(conflicts)), attachment_items
 
 
@@ -818,130 +966,222 @@ def is_identity_attachment_field(field_id: str) -> bool:
     return any(part in {"front", "back"} for part in field_id.split("_"))
 
 
-def compare_ocr(payload: dict[str, Any], attachments: list[dict[str, Any]], field_defs: list[dict[str, Any]]) -> list[str]:
-    """按字段类型匹配填写值；对 id 分词后含整词 front/back 的附件字段做 OCR 身份要素比对。"""
-    from ocr_matcher import extract_from_text as _extract_from_text
+def compare_ocr(payload, attachments, field_defs, *, provenance=None):
+    """Check each explicitly bound piece of evidence; no empty-set/any-match approval."""
+    from ocr_matcher import extract_from_text
 
-    fields: dict[str, list[Any]] = {}
-    flags: list[str] = []
-    identity_field_ids = set()
-    checks = []
-    for field in field_defs:
-        field_id, field_type = field["id"], field["type"]
-        if field_type in ATTACHMENT_TYPES and is_identity_attachment_field(field_id):
-            identity_field_ids.add(field_id)
-        if field_id == "name":
-            checks.append((field_id, "name", "text"))
-        elif field_type == "cn_id":
-            checks.append((field_id, "id_number", "cn_id"))
-        elif field_type == "phone_cn":
-            checks.append((field_id, "phone", "phone_cn"))
-        elif field_type == "address":
-            checks.append((field_id, "address", "text"))
-    identity_attachments = [item for item in attachments if item["field_id"] in identity_field_ids]
-    for item in identity_attachments:
-        text, item_flags = ocr_attachment(item)
-        flags.extend(item_flags)
-        if text:
-            _extract_from_text(text, f"attachment:{item['field_id']}", fields)
-    if identity_attachments and not any(fields.get(field) for field in ("name", "id_number", "address")):
-        flags.append("ocr_no_identity_fields")
-    values = payload.get("values", {})
-    for submitted_id, extracted_id, value_type in checks:
-        manual = normalize_value(value_type, values.get(submitted_id, ""))
-        candidates = {normalize_value(value_type, candidate.value) for candidate in fields.get(extracted_id, []) if candidate.valid is not False}
-        if manual and candidates and manual not in candidates:
-            flags.append(submitted_id)
+    definitions = {f["id"]: f for f in field_defs}
+    flags = []
+    for item in attachments:
+        definition = definitions.get(item["field_id"])
+        if definition is None:
+            continue
+        binding = evidence_routing.bindings(definition, field_defs)
+        if not binding:
+            continue
+        text, warnings, agent_candidates, source, reason = evidence_routing.select(payload, item, definition, ocr_attachment)
+        if provenance is not None:
+            provenance.append({"field_id": item['field_id'], "source": source, "reason": reason})
+        if source == 'manual':
+            flags.append(f"ocr:manual_required:{item['field_id']}")
+            continue
+        if source == 'agent':
+            flags.append(f"ocr:agent_confirmation:{item['field_id']}")
+        for warning in warnings:
+            kind = "runtime:ocr" if any(k in warning for k in ("unavailable", "error")) else "ocr:quality"
+            flags.append(f"{kind}:{item['field_id']}")
+        candidates = {}
+        extract_from_text(text, "attachment", candidates)
+        for field_id in binding:
+            field = definitions[field_id]
+            value = normalize_value(field["type"], payload.get("values", {}).get(field_id, ""))
+            if not value:
+                continue
+            if agent_candidates is not None:
+                found_values = agent_candidates.get(field_id, [])
+                valid = {normalize_value(field['type'], v) for v in found_values if evidence_routing.candidate_valid(field, v)}
+                if any(not evidence_routing.candidate_valid(field, v) for v in found_values):
+                    flags.append(f"ocr:invalid:{field_id}")
+            else:
+                extracted = "name" if field_id == "name" else {"cn_id": "id_number", "address": "address", "phone_cn": "phone"}.get(field["type"])
+                if extracted is None:
+                    flags.append(f"ocr:unsupported:{field_id}")
+                    continue
+                found = candidates.get(extracted, [])
+                valid = {normalize_value(field["type"], candidate.value) for candidate in found if candidate.valid is not False}
+                if any(candidate.valid is False for candidate in found):
+                    flags.append(f"ocr:invalid:{field_id}")
+            if not valid:
+                flags.append(f"ocr:missing:{field_id}")
+            elif len(valid) > 1:
+                flags.append(f"ocr:ambiguous:{field_id}")
+            elif value not in valid:
+                flags.append(f"ocr:conflict:{field_id}")
     return sorted(set(flags))
 
 
-def review_task(task_dir: str | Path, password: str) -> dict[str, Any]:
+def stored_payload(root, task, row, private_key):
+    path = secure_io.checked_path(root / row["path"], root)
+    if sha256_file(path) != row["sha256"]:
+        raise ValueError("CIPHERTEXT_CHANGED: 已接收的文件发生变化")
+    payload = decrypt_envelope(root, task, path, private_key, row["invite_id"])
+    return payload
+
+
+def review_task(task_dir, password, retry_needs_review=False, invite_id=None):
+    from cryptography.exceptions import InvalidTag
     root, task = load_task(task_dir)
     require_current_format(task, "复核")
     if task_expired(task):
-        raise RuntimeError("任务已超过保存期限，停止复核")
+        raise RuntimeError("TASK_EXPIRED: 任务已超过保存期限")
     try:
         private_key = unlock_private_key(root, password)
     except Exception as exc:
-        raise RuntimeError("任务密码错误或私钥损坏") from exc
+        raise RuntimeError("KEY_UNLOCK_FAILED: 任务密码错误或私钥损坏") from exc
     summary = {"verified": 0, "needs_review": 0, "invalid": 0}
     with task_lock(root), closing(connect_db(root)) as db, db:
-        rows = db.execute(
-            "SELECT s.*,i.employee_id,i.name,i.token_hash FROM submissions s JOIN invites i ON i.invite_id=s.invite_id WHERE s.status='submitted' ORDER BY s.invite_id,s.version"
-        ).fetchall()
-        for row in rows:
+        states = "('submitted','needs_review')" if retry_needs_review else "('submitted')"
+        query = f"SELECT s.*,i.employee_id,i.name,i.token_hash FROM submissions s JOIN invites i ON i.invite_id=s.invite_id WHERE s.status IN {states}"
+        params = []
+        if invite_id:
+            query += " AND s.invite_id=?"
+            params.append(invite_id)
+        # Only the newest version remains actionable; resolved history is immutable.
+        query += " AND (s.status='submitted' OR s.id=(SELECT MAX(n.id) FROM submissions n WHERE n.invite_id=s.invite_id)) ORDER BY s.id"
+        for row in db.execute(query, params).fetchall():
+            if task_expired(load_task(root)[1]):
+                raise RuntimeError("TASK_EXPIRED: 任务已超过保存期限")
+            missing, conflicts, attachments, payload, provenance = [], [], [], {}, []
             try:
-                payload = decrypt_envelope(root, task, root / row["path"], private_key, row["invite_id"])
+                payload = stored_payload(root, task, row, private_key)
                 missing, conflicts, attachments = validate_payload(task, row, payload)
-                conflicts = sorted(set(conflicts + compare_ocr(payload, attachments, task["fields"])))
-                status = "needs_review" if missing or conflicts else "verified"
-                reviewed_at = now_iso()
-                db.execute(
-                    "UPDATE submissions SET submitted_at=?,reviewed_at=?,status=?,missing_fields=?,conflict_fields=?,attachment_count=?,consent_confirmed=? WHERE id=?",
-                    (normalize_submitted_at(payload.get("submitted_at")), reviewed_at, status, json.dumps(missing), json.dumps(conflicts), len(attachments), int(payload.get("consent_confirmed") is True), row["id"]),
-                )
-                old = db.execute("SELECT current_submission_id FROM invites WHERE invite_id=?", (row["invite_id"],)).fetchone()[0]
-                old_row = db.execute("SELECT id,status FROM submissions WHERE id=? AND status IN ('verified','needs_review')", (old,)).fetchone() if old else None
-                candidate_is_newer = not old_row or row["id"] > old_row["id"]
-                if candidate_is_newer:
-                    if old_row and old_row["id"] != row["id"]:
-                        db.execute("UPDATE submissions SET status='superseded' WHERE id=?", (old_row["id"],))
-                    db.execute("UPDATE invites SET current_submission_id=?,status=? WHERE invite_id=?", (row["id"], status, row["invite_id"]))
-                elif row["id"] != old:
-                    db.execute("UPDATE submissions SET status='superseded' WHERE id=?", (row["id"],))
-                summary[status] += 1
+                if not missing and not conflicts:
+                    conflicts = compare_ocr(payload, attachments, task["fields"], provenance=provenance)
+                state = "needs_review" if missing or conflicts else "verified"
+            except (OSError, ImportError):
+                state, conflicts = "needs_review", ["runtime:dependency_or_io"]
+            except (ValueError, InvalidTag, TypeError, KeyError):
+                state, conflicts = "invalid", ["ciphertext_or_payload_invalid"]
             except Exception:
-                db.execute("UPDATE submissions SET reviewed_at=?,status='invalid' WHERE id=?", (now_iso(), row["id"]))
-                old = db.execute("SELECT current_submission_id FROM invites WHERE invite_id=?", (row["invite_id"],)).fetchone()[0]
-                if not old:
-                    db.execute("UPDATE invites SET status='invalid' WHERE invite_id=?", (row["invite_id"],))
-                summary["invalid"] += 1
+                state, conflicts = "needs_review", ["runtime:review"]
+            db.execute(
+                "UPDATE submissions SET submitted_at=?,reviewed_at=?,status=?,missing_fields=?,conflict_fields=?,attachment_count=?,consent_confirmed=? WHERE id=?",
+                (normalize_submitted_at(payload.get("submitted_at")), now_iso(), state, json.dumps(missing), json.dumps(conflicts), len(attachments), int(payload.get("consent_confirmed") is True), row["id"]))
+            if state != "invalid":
+                db.execute("UPDATE invites SET current_submission_id=? WHERE invite_id=? AND (current_submission_id IS NULL OR current_submission_id<=?)", (row["id"], row["invite_id"], row["id"]))
+            db.execute("UPDATE invites SET status=? WHERE invite_id=? AND ?=(SELECT MAX(id) FROM submissions WHERE invite_id=?)", (state, row["invite_id"], row["id"], row["invite_id"]))
+            audit(db, "ocr_route", row["id"], json.dumps(provenance, separators=(",", ":")), "recognition_route")
+            audit(db, "review", row["id"], state, ",".join(missing + conflicts))
+            summary[state] += 1
     return summary
 
 
-def cmd_review(args) -> dict[str, Any]:
+def cmd_review(args):
     require_tty("review")
-    password = getpass.getpass("任务密码: ")
-    return review_task(args.task_dir, password)
+    return review_task(args.task_dir, getpass.getpass("任务密码: "),
+                       getattr(args, "retry_needs_review", False), getattr(args, "invite", None))
 
 
-def report_rows(root: Path) -> list[dict[str, Any]]:
-    with closing(connect_db(root)) as db, db:
-        rows = db.execute(
-            """
-            SELECT i.employee_id,i.name,i.invite_id,i.status,
-                   s.version AS submission_version,s.submitted_at,s.reviewed_at,s.late,
-                   s.missing_fields,s.conflict_fields,s.attachment_count,s.consent_confirmed
-            FROM invites i LEFT JOIN submissions s ON s.id=i.current_submission_id AND s.invite_id=i.invite_id
+def cmd_decide(args):
+    require_tty("decide")
+    root, task = load_task(args.task_dir)
+    require_current_format(task, "人工复核")
+    if task_expired(task):
+        raise RuntimeError("TASK_EXPIRED: 任务已到期")
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", args.operator):
+        raise ValueError("OPERATOR_INVALID: 操作者标识限字母、数字、_.@-")
+    private_key = unlock_private_key(root, getpass.getpass("任务密码: "))
+    with task_lock(root), closing(connect_db(root)) as db:
+        row = db.execute("SELECT s.*,i.name,i.employee_id,i.token_hash FROM submissions s JOIN invites i ON i.invite_id=s.invite_id WHERE s.invite_id=? ORDER BY s.version DESC LIMIT 1", (args.invite_id,)).fetchone()
+        if row is None or row['version'] != args.version or row['status'] in {'verified_manual', 'returned'}:
+            raise RuntimeError("STATE_CHANGED: 版本不符或已人工结案")
+        snapshot = export_snapshot(root)
+        issues = json.loads(row['conflict_fields'])
+        if args.action == 'confirm':
+            payload = stored_payload(root, task, row, private_key)
+            missing, hard_conflicts, attachments = validate_payload(task, row, payload)
+            if row['status'] != 'needs_review' or missing or hard_conflicts or not issues or any(not item.startswith('ocr:') for item in issues):
+                raise RuntimeError("MANUAL_NOT_ALLOWED: 人工只能裁定 OCR 问题；输入、认证和运行错误不能放行")
+    if args.action == 'confirm':
+        from review_evidence import confirm_evidence
+        candidate_args = {'agent_candidates': payload['agent_ocr']['items']} if payload.get('agent_ocr') else {}
+        if not confirm_evidence(payload['values'], attachments, issues, **candidate_args):
+            raise RuntimeError("CANCELLED: 未完成逐项确认")
+        state, reason = 'verified_manual', 'evidence_checked'
+    else:
+        if input(f"退回版本 {args.version}，输入任务 ID {task['task_id']}: ").strip() != task['task_id']:
+            raise RuntimeError('CANCELLED: 已取消退回')
+        state, reason = 'returned', 'correction_requested'
+    with task_lock(root), closing(connect_db(root)) as db, db:
+        if task_expired(load_task(root)[1]) or snapshot != export_snapshot(root):
+            raise RuntimeError('STATE_CHANGED: 任务已变化或到期，请刷新后重试')
+        if args.action == 'confirm':
+            stored_payload(root, task, row, private_key)
+        db.execute('UPDATE submissions SET status=?,reviewed_at=? WHERE id=?', (state, now_iso(), row['id']))
+        db.execute('UPDATE invites SET status=?,current_submission_id=? WHERE invite_id=?', (state, row['id'], args.invite_id))
+        for code in issues if args.action == 'confirm' else [reason]:
+            audit(db, 'manual_' + args.action, row['id'], state, code, args.operator)
+    return {'version': args.version, 'status': state}
+
+
+def report_rows(root):
+    with closing(connect_db(root)) as db:
+        rows = db.execute("""
+            SELECT i.employee_id,i.name,i.invite_id,s.id AS submission_id,
+                   COALESCE(s.status,'invited') AS status,
+                   s.version AS submission_version,s.submitted_at,s.reviewed_at,s.received_at,s.late,
+                   s.missing_fields,s.conflict_fields,s.attachment_count,s.consent_confirmed,
+                   a.version AS approved_version,a.status AS approved_status,
+                   (SELECT COUNT(*) FROM submissions n WHERE n.invite_id=i.invite_id
+                    AND n.id=s.id AND n.status IN ('submitted','needs_review')) AS pending_count
+            FROM invites i
+            LEFT JOIN submissions s ON s.id=(SELECT MAX(n.id) FROM submissions n WHERE n.invite_id=i.invite_id)
+            LEFT JOIN submissions a ON a.id=(SELECT MAX(n.id) FROM submissions n WHERE n.invite_id=i.invite_id AND n.status IN ('verified','verified_manual'))
             ORDER BY i.employee_id
-            """
-        ).fetchall()
+        """).fetchall()
+        routes = {}
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit'").fetchone():
+            routes = {r['submission_id']: json.loads(r['result']) for r in db.execute("SELECT submission_id,result FROM audit WHERE id IN (SELECT MAX(id) FROM audit WHERE action='ocr_route' GROUP BY submission_id)")}
     output = []
     for row in rows:
+        conflicts = json.loads(row["conflict_fields"] or "[]")
         output.append({
             "employee_id": row["employee_id"], "name": row["name"], "status": row["status"],
-            "submission_version": row["submission_version"], "submitted_at": row["submitted_at"], "reviewed_at": row["reviewed_at"],
-            "late": bool(row["late"]) if row["late"] is not None else False,
-            "missing_fields": json.loads(row["missing_fields"] or "[]"), "conflict_fields": json.loads(row["conflict_fields"] or "[]"),
-            "attachment_count": row["attachment_count"] or 0, "consent_confirmed": bool(row["consent_confirmed"]) if row["consent_confirmed"] is not None else False,
+            "submission_version": row["submission_version"], "latest_version": row["submission_version"],
+            "approved_version": row["approved_version"], "received_at": row["received_at"],
+            "pending_count": row["pending_count"],
+            "approval_method": "manual" if row["approved_status"] == "verified_manual" else "automatic" if row["approved_status"] else None,
+            "retryable": row["status"] == "needs_review" and any(c.startswith("runtime:") for c in conflicts),
+            "submitted_at": row["submitted_at"], "reviewed_at": row["reviewed_at"],
+            "late": bool(row["late"]), "missing_fields": json.loads(row["missing_fields"] or "[]"),
+            "conflict_fields": conflicts, "attachment_count": row["attachment_count"] or 0,
+            "consent_confirmed": bool(row["consent_confirmed"]),
+            "recognition_sources": routes.get(row["submission_id"], []),
         })
     return output
 
 
-def status_task(task_dir: str | Path) -> dict[str, Any]:
+def status_task(task_dir):
     root, task = load_task(task_dir)
     rows = report_rows(root)
-    counts: dict[str, int] = {}
+    counts = {}
     for row in rows:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
-    return {"task_id": task["task_id"], "task_status": "expired" if task_expired(task) else "active", "deadline": task["deadline"], "retention_until": task["retention_until"], "counts": counts, "total": len(rows)}
+    with closing(connect_db(root)) as db:
+        schema_version = db.execute("PRAGMA user_version").fetchone()[0]
+    return {"task_id": task["task_id"], "task_status": "expired" if task_expired(task) else "active",
+            "deadline": task["deadline"], "retention_until": task["retention_until"], "counts": counts,
+            "total": len(rows), "pending_count": sum(row["pending_count"] for row in rows),
+            "manual_review_count": counts.get("needs_review", 0),
+            "latest_received_at": max((row["received_at"] for row in rows if row["received_at"]), default=None),
+            "schema_version": schema_version, "migration_required": schema_version != DB_VERSION}
 
 
-def cmd_status(args) -> dict[str, Any]:
+def cmd_status(args):
     return status_task(args.task_dir)
 
 
-def write_reports(task_dir: str | Path, formats: list[str]) -> dict[str, str]:
+def _write_reports(task_dir: str | Path, formats: list[str]) -> dict[str, str]:
     root, task = load_task(task_dir)
     if task_expired(task):
         raise RuntimeError("任务已超过保存期限，停止生成报告；请执行清理")
@@ -964,22 +1204,32 @@ def write_reports(task_dir: str | Path, formats: list[str]) -> dict[str, str]:
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "收集进度"
-        columns = ["employee_id", "name", "status", "submission_version", "submitted_at", "reviewed_at", "late", "missing_fields", "conflict_fields", "attachment_count", "consent_confirmed"]
+        columns = ["employee_id", "name", "status", "submission_version", "submitted_at", "reviewed_at", "late", "missing_fields", "conflict_fields", "attachment_count", "consent_confirmed", "latest_version", "approved_version", "pending_count", "approval_method", "retryable", "received_at", "recognition_sources"]
         sheet.append(columns)
         for cell in sheet[1]:
             cell.font = Font(bold=True)
         for row_index, row in enumerate(rows, start=2):
             for column_index, key in enumerate(columns, start=1):
-                value = ",".join(row[key]) if isinstance(row[key], list) else row[key]
+                value = json.dumps(row[key], ensure_ascii=False) if key == "recognition_sources" else ",".join(row[key]) if isinstance(row[key], list) else row[key]
                 cell = sheet.cell(row_index, column_index, value)
                 if isinstance(value, str):
                     cell.data_type = "s"
         sheet.freeze_panes = "A2"
         sheet.auto_filter.ref = sheet.dimensions
-        workbook.save(path)
-        os.chmod(path, 0o600)
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        atomic_write(path, buffer.getvalue())
         written["xlsx"] = str(path)
     return written
+
+
+def write_reports(task_dir, formats):
+    root, _ = load_task(task_dir)
+    with task_lock(root):
+        result = _write_reports(root, formats)
+        with closing(connect_db(root)) as db, db:
+            audit(db, "report")
+        return result
 
 
 def cmd_report(args) -> dict[str, Any]:
@@ -1070,16 +1320,18 @@ def mask_value(rule: str, value: Any) -> str:
 
 
 def collect_clear_rows(root: Path, task: dict[str, Any], private_key, field_ids: list[str], masks: dict[str, str]) -> list[dict[str, str]]:
-    """内存解密全部 current+valid 提交（与 review 相同的解密/校验路径），只保留白名单字段。"""
+    """只解密每人最新且已通过的提交，重新做硬性校验并只保留白名单字段。"""
     field_defs = {field["id"]: field for field in task["fields"]}
     with closing(connect_db(root)) as db, db:
         rows = db.execute(
-            "SELECT s.*,i.employee_id,i.name,i.token_hash FROM submissions s JOIN invites i ON i.invite_id=s.invite_id WHERE s.id=i.current_submission_id AND s.status IN ('verified','needs_review') ORDER BY i.employee_id"
+            "SELECT s.*,i.employee_id,i.name,i.token_hash FROM submissions s JOIN invites i ON i.invite_id=s.invite_id WHERE s.id=(SELECT MAX(n.id) FROM submissions n WHERE n.invite_id=s.invite_id) AND s.status IN ('verified','verified_manual') ORDER BY i.employee_id"
         ).fetchall()
     output = []
     for row in rows:
-        payload = decrypt_envelope(root, task, root / row["path"], private_key, row["invite_id"])
-        validate_payload(task, row, payload)  # 导出前再跑一次完整校验，密文任何损坏都直接中止
+        payload = stored_payload(root, task, row, private_key)
+        missing, conflicts, _ = validate_payload(task, row, payload)
+        if missing or conflicts:
+            raise ValueError("EXPORT_VALIDATION_FAILED: 已通过记录的业务校验失败，停止导出")
         values = payload.get("values", {})
         record = {}
         for column, raw in (("employee_id", row["employee_id"]), ("name", row["name"])):
@@ -1099,19 +1351,20 @@ def write_clear_export(root: Path, task: dict[str, Any], rows: list[dict[str, st
     unknown = set(formats) - {"xlsx", "json"}
     if unknown:
         raise ValueError(f"不支持的导出格式: {sorted(unknown)}")
-    requested_out = Path(out).expanduser()
-    if requested_out.is_symlink():
-        raise ValueError("导出路径不能是符号链接")
-    out_path = requested_out.resolve()
+    out_path = secure_io.checked_path(out)
     if out_path == root or root in out_path.parents:
         raise ValueError("导出路径不能位于任务目录内")
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    for fmt in formats:
+        target = secure_io.checked_path(out_path.with_suffix('.' + fmt))
+        if target.exists():
+            raise FileExistsError("OUTPUT_EXISTS: 导出文件已存在，请选择新文件名")
     columns = ["employee_id", "name"] + field_ids
     written = {}
+    buffers = {}
     if "json" in formats:
         path = out_path.with_suffix(".json")
-        dump_json(path, {"task_id": task["task_id"], "exported_at": now_iso(), "purpose": purpose, "recipient": recipient, "fields": columns, "masks": masks, "rows": rows})
-        os.chmod(path, 0o600)
+        buffers[path] = canonical({"task_id": task["task_id"], "exported_at": now_iso(), "purpose": purpose, "recipient": recipient, "fields": columns, "masks": masks, "rows": rows})
         written["json"] = str(path)
     if "xlsx" in formats:
         from openpyxl import Workbook
@@ -1130,10 +1383,26 @@ def write_clear_export(root: Path, task: dict[str, Any], rows: list[dict[str, st
                 cell.data_type = "s"
         sheet.freeze_panes = "A2"
         sheet.auto_filter.ref = sheet.dimensions
-        workbook.save(path)
-        os.chmod(path, 0o600)
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        buffers[path] = buffer.getvalue()
         written["xlsx"] = str(path)
+    created = []
+    try:
+        for path, data in buffers.items():
+            secure_io.atomic_write(path, data, overwrite=False)
+            created.append(path)
+    except BaseException:
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
     return written
+
+
+def export_snapshot(root):
+    with closing(connect_db(root)) as db:
+        rows = [tuple(row) for row in db.execute("SELECT id,sha256,status FROM submissions ORDER BY id")]
+    return sha256_bytes(canonical([load_task(root)[1], rows]))
 
 
 def cmd_export_clear(args) -> dict[str, Any]:
@@ -1142,6 +1411,9 @@ def cmd_export_clear(args) -> dict[str, Any]:
     require_current_format(task, "明文导出")
     if task_expired(task):
         raise RuntimeError("任务已超过保存期限，禁止明文导出；请执行清理")
+    purpose, recipient = (getattr(args, "purpose", "") or "").strip(), (getattr(args, "recipient", "") or "").strip()
+    if not purpose or not recipient:
+        raise ValueError("EXPORT_PURPOSE_REQUIRED: 请填写 --purpose 和 --recipient")
     field_ids = parse_export_fields(task, getattr(args, "fields", None))
     masks = parse_mask_specs(getattr(args, "mask", None))
     unknown_mask = set(masks) - ({"employee_id", "name"} | set(field_ids))
@@ -1153,48 +1425,72 @@ def cmd_export_clear(args) -> dict[str, Any]:
         private_key = unlock_private_key(root, password)
     except Exception as exc:
         raise RuntimeError("任务密码错误或私钥损坏") from exc
-    rows = collect_clear_rows(root, task, private_key, field_ids, masks)
-    purpose, recipient = (getattr(args, "purpose", "") or "").strip(), (getattr(args, "recipient", "") or "").strip()
+    with task_lock(root):
+        rows = collect_clear_rows(root, task, private_key, field_ids, masks)
+        snapshot = export_snapshot(root)
+        excluded = len(report_rows(root)) - len(rows)
     print("\n=== 明文导出确认 ===")
     print(f"任务: {task['task_id']}（{task['title']}）")
     print(f"导出字段: {', '.join(['employee_id', 'name'] + field_ids)}")
     print(f"脱敏规则: {', '.join(f'{key}={rule}' for key, rule in sorted(masks.items())) or '无（白名单字段全部明文）'}")
     print(f"数据行数: {len(rows)}")
+    print(f"未纳入人数: {excluded}（最新版本未通过或尚未提交；详见进度报告）")
     print(f"用途: {purpose or '（未填写）'}")
     print(f"接收方: {recipient or '（未填写）'}")
     typed = input(f"输入任务 ID {task['task_id']} 以确认导出明文: ").strip()
     if typed != task["task_id"]:
         raise RuntimeError("任务 ID 不匹配，已取消导出")
-    written = write_clear_export(root, task, rows, field_ids, masks, args.out, formats, purpose, recipient)
+    with task_lock(root):
+        if task_expired(load_task(root)[1]) or snapshot != export_snapshot(root):
+            raise RuntimeError("STATE_CHANGED: 任务已变化或到期，请重新确认")
+        # Re-read authenticated bytes after the human confirmation gap.
+        rows = collect_clear_rows(root, task, private_key, field_ids, masks)
+        written = write_clear_export(root, task, rows, field_ids, masks, args.out, formats, purpose, recipient)
+        with closing(connect_db(root)) as db, db:
+            audit(db, "export_clear", reason="approved_latest_only")
     print("警告：明文已落盘，用后请删除，系统无法管控后续传播。", file=sys.stderr)
-    return {"task_id": task["task_id"], "rows": len(rows), **written}
+    return {"task_id": task["task_id"], "rows": len(rows), "excluded": excluded, **written}
 
 
-def build_task_package(task_dir: str | Path) -> tuple[bytes, dict[str, Any]]:
-    """在内存中构建任务交接 ZIP（明文，含名单标识），供加密导出或测试复用。"""
+def build_task_package(task_dir):
     root, task = load_task(task_dir)
     if task_expired(task):
-        raise RuntimeError("任务已超过保存期限，禁止导出；请执行清理")
-    if any(path.is_symlink() for path in root.rglob("*")):
-        raise ValueError("任务目录包含符号链接，拒绝导出")
-    candidates = [root / name for name in ("task.json", "public.pem", "private.pem.enc", "roster.csv", "invite-index.csv", "state.sqlite3")]
-    if any(not path.is_file() for path in candidates):
-        raise ValueError("任务目录缺少必要文件")
-    candidates += list((root / "invites").glob("*.html"))
-    candidates += list((root / "submissions").glob("*/*.yintian"))
-    candidates += [path for path in (root / "reports").glob("progress.*") if path.suffix in {".json", ".xlsx"}]
-    files = [path for path in sorted(candidates) if path.is_file() and not path.is_symlink()]
-    sizes = [path.stat().st_size for path in files]
-    if len(files) > MAX_PACKAGE_FILES or any(size > MAX_PACKAGE_MEMBER_BYTES for size in sizes) or sum(sizes) > MAX_PACKAGE_BYTES:
-        raise ValueError("任务内容超过交接包安全上限")
-    manifest = {path.relative_to(root).as_posix(): sha256_file(path) for path in files}
-    metadata = {"package_version": TASK_PACKAGE_VERSION, "task_id": task["task_id"], "created_at": now_iso(), "manifest": manifest}
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("package.json", json.dumps(metadata, ensure_ascii=False, indent=2))
-        for path in files:
-            archive.write(path, task["task_id"] + "/" + path.relative_to(root).as_posix())
-    return buffer.getvalue(), {"task_id": task["task_id"], "files": len(files)}
+        raise RuntimeError("TASK_EXPIRED: 任务已超过保存期限")
+    with task_lock(root):
+        for path in root.rglob("*"):
+            secure_io.checked_path(path, root)
+        candidates = [root / name for name in ("task.json", "public.pem", "private.pem.enc", "roster.csv", "invite-index.csv", "state.sqlite3")]
+        if any(not path.is_file() for path in candidates):
+            raise ValueError("任务目录缺少必要文件")
+        candidates += list((root / "invites").glob("*.html"))
+        candidates += list((root / "invites").glob("*.yintian-form"))
+        candidates += list((root / "credentials").glob("*.yintian-credential"))
+        if (root / "FORM.yintian-form").exists():
+            candidates.append(root / "FORM.yintian-form")
+        candidates += list((root / "submissions").glob("*/*.yintian"))
+        candidates += [p for p in (root / "reports").glob("progress.*") if p.suffix in {".json", ".xlsx"}]
+        if len(candidates) > MAX_PACKAGE_FILES:
+            raise ValueError("任务内容超过交接包安全上限")
+        data, total = {}, 0
+        for path in sorted(candidates):
+            if path.name == "state.sqlite3":
+                with closing(connect_db(root)) as source, closing(sqlite3.connect(":memory:")) as snapshot:
+                    source.backup(snapshot)
+                    raw = snapshot.serialize()
+            else:
+                raw = secure_io.read_bytes(path, MAX_PACKAGE_MEMBER_BYTES)
+            total += len(raw)
+            if len(raw) > MAX_PACKAGE_MEMBER_BYTES or total > MAX_PACKAGE_BYTES:
+                raise ValueError("任务内容超过交接包安全上限")
+            data[path.relative_to(root).as_posix()] = raw
+        metadata = {"package_version": TASK_PACKAGE_VERSION, "task_id": task["task_id"], "created_at": now_iso(),
+                    "manifest": {name: sha256_bytes(raw) for name, raw in data.items()}}
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("package.json", canonical(metadata))
+            for name, raw in data.items():
+                archive.writestr(task["task_id"] + "/" + name, raw)
+        return buffer.getvalue(), {"task_id": task["task_id"], "files": len(data)}
 
 
 def task_package_aad(task_id: str) -> bytes:
@@ -1207,23 +1503,11 @@ def export_task(task_dir: str | Path, out: str | Path, handoff_password: str | N
     password = handoff_password if handoff_password is not None else generate_password()
     envelope = aes_gcm_seal(ENCRYPTED_TASK_PACKAGE_VERSION, zip_bytes, password, aad=task_package_aad(task["task_id"]))
     envelope["task_id"] = task["task_id"]
-    requested_out = Path(out).expanduser()
-    if requested_out.is_symlink():
-        raise ValueError("导出路径不能是符号链接")
-    out_path = requested_out.resolve()
+    out_path = secure_io.checked_path(out)
     if out_path == root or root in out_path.parents:
         raise ValueError("导出路径不能位于任务目录内")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=out_path.parent, delete=False) as stream:
-        temp_path = Path(stream.name)
-    try:
-        temp_path.write_bytes(json.dumps(envelope, ensure_ascii=False, indent=2).encode("utf-8") + b"\n")
-        os.chmod(temp_path, 0o600)
-        temp_path.replace(out_path)
-    except Exception:
-        temp_path.unlink(missing_ok=True)
-        raise
-    return {"task_id": task["task_id"], "package": str(out_path), "files": info["files"], "handoff_password": password}
+    secure_io.atomic_write(out_path, canonical(envelope), overwrite=False)
+    return {**info, "out": str(out_path), "handoff_password": password}
 
 
 def cmd_export(args) -> dict[str, Any]:
@@ -1279,7 +1563,7 @@ def open_task_package(package_path: Path, handoff_password: str | None = None) -
 
 
 def import_task(package: str | Path, out_parent: str | Path, handoff_password: str | None = None, confirm_plaintext=None) -> dict[str, Any]:
-    package_path, parent = Path(package).expanduser().resolve(), Path(out_parent).expanduser().resolve()
+    package_path, parent = secure_io.checked_path(package), secure_io.checked_path(out_parent)
     if package_path.stat().st_size > MAX_PACKAGE_BYTES:
         raise ValueError("任务包超过安全上限")
     archive, encrypted = open_task_package(package_path, handoff_password)
@@ -1311,8 +1595,11 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
             parts = rel_path.parts
             allowed = (
                 rel in required
+                or rel == "FORM.yintian-form"
+                or (len(parts) == 2 and parts[0] == "invites" and parts[1].endswith(".yintian-form") and INVITE_ID_RE.fullmatch(parts[1][:-13]))
+                or (len(parts) == 2 and parts[0] == "credentials" and parts[1].endswith(".yintian-credential") and valid_invite_identifier(parts[1][:-19]))
                 or (len(parts) == 2 and parts[0] == "invites" and parts[1].endswith(".html") and INVITE_ID_RE.fullmatch(parts[1][:-5]))
-                or (len(parts) == 3 and parts[0] == "submissions" and INVITE_ID_RE.fullmatch(parts[1]) and re.fullmatch(r"v\d{4}_[0-9a-f]{12}\.yintian", parts[2]))
+                or (len(parts) == 3 and parts[0] == "submissions" and valid_invite_identifier(parts[1]) and re.fullmatch(r"v\d{4}_[0-9a-f]{12}\.yintian", parts[2]))
                 or rel in {"reports/progress.json", "reports/progress.xlsx"}
             )
             if not allowed or rel in manifest:
@@ -1363,11 +1650,11 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
             roster = read_roster(target / "roster.csv")
             with (target / "invite-index.csv").open("r", encoding="utf-8-sig", newline="") as stream:
                 index = list(csv.DictReader(stream))
-            if len(index) != len(roster) or not index or any(not INVITE_ID_RE.fullmatch(row.get("invite_id", "")) for row in index):
+            if len(index) != len(roster) or not index or any(not valid_invite_identifier(row.get("invite_id", "")) for row in index):
                 raise ValueError("任务包名单或邀请索引无效")
             if status_task(target)["total"] != len(roster):
                 raise ValueError("任务包状态数据库与名单不一致")
-            if imported_task["format_version"] == FORMAT_VERSION:
+            if imported_task["format_version"] in {FORMAT_VERSION, GROUP_FORMAT_VERSION}:
                 with closing(connect_db(target)) as db, db:
                     columns = {row[1] for row in db.execute("PRAGMA table_info(invites)")}
                 if "token_hash" not in columns:
@@ -1403,7 +1690,21 @@ def cmd_purge(args) -> dict[str, Any]:
     with task_lock(root):
         status = status_task(root)
         summary = {"task_id": task["task_id"], "purged_at": now_iso(), "aggregate_counts": status["counts"], "total": status["total"]}
-        shutil.rmtree(root)
+        if os.name == 'nt':
+            # Windows cannot delete an open CRT lock file. Remove task data under
+            # the lock; after release only the inert lock/empty directory remain.
+            for path in root.rglob('*'):
+                secure_io.checked_path(path, root)
+            for path in root.iterdir():
+                if path.name != '.write.lock':
+                    shutil.rmtree(path) if path.is_dir() else path.unlink()
+        else:
+            shutil.rmtree(root)
+    if os.name == 'nt':
+        if {path.name for path in root.iterdir()} - {'.write.lock'}:
+            raise RuntimeError('STATE_CHANGED: 删除结束时目录出现新文件，停止清理')
+        (root / '.write.lock').unlink(missing_ok=True)
+        root.rmdir()
     summary_path = parent / f"{task['task_id']}.purged.json"
     dump_json(summary_path, summary)
     return {"summary": str(summary_path)}
@@ -1413,15 +1714,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="隐填：端到端加密的私密信息收集管理")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("init-config", help="生成基础身份信息收集配置")
-    p.add_argument("--out", required=True); p.add_argument("--force", action="store_true"); p.set_defaults(func=cmd_init_config)
+    p.add_argument("--out", required=True); p.add_argument("--force", action="store_true"); p.add_argument('--mode', choices=['directed', 'group'], default='directed'); p.set_defaults(func=cmd_init_config)
     p = sub.add_parser("create", help="创建任务并批量生成离线邀请")
     p.add_argument("--roster", required=True); p.add_argument("--config", required=True); p.add_argument("--out", required=True)
-    p.add_argument("--mode", choices=["directed", "group"], default="directed", help="directed 逐人定向邀请（默认）；group 单份表单群发、无个人令牌，可冒名提交，仅靠复核名单比对兜底")
+    p.add_argument("--mode", choices=["directed", "group"], default="directed", help="directed 个人邀请；group 公共模板加私下发放的个人凭据")
     p.set_defaults(func=cmd_create)
     p = sub.add_parser("ingest", help="接收 .yintian 密文提交")
     p.add_argument("task_dir"); p.add_argument("submissions_dir"); p.set_defaults(func=cmd_ingest)
     p = sub.add_parser("review", help="本地解密、校验和 OpenVINO OCR 复核")
-    p.add_argument("task_dir"); p.set_defaults(func=cmd_review)
+    p.add_argument("task_dir"); p.add_argument("--retry-needs-review", action="store_true"); p.add_argument("--invite"); p.set_defaults(func=cmd_review)
+    p = sub.add_parser("decide", help="本人终端逐项核对 OCR 证据或退回重填")
+    p.add_argument("task_dir"); p.add_argument("invite_id"); p.add_argument("--version", required=True, type=int)
+    p.add_argument("--action", choices=["confirm", "return"], required=True); p.add_argument("--operator", required=True); p.set_defaults(func=cmd_decide)
+    p = sub.add_parser("migrate", help="显式备份并升级数据库；旧无认证群发任务保持只读")
+    p.add_argument("task_dir"); p.set_defaults(func=cmd_migrate)
+    p = sub.add_parser("doctor", help="检查 Python、核心依赖、OCR 与 Tk，不读取私密材料")
+    p.add_argument("--vault", help="仅检查目录权限"); p.set_defaults(func=cmd_doctor)
     p = sub.add_parser("status", help="查看数据最小化统计")
     p.add_argument("task_dir"); p.set_defaults(func=cmd_status)
     p = sub.add_parser("report", help="生成保留姓名/员工号的数据最小化 XLSX/JSON 报告")
@@ -1458,7 +1766,7 @@ def main() -> None:
         if result is not None:
             print(json.dumps(result, ensure_ascii=False, indent=2))
     except Exception as exc:
-        print(f"错误: {exc}", file=sys.stderr)
+        print(f"错误: {terminal_text(exc)}", file=sys.stderr)
         raise SystemExit(1)
 
 

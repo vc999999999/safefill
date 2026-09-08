@@ -7,12 +7,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import io
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
 import collection
+import secure_io
 
 REQUIRED_INDEX_COLUMNS = ("employee_id", "name", "invite_id", "invite_file")
 
@@ -23,10 +25,10 @@ def _one_line(value: Any) -> str:
 
 
 def load_invite_index(task_dir: Path) -> list[dict[str, str]]:
-    index_path = task_dir / "invite-index.csv"
+    index_path = secure_io.checked_path(task_dir / "invite-index.csv", task_dir)
     if not index_path.is_file():
         raise FileNotFoundError(f"未找到邀请索引文件: {index_path}")
-    with index_path.open("r", encoding="utf-8-sig") as stream:
+    with io.StringIO(secure_io.read_bytes(index_path, 8 * 1024 * 1024).decode('utf-8-sig')) as stream:
         reader = csv.DictReader(stream)
         missing_cols = [col for col in REQUIRED_INDEX_COLUMNS if col not in (reader.fieldnames or [])]
         if missing_cols:
@@ -55,7 +57,16 @@ def verify_invites(task_dir: Path) -> dict[str, Any]:
         if rel is None:
             invalid.append(row)
             continue
-        target = task_dir / rel
+        try:
+            target = secure_io.checked_path(task_dir / rel, task_dir)
+            if row['invite_id'].startswith(collection.GROUP_INVITE_PREFIX):
+                credential = secure_io.checked_path(task_dir / 'credentials' / (row['invite_id'] + '.yintian-credential'), task_dir)
+                if not credential.is_file() or credential.stat().st_size == 0:
+                    missing.append(row)
+                    continue
+        except ValueError:
+            invalid.append(row)
+            continue
         if target.is_file() and target.stat().st_size > 0:
             valid += 1
         else:
@@ -82,10 +93,24 @@ def generate_messages(task_dir: Path, template: str | None = None) -> list[dict[
         "说明：请使用 Chrome 或 Edge 浏览器双击打开此单文件直接填写，断网亦可导出加密文件；"
         "提交后生成的 .yintian 密文文件请直接私聊交回。截止时间：{deadline}。"
     )
+    if collection.task_mode(task) == 'group':
+        default_tpl = (
+            "【{title}】{name}（{employee_id}），请用隐填填写 Skill 读取群内 FORM.yintian-form，"
+            "在本人终端解锁保险柜填写；本人的 {invite_id}.yintian-credential 将私下发放，不能发到群里。"
+            "仅交回 .yintian 密文，截止时间：{deadline}。"
+        )
     tpl = template or default_tpl
 
     results = []
     for r in rows:
+        rel = safe_invite_relpath(r['invite_file'])
+        if rel is None:
+            raise ValueError('INDEX_INVALID: 分发索引含非法邀请或文件路径')
+        if collection.task_mode(task) == 'group':
+            collection.parse_group_employee_id(r['invite_id'])
+        elif not collection.INVITE_ID_RE.fullmatch(r['invite_id']):
+            raise ValueError('INDEX_INVALID: 非法邀请标识')
+        secure_io.checked_path(task_dir / rel, task_dir)
         msg = tpl.format(
             title=title,
             name=_one_line(r["name"]),
@@ -101,6 +126,8 @@ def generate_messages(task_dir: Path, template: str | None = None) -> list[dict[
             "invite_id": r["invite_id"],
             "invite_path": str(task_dir / r["invite_file"]),
             "message": msg,
+            **({"credential_path": str(task_dir / 'credentials' / (r['invite_id'] + '.yintian-credential')),
+                "credential_delivery": "private", "template_delivery": "group"} if collection.task_mode(task) == 'group' else {}),
         })
     return results
 
@@ -108,8 +135,10 @@ def generate_messages(task_dir: Path, template: str | None = None) -> list[dict[
 def export_messages_csv(msgs: list[dict[str, str]], out_csv: str, force: bool = False) -> Path:
     """导出分发文案 CSV；落盘只含邀请单页文件名，拒绝符号链接与意外覆盖，写后收紧权限为 0600。"""
     out_path = Path(out_csv).expanduser()
-    if out_path.is_symlink():
-        raise RuntimeError(f"输出路径是符号链接，拒绝写入: {out_path}")
+    try:
+        secure_io.checked_path(out_path)
+    except ValueError:
+        raise RuntimeError('PATH_UNSAFE: 输出路径包含符号链接或重解析点') from None
     rows = [
         {
             "employee_id": item["employee_id"],
@@ -121,14 +150,13 @@ def export_messages_csv(msgs: list[dict[str, str]], out_csv: str, force: bool = 
         for item in msgs
     ]
     try:
-        with out_path.open("w" if force else "x", encoding="utf-8-sig", newline="") as s:
-            writer = csv.DictWriter(s, fieldnames=["employee_id", "name", "invite_id", "invite_file", "message"])
-            writer.writeheader()
-            writer.writerows(rows)
+        buffer = io.StringIO(newline='')
+        writer = csv.DictWriter(buffer, fieldnames=["employee_id", "name", "invite_id", "invite_file", "message"])
+        writer.writeheader()
+        writer.writerows([{key: collection.csv_text(value) for key, value in row.items()} for row in rows])
+        secure_io.atomic_write(out_path, buffer.getvalue().encode('utf-8-sig'), overwrite=force)
     except FileExistsError:
         raise RuntimeError(f"输出文件已存在，拒绝覆盖（确认要覆盖请加 --force）: {out_path}") from None
-    if os.name != "nt":
-        os.chmod(out_path, 0o600)
     return out_path
 
 

@@ -7,14 +7,15 @@ import os
 import re
 import sys
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 import config
 import privacy
+import secure_io
 
-# collection.py 的 atomic_write 使用 tempfile.NamedTemporaryFile(delete=False)，
-# 默认命名为 tmp 加 8 位小写字母/数字/下划线；进程中断时可能留下孤儿临时文件。
-ORPHAN_TEMP_RE = re.compile(r"^tmp[a-z0-9_]{8}$")
+# 同时识别旧版和 secure_io 的原子写临时文件。
+ORPHAN_TEMP_RE = re.compile(r"^(tmp[a-z0-9_]{8}|\.yintian-tmp-[0-9a-f]{24})$")
 LOCK_NAME = ".write.lock"
 LOCK_PID_RE = re.compile(r"^pid=(\d+)\s+time=(\S+)")
 PYCACHE_DIR = "__pycache__"
@@ -32,6 +33,8 @@ def keep_rule(path: Path) -> tuple[str, str] | None:
         return "任务定义", GUIDE_PURGE
     if name == "state.sqlite3":
         return "任务状态数据库", GUIDE_PURGE
+    if path.suffix in {'.yintian-vault', '.yintian-credential', '.yintian-form'}:
+        return '个人保险柜、凭据或模板', GUIDE_MANUAL
     if name == "private.pem.enc":
         return "加密的任务私钥", GUIDE_PURGE
     if name == "invite-index.csv":
@@ -84,10 +87,12 @@ def pid_alive(pid: int) -> bool | None:
 def judge_lock(path: Path) -> tuple[str, str]:
     """判定 .write.lock 是否可删；返回 (delete|keep, 理由)。"""
     try:
-        first_line = path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
-    except (OSError, IndexError):
+        first_line = secure_io.read_bytes(path, 1024).decode('utf-8', errors='replace').splitlines()[0]
+    except (OSError, ValueError, IndexError):
         return "keep", "锁文件无法读取，保守保留"
     match = LOCK_PID_RE.match(first_line)
+    if first_line == 'yintian-os-lock/1':
+        return 'keep', '操作系统锁文件；不得删除，锁会随进程退出自动释放'
     if not match:
         return "keep", "锁文件未记录 pid，无法确认写入进程已退出，保守保留"
     alive = pid_alive(int(match.group(1)))
@@ -119,6 +124,11 @@ def scan_root(root: Path, stale_seconds: float, result: dict) -> None:
         try:
             if entry.is_symlink():
                 result["skipped_symlinks"].append({"path": str(path), "reason": "符号链接一律不跟随、不删除"})
+                continue
+            try:
+                secure_io.checked_path(path)
+            except ValueError:
+                result['skipped_symlinks'].append({'path': str(path), 'reason': '拒绝链接或重解析点'})
                 continue
             if entry.is_dir(follow_symlinks=False):
                 if entry.name in {"submissions", "received"}:
@@ -173,7 +183,7 @@ def resolve_task_dirs(task_dirs: list[str], vault_dir: str | None) -> list[Path]
     if not task_dirs:
         if not vault:
             raise RuntimeError("未指定 TASK_DIR 且未配置 YINTIAN_VAULT_DIR；请显式给出要扫描的目录，绝不默认扫描当前目录")
-        vault_root = Path(vault).expanduser().resolve()
+        vault_root = secure_io.checked_path(vault)
         try:
             children = sorted(path for path in vault_root.iterdir() if path.is_dir() and not path.is_symlink())
         except OSError as exc:
@@ -186,6 +196,7 @@ def resolve_task_dirs(task_dirs: list[str], vault_dir: str | None) -> list[Path]
         if vault:
             privacy.assert_in_vault(raw, vault)
         path = Path(raw).expanduser()
+        secure_io.checked_path(path)
         if not path.is_dir():
             raise RuntimeError(f"不是目录或不存在: {raw}")
         resolved.append(path)
@@ -213,13 +224,14 @@ def should_scan_scripts_cache(cache_dir: Path, roots: list[Path], vault: str | N
 
 
 def recheck_deletable(item: dict, stale_seconds: float, now: float) -> str | None:
-    """apply 删除前逐项重判，消除扫描与删除之间的 TOCTOU；返回 None 表示仍可删除，否则返回跳过理由。"""
+    """apply 删除前逐项重判；返回 None 表示仍可删除，否则返回跳过理由。"""
     path = Path(item["path"])
     if path.is_symlink():
         return "删除前复查发现它已变成符号链接"
     try:
+        secure_io.checked_path(path)
         stat_result = path.stat()
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return f"删除前复查无法读取状态: {exc}"
     if not path.is_file():
         return "删除前复查发现它不再是普通文件"
@@ -246,12 +258,24 @@ def apply_deletions(result: dict, stale_seconds: float) -> None:
     deleted = []
     now = time.time()
     for item in result["delete"]:
-        reason = recheck_deletable(item, stale_seconds, now)
-        if reason is not None:
-            result["skipped_recheck"].append({"path": item["path"], "category": item.get("category", ""), "reason": reason})
-            continue
         try:
-            Path(item["path"]).unlink()
+            with ExitStack() as stack:
+                path = secure_io.checked_path(item['path'])
+                # All task mutations use the same OS lock, including old temporary files.
+                if item.get('category') != '死锁文件':
+                    for parent in path.parents:
+                        if (parent / 'task.json').exists() or (parent / LOCK_NAME).exists():
+                            stack.enter_context(secure_io.file_lock(parent / LOCK_NAME))
+                            break
+                reason = recheck_deletable(item, stale_seconds, now)
+                if reason is not None:
+                    result['skipped_recheck'].append({'path': item['path'], 'category': item.get('category', ''), 'reason': reason})
+                    continue
+                with secure_io.parent_handle(path) as (directory, checked):
+                    os.unlink(checked if directory is None else checked.name, dir_fd=directory)
+        except (ValueError, RuntimeError) as exc:
+            result['skipped_recheck'].append({'path': item['path'], 'category': item.get('category', ''), 'reason': str(exc)})
+            continue
         except OSError as exc:
             result["errors"].append({"path": item["path"], "error": str(exc)})
             continue

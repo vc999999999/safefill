@@ -1,13 +1,3 @@
-# OpenVINO 本地 OCR
-# rapidocr-openvino 1.4.4 自身钉 openvino<=2024.0.0，二者必须保持一致
-rapidocr-openvino==1.4.4
-openvino==2024.0.0
-
-# 端到端加密与扫描 PDF 内存渲染
-cryptography>=50,<51
-pypdfium2>=5.13,<6
-pillow>=12.3,<13
-
-# 安全状态 MCP 与数据最小化报告
-mcp>=1.29,<2
-openpyxl>=3.1,<4
+# Default installation runs the full collection workflow without hardware OCR.
+-r requirements-core.txt
+# Optional local acceleration: pip install -r requirements-ocr.txt

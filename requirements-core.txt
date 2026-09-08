@@ -1,0 +1,6 @@
+# CPU-independent collection/filling runtime, Python 3.11+
+cryptography>=46,<51
+pillow>=11.3,<13
+pypdfium2>=5.13,<6
+openpyxl>=3.1,<4
+mcp>=1.29,<2

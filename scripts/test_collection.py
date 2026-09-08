@@ -269,7 +269,7 @@ def test_compare_ocr_field_matching(tmp_path: Path) -> None:
     collection.ocr_attachment = lambda item: ("", ["ocr_no_text"])
     try:
         task_fields = collection.load_json(ns.task_dir / "task.json")["fields"]
-        assert set(collection.compare_ocr({"values": ns.values}, [{"field_id": "id_front"}], task_fields)) == {"ocr_no_identity_fields", "ocr_no_text"}
+        assert set(collection.compare_ocr({"values": ns.values}, [{"field_id": "id_front"}], task_fields)) == {"ocr:quality:id_front", "ocr:missing:name", "ocr:missing:id_number", "ocr:missing:address"}
         assert collection.compare_ocr({"values": ns.values}, [{"field_id": "profile_photo"}], task_fields) == []
         custom_fields = [
             {"id": "name", "label": "姓名", "type": "text"},
@@ -281,7 +281,7 @@ def test_compare_ocr_field_matching(tmp_path: Path) -> None:
         ]
         collection.ocr_attachment = lambda item: (f"姓名 张三\n住址 北京市海淀区\n公民身份号码 {VALID_ID}\n联系电话 13900139000\n", [])
         custom_values = {"name": "张三", "mobile": "13800138000", "credential": VALID_ID, "residence": "北京市朝阳区"}
-        assert set(collection.compare_ocr({"values": custom_values}, [{"field_id": "card_front"}], custom_fields)) == {"mobile", "residence"}
+        assert set(collection.compare_ocr({"values": custom_values}, [{"field_id": "card_front"}], custom_fields)) == {"ocr:conflict:residence"}  # 身份证正面不要求识别手机号
     finally:
         collection.ocr_attachment = original_ocr
 
@@ -297,7 +297,9 @@ def test_tampered_ciphertext_does_not_overwrite(tmp_path: Path) -> None:
     collection.dump_json(ns.incoming / "two.yintian", tampered)
     assert collection.ingest_task(ns.task_dir, ns.incoming)["accepted"] == 1
     assert collection.review_task(ns.task_dir, PASSWORD)["invalid"] == 1
-    assert collection.report_rows(ns.task_dir)[0]["submission_version"] == 2  # 无效新版本不覆盖旧有效版本
+    assert collection.report_rows(ns.task_dir)[0]["latest_version"] == 3
+    with collection.connect_db(ns.task_dir) as db:
+        assert db.execute("SELECT current_submission_id FROM invites").fetchone()[0] == 2  # 旧记录仍保留
 
 
 def test_ingest_rejects_unreadable_files(tmp_path: Path) -> None:
@@ -726,7 +728,9 @@ def test_ingest_versions_per_invite_limited(tmp_path: Path) -> None:
     result = collection.ingest_task(ns.task_dir, ns.incoming)
     assert result["accepted"] == collection.MAX_VERSIONS_PER_INVITE - 1 and result["rejected"] == 1
     row = collection.report_rows(ns.task_dir)[0]
-    assert row["submission_version"] == 1 and row["status"] == "needs_review"  # 已有有效版本不受影响
+    assert row["latest_version"] == collection.MAX_VERSIONS_PER_INVITE and row["status"] == "submitted"
+    with collection.connect_db(ns.task_dir) as db:
+        assert db.execute("SELECT status FROM submissions WHERE version=1").fetchone()[0] == "needs_review"
     with closing_db(ns.task_dir) as db:
         versions = db.execute("SELECT COUNT(*) FROM submissions WHERE invite_id=?", (ns.invite_id,)).fetchone()[0]
     assert versions == collection.MAX_VERSIONS_PER_INVITE
@@ -853,7 +857,7 @@ def test_compare_ocr_front_back_word_boundary(tmp_path: Path) -> None:
         ]
         attachments = [{"field_id": field_id} for field_id in ("backdrop", "feedback_scan", "id_front", "id_card_back")]
         collection.compare_ocr({"values": {"name": "张三"}}, attachments, fields)
-        assert sorted(calls) == ["id_card_back", "id_front"]  # backdrop 类 id 不触发证件 OCR 比对
+        assert sorted(calls) == ["id_front"]  # backdrop 类 id 不触发证件 OCR 比对
     finally:
         collection.ocr_attachment = original_ocr
 
@@ -924,7 +928,7 @@ def make_group_scenario(tmp: Path) -> types.SimpleNamespace:
     warning = io.StringIO()
     with contextlib.redirect_stderr(warning):
         created = collection.create_task(roster, config_path, tmp / "group-tasks", PASSWORD, require_terminal=False, mode="group")
-    assert "冒名" in warning.getvalue()  # group 创建必须打印可冒名风险提示
+    assert not warning.getvalue()  # 新群发协议通过个人凭据认证，不依赖风险提示
     task_dir = Path(created["task_dir"])
     values = {"name": "张三", "employee_id": "E001", "phone": "13800138000", "id_number": VALID_ID, "address": "北京市朝阳区"}
     incoming = tmp / "group-incoming"; incoming.mkdir()
@@ -947,9 +951,16 @@ def make_group_envelope(task_dir: Path, employee_id: str, values: dict, override
         "values": values,
         "attachments": {},
     }
+    credential_path = task_dir / "credentials" / (invite_id + ".yintian-credential")
+    if credential_path.exists():
+        payload["invite_token"] = collection.load_json(credential_path)["invite_token"]
     if overrides:
         payload.update(overrides)
-    return wrap_payload(task_dir, invite_id, payload)
+    envelope = wrap_payload(task_dir, invite_id, payload)
+    if task.get("submission_auth") == collection.AUTH_VERSION:
+        token = collection.load_json(credential_path)["invite_token"]
+        envelope["auth_tag"] = collection.submission_auth_tag(envelope, collection.sha256_bytes(token.encode()))
+    return envelope
 
 
 def submit_group(ns: types.SimpleNamespace, employee_id: str, filename: str, values: dict | None = None, **kwargs) -> None:
@@ -975,7 +986,7 @@ def test_group_create_layout(tmp_path: Path) -> None:
     task = collection.load_json(ns.task_dir / "task.json")
     assert task["mode"] == "group"
     form = collection.load_json(ns.task_dir / "FORM.yintian-form")
-    assert form["format"] == "yintian-form/1" and form["mode"] == "group"
+    assert form["format"] == "yintian-form/2" and form["mode"] == "group"
     assert "invite_id" not in form and "invite_token" not in form and "name" not in form  # 单份群发，无任何个人标识与令牌
     assert form["key_id"] == task["key_id"] and form["public_key_pem"] == (ns.task_dir / "public.pem").read_text(encoding="utf-8")
     assert [field["id"] for field in form["fields"]] == [field["id"] for field in task["fields"]]
@@ -1001,7 +1012,7 @@ def test_group_config_requires_employee_id_field(tmp_path: Path) -> None:
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
         assert_raises(ValueError, lambda: collection.create_task(roster, config_path, tmp_path / "blocked", PASSWORD, require_terminal=False, mode="group"), "group 模式缺少 employee_id 字段必须拒绝创建")
-    assert "冒名" in err.getvalue()  # 拒绝前也已如实提示风险
+    assert not err.getvalue()  # 不用警告替代新群发协议的认证
     assert not (tmp_path / "blocked").exists()
     created = collection.create_task(roster, config_path, tmp_path / "ok", PASSWORD, require_terminal=False)  # 默认 directed 不受影响
     assert collection.load_json(Path(created["task_dir"]) / "task.json")["mode"] == "directed"
@@ -1068,6 +1079,15 @@ def test_envelope_mode_isolation(tmp_path: Path) -> None:
     assert collection.review_task(directed_ns.task_dir, PASSWORD)["invalid"] == 1  # directed 模式令牌缺失仍判 invalid，校验链未松动
 
 
+def valid_test_attachments():
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), "white").save(buffer, format="PNG")
+    raw = buffer.getvalue()
+    item = {"name": "synthetic.png", "type": "image/png", "size": len(raw), "sha256": collection.sha256_bytes(raw), "data_b64": base64.b64encode(raw).decode()}
+    return {"id_front": [item], "id_back": [item]}
+
+
 def export_clear_args(ns: types.SimpleNamespace, out: Path, **overrides) -> types.SimpleNamespace:
     base = dict(task_dir=str(ns.task_dir), out=str(out), fields="phone,id_number,address", mask=["id_number=last4", "phone=mid4"],
                 purpose="办理员工商业保险", recipient="保险公司对接人", formats=["xlsx", "json"])
@@ -1079,8 +1099,15 @@ def test_export_clear_end_to_end(tmp_path: Path) -> None:
     from openpyxl import load_workbook
 
     ns = make_scenario(tmp_path)
-    submit_accepted(ns)
-    assert collection.review_task(ns.task_dir, PASSWORD)["needs_review"] == 1  # 缺证件附件；needs_review 仍属 current+valid
+    ns.values["effective_date"] = "2024-02-29"
+    attachments = valid_test_attachments()
+    submit_accepted(ns, attachments=attachments)
+    original = collection.ocr_attachment
+    collection.ocr_attachment = lambda item: (f"姓名 张三\n公民身份号码 {VALID_ID}\n住址 北京市朝阳区\n", [])
+    try:
+        assert collection.review_task(ns.task_dir, PASSWORD)["verified"] == 1
+    finally:
+        collection.ocr_attachment = original
     capture = TtyCapture()
     warning = io.StringIO()
     with fake_tty(input_func=lambda prompt="": ns.task_id, getpass_func=lambda prompt="": PASSWORD, capture=capture), contextlib.redirect_stderr(warning):

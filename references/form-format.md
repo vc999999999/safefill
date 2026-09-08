@@ -1,69 +1,41 @@
-# yintian-form/1 收集需求格式
+# 文件协议
 
-`.yintian-form` 是纯 JSON 的收集需求描述文件，由 `collection.py create` 在建任务时生成，
-供填写端（邀请 HTML 的机读副本、yintian-fill 填写器）读取并据此在本地构造
-`yintian-submission/2` 加密提交信封。文件只含公钥，不含任何私钥材料。
+| 文件 | 用途与分发 |
+|---|---|
+| `FORM.yintian-form` | 字段、告知、任务公钥，可发群 |
+| `GRP-工号.yintian-credential` | 任务/公钥/模板绑定、工号姓名、个人令牌，仅本人私下接收 |
+| `INV-*.yintian-form / .html` | 内含个人令牌的定向模板，私下发放 |
+| `*.yintian-vault` | 加密个人字段及附件，留在本机 |
+| `*.yintian` | 加密提交，按指定渠道交回 |
+| `*.yintian-task` | 加密任务交接，仅授权 HR |
 
-## 顶层字段
+## 兼容
 
-| 字段 | 说明 |
-| --- | --- |
-| `format` | 固定为 `yintian-form/1` |
-| `format_version` | 填写端应产出的提交信封版本，当前为 `yintian-submission/2` |
-| `mode` | `directed`（定向型，默认）或 `group`（群发型），决定身份绑定语义 |
-| `task_id` | 任务编号，`YT-YYYYMMDD-XXXXXX` |
-| `title` / `purpose` / `deadline` / `retention_until` / `contact` / `correction` | 收集告知六要素，须原样展示给填写人 |
-| `template_version` | 表单模板版本，载荷需带回供复核比对 |
-| `fields` | 字段定义数组：`{id, type, label, required, options?}`，另有 `sensitive`（脱敏预览用）与附件字段的 `multiple`；类型见 collection-config.md |
-| `public_key_pem` | 任务 RSA-3072 公钥（PEM），用于 OAEP-SHA256 包裹一次性 AES-256 数据密钥 |
-| `key_id` | 公钥指纹（DER 的 SHA-256 前 24 位十六进制），填写前供人工核对 |
-| `schema_hash` | `sha256(canonical(fields))`，信封与载荷均须带回 |
-| `notice_hash` | `sha256(canonical({title,purpose,deadline,retention_until,contact,correction}))`，载荷须带回 |
-| `created_at` | 任务创建时间（UTC ISO 8601） |
-| `invite_id` / `invite_token` / `name` | **仅 directed 模式存在**：个人邀请编号、认证令牌、预填姓名 |
+定向保留 `yintian-form/1` 和 `yintian-submission/2`。新群发模板 `yintian-form/2`、提交 `yintian-submission/3`，要求 `submission_auth=hmac-sha256-token/1`；旧程序不能无声跳过认证。
 
-## 双模式语义
+旧无认证群发模板拒绝填写，任务仅查询；请新建任务，不能通过迁移伪造过去认证。数据库独立版本 `PRAGMA user_version=1`；旧定向写入提示显式迁移，查询不迁移。交接外层仍为加密 `yintian-task/3`，包含模板、凭据、密文和数据库一致性快照。
 
-### directed 定向型（默认）
+## 模板与凭据
 
-- 每人生成 `invites/INV-XXXXXXXXXX.yintian-form`，与该人的 `INV-*.html` 内嵌配置是同一份数据
-  （`invite_id` / `invite_token` / `key_id` 完全一致）；HTML 页是表单的人类可读渲染版。
-- 含个人认证令牌 `invite_token`：服务端只存 SHA-256 哈希，复核时恒定时间比对；
-  令牌错误或不匹配的提交在复核时直接判 `invalid`，不覆盖已有有效版本。
-- 信封 `invite_id = INV-...`，每人每邀请的版本上限独立计数。
-- 分发：按 `invite-index.csv` 逐人私聊发送，不得串发；任何人拿到他人的 form 文件也无法伪造令牌之外的字段绑定。
+模板有 `task_id/title/purpose/deadline/retention_until/contact/correction/fields/public_key_pem/key_id/schema_hash/notice_hash`。`key_id` 是公钥 DER 的 SHA-256 前 24 个十六进制字符，须经独立渠道核对。
 
-### group 群发型
+`schema_hash` 覆盖规范 JSON 字段清单（含 `ocr_fields`），`notice_hash` 覆盖告知。个人凭据格式 `yintian-credential/1`，绑定任务、公钥、字段摘要、工号姓名和个人令牌。
 
-- 任务根目录只生成单份 `FORM.yintian-form`：无 `invite_id`、无 `invite_token`、无 `name`，
-  含全部字段定义与任务公钥，可原样群发给全体填写人。
-- 信封 `invite_id` 使用 `GRP-<employee_id>` 约定（`GRP-` 前缀 + 名单中的工号），
-  收集端按工号定位名单记录，版本上限按工号维度计数（同 `MAX_VERSIONS_PER_INVITE`）。
-- 载荷内 `invite_token` 可缺席，收集端跳过令牌比对。
-- **身份仅靠 `values` 中的 `employee_id` + `name` 与名单比对**：不一致只打复核冲突标记
-  （`employee_id_roster_mismatch` / `name_roster_mismatch`），进入人工复核兜底，绝不自动拒绝或覆盖。
-- group 任务的字段必须包含 `id=employee_id` 的工号字段（建任务时强制校验），否则填写端无法回填身份。
+## 提交
 
-## 风险对照表
+AAD 是规范 JSON 数组 `[format_version,task_id,invite_id,schema_hash,key_id]`。加密载荷包含告知、时间、确认标记、个人令牌、`values` 与 `attachments`。附件只允许请求字段，含文件名、类型、大小、SHA-256、base64 字节。
 
-| 维度 | directed | group |
-| --- | --- | --- |
-| 认证令牌 | 每人独立随机令牌，库中仅存 SHA-256 | 无令牌 |
-| 冒名提交 | 无法通过令牌校验，复核判 invalid | 任何拿到表单的人可为任何工号提交，只能靠名单比对标记 + 人工复核兜底 |
-| 分发成本 | 逐人私聊，泄露面小 | 单份群发，泄露面等同公开 |
-| 适用场景 | 身份证号、证件影像等高敏感定向收集 | 低敏感、群公告式一次性分发 |
-| 风险声明 | 私聊送达是工作流约定，非密码学身份认证 | 创建时必须向用户如实声明可冒名风险；高敏感场景应改用 directed |
+群发信封额外带：
 
-## 填写端产出约定
+```text
+auth_tag = HMAC-SHA256(SHA256(invite_token), canonical_json(envelope_without_auth_tag))
+```
 
-填写端（HTML 页或 yintian-fill）读取本文件后，在本地组装载荷并用 Web Crypto 加密：
+标签覆盖全部密文和头。收件端用数据库令牌摘要验证后才落盘和计数；无凭据、篡改或跨邀请提交不消耗版本配额。相同密文按哈希去重。确认标记必须由本地程序在本人确认后写入。
 
-- 载荷带回 `format_version` / `task_id` / `invite_id` / `schema_hash` / `notice_hash` / `template_version`，
-  directed 模式另带 `invite_token`；`consent_confirmed` 必须为 `true`。
-- 信封 AAD 绑定 `[format_version, task_id, invite_id, schema_hash, key_id]`，算法套件固定为
-  `AES-256-GCM` + `RSA-OAEP-3072-SHA256`；收集端对信封做算法白名单、尺寸、去重、过期校验，
-  mode 只从服务端 `task.json` 读取，信封与载荷无法伪造。
+## 保险柜
 
-## 已知限制
+`yintian-vault/1` 使用受限参数 scrypt、随机盐/nonce、AES-256-GCM，加密字段类型、值和附件字节，不存明文路径引用。
+按显式映射、同名同类型、唯一语义类型（手机号/证件号/住址/日期）匹配。姓名等文本不会仅凭类型猜测。多候选和缺项由本人处理，仅选择本模板字段。
 
-- group 任务暂不支持 `export-task` / `import-task` 交接（GRP- 标识未纳入交接包清单校验）；如需交接请使用 directed 模式任务。
+手工 `seal --values ...` 保留为本人终端兼容入口，也要确认指纹和本次内容。保险柜主流程不需要明文中间 JSON。

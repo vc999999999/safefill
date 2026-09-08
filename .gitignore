@@ -9,3 +9,9 @@ collection.json
 
 .coverage
 .ruff_cache/
+.pytest_cache/
+dist/
+*.yintian-vault
+*.yintian-credential
+values.json
+personal*.json

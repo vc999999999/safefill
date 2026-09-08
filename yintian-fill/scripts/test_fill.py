@@ -56,7 +56,8 @@ def make_task(tmp: Path, mode: str = "directed") -> types.SimpleNamespace:
     created = collection.create_task(roster, config_path, tmp / "tasks", PASSWORD, require_terminal=False, mode=mode)
     task_dir = Path(created["task_dir"])
     if mode == "group":
-        invite_id, token = "GRP-E001", None
+        invite_id = "GRP-E001"
+        token = collection.load_json(task_dir / "credentials/GRP-E001.yintian-credential")["invite_token"]
         form_src = task_dir / "FORM.yintian-form"
     else:
         invite_id = next(csv.DictReader((task_dir / "invite-index.csv").open(encoding="utf-8-sig")))["invite_id"]
@@ -122,7 +123,8 @@ def seal_into_incoming(ns: types.SimpleNamespace, form_path: Path, values_path: 
     incoming = ns.tmp / "incoming"
     incoming.mkdir(exist_ok=True)
     out = incoming / filename
-    fill.seal_form(form_path, values_path, out)
+    credential = ns.task_dir / "credentials" / (ns.invite_id + ".yintian-credential") if ns.mode == "group" else None
+    fill.seal_form(form_path, values_path, out, confirmed=True, credential_path=credential)
     return out
 
 
@@ -143,7 +145,7 @@ def review_payload(ns: types.SimpleNamespace) -> dict:
 
 
 def assert_envelope_structure(envelope: dict, invite_id: str) -> None:
-    assert list(envelope) == ["format_version", "task_id", "invite_id", "schema_hash", "key_id", "algorithms", "encrypted_key_b64", "iv_b64", "ciphertext_b64"]
+    assert list(envelope) == ["format_version", "task_id", "invite_id", "schema_hash", "key_id", "algorithms", "encrypted_key_b64", "iv_b64", "ciphertext_b64"] + (["auth_tag"] if invite_id.startswith("GRP-") else [])
     assert envelope["algorithms"] == {"content": "AES-256-GCM", "key_wrap": "RSA-OAEP-3072-SHA256"}
     assert envelope["invite_id"] == invite_id
     assert len(base64.b64decode(envelope["iv_b64"])) == 12
@@ -202,7 +204,7 @@ def test_group_end_to_end_roundtrip(tmp_path: Path) -> None:
     assert reviewed["verified"] == 1, reviewed
     payload = review_payload(ns)
     assert payload["invite_id"] == "GRP-E001"
-    assert "invite_token" not in payload
+    assert payload["invite_token"] == ns.token
     assert payload["values"]["employee_id"] == "E001" and payload["values"]["id_number"] == VALID_ID
 
 
@@ -236,7 +238,7 @@ def test_inspect_detects_tampered_form(tmp_path: Path) -> None:
     bad = write_form(ns, mutate=lambda form: form.update(purpose="篡改后的用途"), name="bad.yintian-form")
     assert_raises(fill.FillError, lambda: fill.load_form(bad), "notice_hash 不匹配必须拒绝")
     wrong_key = write_form(ns, mutate=lambda form: form.update(key_id="0" * 24), name="wrong-key.yintian-form")
-    assert_raises(fill.FillError, lambda: fill.seal_form(wrong_key, write_values(tmp_path, good_values(), make_images(tmp_path)), tmp_path / "o.yintian"), "公钥指纹不一致必须拒绝")
+    assert_raises(fill.FillError, lambda: fill.seal_form(wrong_key, write_values(tmp_path, good_values(), make_images(tmp_path)), tmp_path / "o.yintian", confirmed=True), "公钥指纹不一致必须拒绝")
     info = fill.inspect_info(fill.load_form(wrong_key))
     assert info["key_id_match"] is False
 
@@ -255,7 +257,7 @@ def test_seal_validation_rejects_and_writes_nothing(tmp_path: Path) -> None:
     for values, keyword in cases:
         values_path = write_values(tmp_path, values, images)
         try:
-            fill.seal_form(form_path, values_path, out)
+            fill.seal_form(form_path, values_path, out, confirmed=True)
             raise AssertionError(f"校验应拒绝: {keyword}")
         except fill.FillError as exc:
             assert keyword in str(exc), str(exc)
@@ -269,7 +271,7 @@ def test_seal_lists_all_problems(tmp_path: Path) -> None:
     del values["address"]
     values_path = write_values(tmp_path, values, make_images(tmp_path))
     try:
-        fill.seal_form(form_path, values_path, tmp_path / "out.yintian")
+        fill.seal_form(form_path, values_path, tmp_path / "out.yintian", confirmed=True)
         raise AssertionError("应拒绝")
     except fill.FillError as exc:
         message = str(exc)
@@ -281,9 +283,9 @@ def test_seal_attachment_path_guard(tmp_path: Path) -> None:
     form_path = write_form(ns)
     images = make_images(tmp_path)
     values_path = write_values(tmp_path, good_values(), {"id_front": "../escape.png", "id_back": images["id_back"]})
-    assert_raises(fill.FillError, lambda: fill.seal_form(form_path, values_path, tmp_path / "a.yintian"), "附件路径含 .. 必须明确报错")
+    assert_raises(fill.FillError, lambda: fill.seal_form(form_path, values_path, tmp_path / "a.yintian", confirmed=True), "附件路径含 .. 必须明确报错")
     values_path = write_values(tmp_path, good_values(), {"id_front": str(tmp_path / "missing.png"), "id_back": images["id_back"]})
-    assert_raises(fill.FillError, lambda: fill.seal_form(form_path, values_path, tmp_path / "b.yintian"), "附件不存在必须明确报错")
+    assert_raises(fill.FillError, lambda: fill.seal_form(form_path, values_path, tmp_path / "b.yintian", confirmed=True), "附件不存在必须明确报错")
     assert not (tmp_path / "a.yintian").exists() and not (tmp_path / "b.yintian").exists()
 
 
@@ -296,7 +298,7 @@ def test_values_permission_warning(tmp_path: Path) -> None:
     os.chmod(values_path, 0o644)
     capture = io.StringIO()
     with contextlib.redirect_stderr(capture):
-        fill.seal_form(form_path, values_path, tmp_path / "ok.yintian")
+        fill.seal_form(form_path, values_path, tmp_path / "ok.yintian", confirmed=True)
     assert "权限宽于 0600" in capture.getvalue()
     assert stat.S_IMODE((tmp_path / "ok.yintian").stat().st_mode) == 0o600
 
