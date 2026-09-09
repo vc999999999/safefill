@@ -1,0 +1,7 @@
+# 可选：OpenVINO 驱动的本地 VLM 证件提取（比赛亮点，独立安装）
+# 与 requirements-ocr.txt 分开装到独立 venv：rapidocr-openvino 钉死 openvino==2024.0.0。
+openvino>=2024.6
+optimum-intel>=1.20,<2
+transformers>=4.45,<5
+huggingface_hub>=0.26,<1
+pillow>=11.3,<13

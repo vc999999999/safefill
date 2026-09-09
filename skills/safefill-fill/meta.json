@@ -1,13 +1,14 @@
 {
   "display_name": "SafeFill · 填写者",
-  "display_description": "读取 AI 请求包，对话生成加密回执",
-  "detail_describe": "员工把机器请求包交给 Agent，通过对话提供资料并生成可交回 HR 的加密文件",
+  "display_description": "读取 AI 请求包，本机保险柜复用资料生成加密回执",
+  "detail_describe": "员工把机器请求包交给 Agent，首次初始化本机加密保险柜，之后跨任务复用、缺项补录，可选 OpenVINO 本地识别证件，生成可交回 HR 的加密文件",
   "name": "safefill-fill",
   "icon": "",
   "use_cases": [
-    "根据机器请求包一次问齐缺失字段",
+    "保险柜跨任务复用，一次录入终身免重复填写",
+    "OpenVINO 本地识别证件字段，不联网无需 API Key",
     "无需个人凭据或终端即可生成加密回执"
   ],
   "author": "vc999999999",
-  "version": "4.2.0"
+  "version": "4.3.0"
 }

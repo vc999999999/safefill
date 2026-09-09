@@ -3,5 +3,11 @@
   "python_version": "3.11",
   "mem_need_gb": 1.5,
   "server_alive_timeout": 300,
-  "models": []
+  "models": [
+    {
+      "id": "OpenVINO/MiniCPM-V-2_6-int4-ov",
+      "optional": true,
+      "purpose": "本地 VLM 证件字段提取（fill.py vlm-setup 显式下载到 data/models/，不随 skill 分发）"
+    }
+  ]
 }

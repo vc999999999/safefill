@@ -13,6 +13,7 @@ collection.json
 dist/
 *.yintian-vault
 *.yintian-credential
+skills/safefill-fill/data/
 values.json
 personal*.json
 
