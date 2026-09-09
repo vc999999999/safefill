@@ -9,13 +9,14 @@ metadata:
 
 目标：群内统一发模板，员工本机加密交回，授权 HR 本地汇总 Excel。
 
-以本文件目录为 `SKILL_ROOT`，使用已安装依赖的 Python 绝对路径。员工收到模板要填写时，使用同级 `yintian-fill` Skill（填写者）。
+以本文件目录为 `SKILL_ROOT`，使用已安装依赖的 Python 绝对路径。员工收到模板或邀请要填写时，改用同级 `yintian-fill` Skill（填写者），不在本 Skill 内代填。
 
 1. 根据用户已给出的用途、字段、期限和名单准备任务配置，只补问缺失项。配置规则见 [collection-config.md](references/collection-config.md)。
-2. 交给 HR 在自己的终端创建任务。群发只发布 `FORM.yintian-form`；每人的 `.yintian-credential` 私下发给对应本人。定向邀请也只能逐人发放。
-3. 接收密文后运行 `ingest`，用 `status/report` 汇报最新版本、待处理数、最近通过版本。需要复核或 Excel 时按 [operator.md](references/operator.md) 交接给 HR。
-4. OCR 是可选能力；默认本地优先。缺后端时按 [recognition.md](references/recognition.md) 使用员工已授权的宿主候选或交接人工复核，不索取 API Key。
-5. 用户已明确授权发送且宿主有发送工具时，按指定收件人、群和附件执行；否则提供文件与文案，标记“待发送”。没有成功回执不能宣称已送达。
+2. 用户同时要求收集告知书、填写说明或培训材料时，先查找并调用当前环境中匹配的文档生成、排版或 PDF Skill。只传递用途、字段名称、期限和公开联系方式；不传名单、凭据、提交内容、附件或明文结果。没有匹配 Skill 时回退为纯文本草稿。
+3. 交给 HR 在自己的终端创建任务。群发只发布 `FORM.yintian-form`；每人的 `.yintian-credential` 私下发给对应本人。定向邀请也只能逐人发放。
+4. 接收密文后运行 `ingest`，用 `status/report` 汇报最新版本、待处理数、最近通过版本。需要复核或 Excel 时按 [operator.md](references/operator.md) 交接给 HR。
+5. OCR 是可选能力；默认本地优先。缺后端时按 [recognition.md](references/recognition.md) 使用员工已授权的宿主候选或交接人工复核，不索取 API Key。
+6. 用户已明确授权发送且宿主有发送工具时，按指定收件人、群和附件执行；否则提供文件与文案，标记“待发送”。没有成功回执不能宣称已送达。
 
 Agent 可运行：
 
