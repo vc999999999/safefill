@@ -743,7 +743,7 @@ def cmd_vault_scan(args) -> dict[str, Any]:
             "candidates": extracted["candidates"],
             "ambiguous": extracted["ambiguous"],
         })
-    return {"scans": scans, "hint": "候选仅供本人确认；确认后用 vault-stage/vault-apply 写入保险柜。"}
+    return {"scans": scans, "hint": "候选仅供本人确认；含 needs_review 的字段必须人工逐字核对；确认后用 vault-stage/vault-apply 写入保险柜。"}
 
 
 def _check_vault_attachments(form: dict[str, Any], attachments: dict[str, list]) -> list[str]:
@@ -925,6 +925,11 @@ def cmd_vault_fill(args) -> dict[str, Any]:
                 raise FillError("REPLY_ROLLBACK_FAILED: 确认文件无法消费且新回执无法撤回，请停止重试") from rollback_exc
             raise FillError("CONFIRMATION_CONSUME_FAILED: 确认文件无法消费，未保留回执") from exc
         result["matched"] = matches
+        out_path = Path(result["out"])
+        earlier = [path for path in out_path.parent.glob("*.yintian") if path != out_path]
+        if earlier:
+            result["warning"] = (f"输出目录已存在 {len(earlier)} 份回执，"
+                                 "如其中已有本任务回执且已提交，请用 --previous 重新生成以免产生重复记录")
     return result
 
 
@@ -932,7 +937,7 @@ def cmd_vlm_setup(args) -> dict[str, Any]:
     try:
         import vlm_extract
 
-        return vlm_extract.setup(args.model, args.revision)
+        return vlm_extract.setup(args.model, args.revision, source=args.source)
     except Exception as exc:
         raise FillError(str(exc)) from exc
 
@@ -947,6 +952,10 @@ def _importable(module: str) -> bool:
 
 def _ocr_report() -> dict[str, Any]:
     install_hint = "pip install -r requirements-ocr.txt"
+    python_too_new = sys.version_info >= (3, 12)
+    if python_too_new:
+        install_hint = ("本地 OCR 需 Python 3.11 环境后执行 pip install -r requirements-ocr.txt"
+                        "（rapidocr-openvino 1.4.4 钉死的 openvino 2024.0.0 wheel 上限 cp311）")
     rapidocr_ok = _importable("rapidocr_openvino")
     openvino_ok = _importable("openvino")
     devices: list[str] = []
@@ -974,6 +983,8 @@ def _ocr_report() -> dict[str, Any]:
         details.append("可用设备: " + ", ".join(devices))
     if configured != "AUTO" and devices and configured not in devices:
         details.append(f"配置的 OCR 设备 {configured} 不在可用设备中")
+    if python_too_new:
+        details.append("当前 Python 版本无 rapidocr-openvino 1.4.4 可用 wheel，本地 OCR 需 Python 3.11 环境")
     if not details:
         details.append(f"OCR 本地推理可用（设备配置 {configured}）")
     return {"ok": not missing, "detail": "；".join(details), "install_hint": install_hint if missing else None,
@@ -1032,7 +1043,7 @@ def _environment_report(args) -> dict[str, Any]:
     return {
         "python": {
             "ok": python_ok,
-            "detail": f"Python {sys.version.split()[0]}",
+            "detail": f"Python {sys.version.split()[0]} ({sys.executable})",
             "install_hint": None if python_ok else "安装 Python 3.11 或更高版本",
         },
         "core": {
@@ -1109,8 +1120,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_storage_args(p)
     p.set_defaults(func=cmd_vault_fill)
     p = sub.add_parser("vlm-setup", help="下载用户指定的兼容模型（安装时联网，推理离线）")
-    p.add_argument("--model", required=True, help="Hugging Face 模型 ID")
+    p.add_argument("--model", required=True, help="Hugging Face 或 ModelScope 模型 ID")
     p.add_argument("--revision", help="可选模型 revision；不指定时使用模型仓库默认版本")
+    p.add_argument("--source", choices=["huggingface", "modelscope"], default="huggingface",
+                   help="模型下载来源；modelscope 为可选备选，需先 pip install modelscope")
     p.set_defaults(func=cmd_vlm_setup)
     return parser
 

@@ -227,3 +227,88 @@ def test_doctor_storage_overrides(tmp_path):
     report = run(["doctor", "--vault", str(custom_vault), "--key-file", str(tmp_path / "custom" / "k.key")])
     assert report["storage"]["ok"] is True
     assert str(custom_vault) in report["storage"]["detail"]
+
+
+def test_doctor_ocr_warns_python_312_requires_311(monkeypatch):
+    monkeypatch.setattr(sys, "version_info", (3, 12, 0))
+    monkeypatch.setitem(sys.modules, "rapidocr_openvino", None)
+    monkeypatch.setitem(sys.modules, "openvino", None)
+    report = run(["doctor"])
+    assert report["ocr"]["ok"] is False
+    assert "3.11" in report["ocr"]["detail"]
+    assert "3.11" in report["ocr"]["install_hint"]
+    assert "requirements-ocr.txt" in report["ocr"]["install_hint"]
+
+
+def test_doctor_reports_current_interpreter_path():
+    report = run(["doctor"])
+    assert sys.executable in report["python"]["detail"]
+
+
+def test_vlm_setup_resumes_partial_download(tmp_path, monkeypatch):
+    root = private(tmp_path / "models")
+    monkeypatch.setattr(vlm_extract, "model_root", lambda: root)
+    calls = []
+
+    def flaky_download(**kwargs):
+        calls.append(kwargs)
+        local = Path(kwargs["local_dir"])
+        (local / ".cache").mkdir(exist_ok=True)
+        if len(calls) == 1:
+            (local / ".cache" / "chunk.bin").write_bytes(b"half")
+            raise RuntimeError("network down")
+        (local / "model.bin").write_bytes(b"model")
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(snapshot_download=flaky_download))
+    with pytest.raises(vlm_extract.VlmUnavailable, match="断点续传"):
+        vlm_extract.setup("any-compatible/model")
+    partial = Path(calls[0]["local_dir"])
+    assert partial.name.endswith(".partial") and partial.is_dir()
+
+    result = vlm_extract.setup("any-compatible/model")
+    assert len(calls) == 2 and Path(calls[1]["local_dir"]) == partial  # 复用同一 .partial 续传
+    assert not partial.exists()
+    assert vlm_extract.verify_model("any-compatible/model", target=Path(result["path"]))
+
+
+def test_vlm_candidates_flag_needs_review_for_unvalidated_fields(tmp_path, monkeypatch):
+    text = json.dumps({"name": "张三", "id_number": "110105194912310020",
+                       "phone": "13800138000", "address": "北京市海淀区中关村大街1号"})
+    monkeypatch.setattr(vlm_extract, "_run_model", lambda *args, **kwargs: text)
+    result = vlm_extract.extract_fields(tmp_path / "id.png", "any-compatible/model")
+    candidates = {item["field"]: item for item in result["candidates"]}
+    assert candidates["name"]["valid"] is None and candidates["name"]["needs_review"] is True
+    assert candidates["address"]["valid"] is None and candidates["address"]["needs_review"] is True
+    assert candidates["id_number"]["valid"] is False and "needs_review" not in candidates["id_number"]
+    assert candidates["phone"]["valid"] is True and "needs_review" not in candidates["phone"]
+
+
+def test_vault_fill_warns_about_existing_receipts(tmp_path, isolated_vault):
+    request, _task_dir = make_request(tmp_path, [
+        {"id": "name", "label": "姓名", "type": "text", "required": True, "sensitive": True},
+    ])
+    stage(tmp_path, {"name": {"type": "text", "value": "张三"}})
+    confirmation = tmp_path / "private" / "submit.yintian-confirmation"
+    run(["vault-preview", str(request), "--confirmation-out", str(confirmation)])
+    incoming = private(tmp_path / "incoming")
+    (incoming / "张三-AAAAAA.yintian").write_bytes(b"old-receipt")
+    result = run(["vault-fill", str(request), "--confirmation", str(confirmation), "--out-dir", str(incoming)])
+    assert "--previous" in result["warning"] and "重复" in result["warning"]
+
+
+def test_vlm_setup_modelscope_source(tmp_path, monkeypatch):
+    root = private(tmp_path / "models")
+    monkeypatch.setattr(vlm_extract, "model_root", lambda: root)
+    calls = []
+
+    def download(**kwargs):
+        calls.append(kwargs)
+        Path(kwargs["local_dir"], "model.bin").write_bytes(b"model")
+
+    monkeypatch.setitem(sys.modules, "modelscope", types.SimpleNamespace(snapshot_download=download))
+    result = run(["vlm-setup", "--model", "any-compatible/model", "--source", "modelscope"])
+    assert calls[0]["model_id"] == "any-compatible/model" and "revision" not in calls[0]
+    assert vlm_extract.verify_model("any-compatible/model", target=Path(result["path"]))
+
+    with pytest.raises(SystemExit):
+        fill.build_parser().parse_args(["vlm-setup", "--model", "m", "--source", "unknown"])

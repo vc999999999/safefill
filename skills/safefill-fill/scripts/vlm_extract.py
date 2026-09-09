@@ -8,7 +8,6 @@ import re
 import shutil
 import stat
 import sys
-import tempfile
 from pathlib import Path
 from unittest import mock
 
@@ -122,11 +121,24 @@ def verify_model(model_id: str, revision: str | None = None, target: Path | None
     return expected
 
 
-def setup(model_id: str, revision: str | None = None) -> dict:
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as exc:
-        raise VlmUnavailable("缺少 huggingface_hub，请在独立 VLM 环境安装 requirements-vlm.txt") from exc
+def _snapshot_downloader(source: str):
+    if source == "huggingface":
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as exc:
+            raise VlmUnavailable("缺少 huggingface_hub，请在独立 VLM 环境安装 requirements-vlm.txt") from exc
+        return snapshot_download, "repo_id"
+    if source == "modelscope":
+        try:
+            from modelscope import snapshot_download
+        except ImportError as exc:
+            raise VlmUnavailable("缺少 modelscope，请先 pip install modelscope 后重试") from exc
+        return snapshot_download, "model_id"
+    raise VlmUnavailable(f"未知下载来源: {source}")
+
+
+def setup(model_id: str, revision: str | None = None, source: str = "huggingface") -> dict:
+    snapshot_download, id_key = _snapshot_downloader(source)
     model_id = model_id.strip()
     revision = (revision or "").strip() or None
     root, target = model_root(), model_dir(model_id, revision)
@@ -136,20 +148,21 @@ def setup(model_id: str, revision: str | None = None) -> dict:
         if target.exists():
             manifest = verify_model(model_id, revision, target)
             return {"model": model_id, "revision": revision, "path": str(target), "files": len(manifest["files"])}
-        temporary = Path(tempfile.mkdtemp(prefix=".safefill-vlm-", dir=root))
+        partial = target.with_name(target.name + ".partial")
+        partial.mkdir(mode=0o700, exist_ok=True)
         try:
-            options = {"repo_id": model_id, "local_dir": str(temporary)}
+            options: dict[str, str] = {id_key: model_id, "local_dir": str(partial)}
             if revision:
                 options["revision"] = revision
             snapshot_download(**options)
-            shutil.rmtree(temporary / ".cache", ignore_errors=True)
-            manifest = _manifest(temporary, model_id, revision)
-            secure_io.atomic_write(temporary / MANIFEST_NAME, collection.canonical(manifest), overwrite=False)
-            verify_model(model_id, revision, temporary)
-            temporary.rename(target)
-        finally:
-            if temporary.exists():
-                shutil.rmtree(temporary)
+            shutil.rmtree(partial / ".cache", ignore_errors=True)
+            manifest = _manifest(partial, model_id, revision)
+            (partial / MANIFEST_NAME).unlink(missing_ok=True)
+            secure_io.atomic_write(partial / MANIFEST_NAME, collection.canonical(manifest), overwrite=False)
+            verify_model(model_id, revision, partial)
+            partial.rename(target)
+        except Exception as exc:
+            raise VlmUnavailable(f"模型下载或校验失败: {exc}；已保留部分下载，重新运行 vlm-setup 将断点续传") from exc
     return {"model": model_id, "revision": revision, "path": str(target), "files": len(manifest["files"])}
 
 
@@ -209,6 +222,9 @@ def extract_fields(image_path, model_id: str, revision: str | None = None) -> di
         value = value.strip()
         if value:
             fields[name] = value
-            candidates.append({"field": name, "type": entry_type, "value": value,
-                               "confidence": "vlm", "valid": _valid_flag(name, value)})
+            candidate: dict = {"field": name, "type": entry_type, "value": value,
+                               "confidence": "vlm", "valid": _valid_flag(name, value)}
+            if candidate["valid"] is None:
+                candidate["needs_review"] = True
+            candidates.append(candidate)
     return {"fields": fields, "candidates": candidates, "ambiguous": []}

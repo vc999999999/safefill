@@ -2,7 +2,7 @@
 name: safefill-fill
 description: 员工收到 SafeFill 机器请求包后，由 Agent 从本机加密保险柜精确匹配字段、逐项展示完整值确认并生成加密 .yintian 回执；支持无终端迁移、缺项补录和可选离线 OpenVINO 识别。不处理 HR 汇总，不生成网页表单。
 metadata:
-  compatibility: "Python 3.11–3.13；requirements.txt；读取 yintian-request/1。可选：requirements-ocr.txt、独立环境 requirements-vlm.txt。"
+  compatibility: "Python 3.11–3.13；requirements.txt；读取 yintian-request/1。可选：requirements-ocr.txt（仅 Python 3.11，openvino 2024.0.0 wheel 上限 cp311）、独立环境 requirements-vlm.txt。"
 ---
 
 # SafeFill · 填写者
@@ -40,8 +40,10 @@ Agent 内部入口：
 ## 迁移与可选识别
 
 - `vault-status` 返回 `migration_required` 时，只向员工询问一次旧密码，写入 `0600` 临时文件并运行 `vault-migrate --password-file TEMP`。密码文件无论成败都会删除，旧 v1 保险柜始终保留。
-- 默认保险柜位于系统用户数据目录，密钥位于独立系统用户密钥目录；旧 `SKILL_ROOT/data` 的 v2 数据会校验后复制，旧文件不删除。`YINTIAN_VAULT_DIR` 与 `YINTIAN_VAULT_KEY_DIR` 可重定向；CLI 使用自定义 `--vault` 时必须同时给 `--key-file`。
-- 普通 OCR 使用核心环境。VLM 使用独立环境，由用户选择兼容模型：安装时运行 `vlm-setup --model MODEL [--revision REVISION]`，识别时运行 `vault-scan 图片... --vlm --model MODEL [--revision REVISION]`；不限定模型或 revision。返回 `VLM_UNAVAILABLE` 时，由 Agent 改用核心 Python 重跑不带 `--vlm` 的命令。
+- 默认保险柜位于系统用户数据目录，密钥位于独立系统用户密钥目录；旧 `SKILL_ROOT/data` 的 v2 数据会校验后复制，旧文件不删除。`YINTIAN_VAULT_DIR` 与 `YINTIAN_VAULT_KEY_DIR` 可重定向；CLI 使用自定义 `--vault` 时必须同时给 `--key-file`。验证流程时把这两个变量指向 `0700` 临时目录，避免触碰真实保险柜。
+- 双环境入口：核心流程（doctor 至 vault-fill）用核心环境的 `$PYTHON`；VLM 使用独立环境，安装与识别命令都必须用独立环境的 `$PYTHON_VLM` 执行。装错环境时用 `doctor` 核实（python 项会显示当前解释器路径）。
+- 普通 OCR 使用核心环境（仅 Python 3.11）。VLM 使用独立环境，由用户选择兼容模型：安装时运行 `vlm-setup --model MODEL [--revision REVISION]`，识别时运行 `vault-scan 图片... --vlm --model MODEL [--revision REVISION]`；不限定模型或 revision。返回 `VLM_UNAVAILABLE` 时，由 Agent 改用核心 Python 重跑不带 `--vlm` 的命令。
+- Hugging Face 不可达时，先经员工同意设 `HF_ENDPOINT=https://hf-mirror.com` 后重试；Xet CDN 超时再加 `HF_HUB_DISABLE_XET=1`。仍不可用时可选 ModelScope 备选：独立环境中 `pip install modelscope`（不在 requirements-vlm.txt 中），再运行 `vlm-setup --model MODEL --source modelscope`。下载中断后重新运行 `vlm-setup` 会断点续传。
 
 ## 边界
 

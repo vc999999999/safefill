@@ -43,7 +43,8 @@ def extract_fields(text: str, source: str = "text") -> dict[str, Any]:
             if candidate.value not in best_by_value or rank > best_by_value[candidate.value][0]:
                 best_by_value[candidate.value] = (rank, candidate)
         ordered = sorted(best_by_value.values(), key=lambda item: item[0], reverse=True)
-        cand_list = [{"value": c.value, "confidence": c.confidence, "valid": c.valid} for _rank, c in ordered]
+        cand_list = [{"value": c.value, "confidence": c.confidence, "valid": c.valid,
+                      **({"needs_review": True} if c.valid is None else {})} for _rank, c in ordered]
         candidates[field] = cand_list
         fields[field] = {"value": cand_list[0]["value"], "confidence": cand_list[0]["confidence"]}
         if len(cand_list) > 1:
