@@ -1,5 +1,5 @@
 # Optional local OCR; install only on a platform supported by this backend.
 # 仅支持 Python 3.11：rapidocr-openvino 1.4.4 requires_python <3.13，
-# 且其钉死的 openvino==2024.0.0 wheel 上限为 cp311，Python 3.12+ 无可用 wheel。
+# 且其钉死的 openvino==2026.3.1 wheel 上限为 cp311，Python 3.12+ 无可用 wheel。
 rapidocr-openvino==1.4.4
-openvino==2024.0.0
+openvino==2026.3.1
