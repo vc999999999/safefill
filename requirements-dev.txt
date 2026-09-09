@@ -1,0 +1,2 @@
+-r skills/safefill-collect/requirements-core.txt
+pytest==8.4.2

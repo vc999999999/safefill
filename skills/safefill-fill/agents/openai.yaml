@@ -1,4 +1,4 @@
 interface:
   display_name: "SafeFill · 填写者"
   short_description: "读取 AI 请求包，本机保险柜复用资料生成加密回执"
-  default_prompt: "使用 $safefill-fill：读取 REQUEST.yintian-request，优先用我的本机加密保险柜匹配字段（首次初始化、缺项补录、可选 OpenVINO 本地识别我指定的证件），确认后生成姓名可读、内容加密的回执；不要创建或展示 HTML 表单，也不要让我运行终端。"
+  default_prompt: "使用 $safefill-fill：读取 REQUEST.yintian-request，只按字段 ID 精确匹配本机保险柜，缺项在对话补录；提交前逐项展示完整值和来源，待我确认后生成姓名可读、内容加密的回执。不要创建 HTML，也不要让我运行终端。"

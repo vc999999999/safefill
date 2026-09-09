@@ -41,35 +41,35 @@
     {
       "id": 6,
       "prompt": "我上次手机号填错了，这是我上一次生成的 .yintian，帮我更正。",
-      "expected_output": "检查旧回执与当前开放请求包匹配，用 vault-add 更新保险柜手机号后，vault-fill --previous 沿用随机回执编号生成新的 姓名-短码.yintian；仍由员工本人发送。",
+      "expected_output": "检查旧回执与当前开放请求包匹配，用 vault-stage 展示手机号新旧值，员工确认后 vault-apply；再用 vault-preview --previous 预览并以对应确认文件执行 vault-fill --previous，沿用随机回执编号；仍由员工本人发送。",
       "files": [],
       "expectations": ["校验旧回执", "沿用随机编号", "不覆盖原文件", "保险柜同步更正"]
     },
     {
       "id": 7,
       "prompt": "第一次用，HR 要姓名、手机号和入职日期。",
-      "expected_output": "vault-status 返回 vault:false 后，Agent 在对话中向员工收集基础条目并说明将存入本机加密保险柜；员工确认后写 0600 临时 JSON 运行 vault-init，再 vault-fill 生成回执；临时文件已删除。",
+      "expected_output": "vault-status 返回 vault:false 后，Agent 在对话中收集所需条目；vault-stage 删除 0600 明文 JSON并展示完整值，员工确认后 vault-apply；再经 vault-preview 确认后 vault-fill 生成回执。",
       "files": [],
       "expectations": ["首次初始化保险柜", "临时 JSON 0600 且用后删除", "不索取请求包无关的隐私条目"]
     },
     {
       "id": 8,
       "prompt": "保险柜里有我的手机号，这次还要紧急联系人，别再问我已有的。",
-      "expected_output": "vault-status 标出已有字段 matched、紧急联系人 missing；Agent 只询问 missing 字段，确认后 vault-add 补录并 vault-fill；不重复询问已匹配内容。",
+      "expected_output": "vault-status 标出已有字段 matched、紧急联系人 missing；Agent 只询问 missing 字段，经 vault-stage/vault-apply 确认补录，再 vault-preview/vault-fill；不重复询问已有值。",
       "files": [],
       "expectations": ["只问缺项", "补录沉淀到保险柜", "复用已有条目不重问"]
     },
     {
       "id": 9,
       "prompt": "这是我的身份证照片 id.png，你看着把信息填进保险柜。",
-      "expected_output": "只处理这张明确指定的图片，用 vault-scan 本地 OpenVINO 识别（可选 --vlm），把候选逐项向员工展示，本人确认或纠正后才 vault-add 写入，source 记录识别方式与图片 sha256；候选不自动入柜。",
+      "expected_output": "只处理这张明确指定的图片，用 vault-scan 本地 OpenVINO 识别（使用 VLM 时由用户指定兼容模型），把候选逐项向员工展示，本人确认或纠正后才经 vault-stage/vault-apply 写入，source 记录识别方式与图片 sha256；候选不自动入柜。",
       "files": [],
       "expectations": ["只处理指定文件", "本地推理不联网", "候选必须本人确认"]
     },
     {
       "id": 10,
       "prompt": "上次收集填过一次，这次 HR 换了批字段又要收集。",
-      "expected_output": "直接 vault-status 匹配：已有条目零提问复用，仅新字段进入缺项询问；员工确认映射后 vault-fill 生成回执。",
+      "expected_output": "直接 vault-status 精确匹配：已有条目不重复询问，仅新字段进入缺项询问；ID 不同的语义映射必须显式提供，经 vault-preview 展示完整值并确认后 vault-fill 生成回执。",
       "files": [],
       "expectations": ["跨任务复用保险柜", "零重复提问", "映射经本人确认"]
     }

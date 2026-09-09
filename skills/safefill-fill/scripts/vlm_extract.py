@@ -1,18 +1,21 @@
-"""可选增强：OpenVINO 驱动的本地 VLM 从本人指定的证件图提取结构化字段候选。
-
-依赖 requirements-vlm.txt（与 requirements-ocr.txt 分开安装：rapidocr-openvino
-钉死 openvino==2024.0.0，VLM 需要更新版本）。模型经 `fill.py vlm-setup` 下载到
-data/models/，不随 skill 分发。依赖或模型缺失一律抛 VlmUnavailable，由调用方
-回退到 openvino-ocr 路径；候选只作参考，经本人确认后才可写入保险柜。
-"""
+"""Pinned, offline OpenVINO VLM extraction for employee-selected images."""
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import shutil
+import stat
+import sys
+import tempfile
 from pathlib import Path
+from unittest import mock
 
-MODEL_ROOT = Path(__file__).resolve().parent.parent / "data" / "models"
-DEFAULT_MODEL_ID = "OpenVINO/MiniCPM-V-2_6-int4-ov"
+import collection
+import secure_io
+
+MANIFEST_NAME = "safefill-model-manifest.json"
 PROMPT = (
     "提取这张证件图片上的姓名、身份证号、手机号、住址。"
     '只输出一个 JSON 对象：{"name":"","id_number":"","phone":"","address":""}，'
@@ -22,51 +25,159 @@ FIELD_TYPES = {"name": "text", "id_number": "cn_id", "phone": "phone_cn", "addre
 
 
 class VlmUnavailable(RuntimeError):
-    """VLM 依赖、模型或推理不可用；调用方应回退到 openvino-ocr。"""
+    """The pinned model, dependencies or offline inference is unavailable."""
 
 
-def _model_dir(model_id: str | None = None) -> Path:
-    return MODEL_ROOT / (model_id or DEFAULT_MODEL_ID).replace("/", "--")
+def _home() -> Path:
+    return secure_io.checked_path(Path.home())
 
 
-def setup(model_id: str | None = None) -> dict:
+def model_root() -> Path:
+    override = os.environ.get("YINTIAN_VLM_MODEL_DIR", "").strip()
+    if override:
+        return secure_io.checked_path(override)
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA", "").strip()
+        if not root:
+            raise VlmUnavailable("Windows 缺少 LOCALAPPDATA，无法确定模型缓存目录")
+        return secure_io.checked_path(root) / "SafeFill" / "Cache" / "models"
+    if sys.platform == "darwin":
+        return _home() / "Library" / "Caches" / "SafeFill" / "models"
+    root = os.environ.get("XDG_CACHE_HOME", "").strip()
+    return (secure_io.checked_path(root) if root else _home() / ".cache") / "safefill" / "models"
+
+
+def model_dir(model_id: str, revision: str | None = None) -> Path:
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise VlmUnavailable("必须指定要使用的模型")
+    identity = f"{model_id.strip()}\0{revision.strip() if revision else ''}".encode()
+    return model_root() / hashlib.sha256(identity).hexdigest()[:20]
+
+
+def _check_write_permissions(path: Path) -> None:
+    if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) & 0o022:
+        raise VlmUnavailable(f"模型路径可被其他账户写入，拒绝使用: {path}")
+
+
+def _files(target: Path) -> list[Path]:
+    result = []
+    for path in target.rglob("*"):
+        relative = path.relative_to(target)
+        if path.name == MANIFEST_NAME:
+            continue
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise VlmUnavailable(f"模型目录含符号链接，拒绝加载: {relative}")
+        if stat.S_ISREG(info.st_mode):
+            _check_write_permissions(path)
+            result.append(path)
+    return sorted(result)
+
+
+def _sha256(path: Path) -> str:
+    checked = secure_io.checked_path(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(checked, flags)
+    digest = hashlib.sha256()
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise VlmUnavailable(f"模型文件不是普通文件: {path.name}")
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _manifest(target: Path, model_id: str, revision: str | None) -> dict:
+    return {
+        "format": "safefill-model-manifest/1",
+        "model_id": model_id,
+        "revision": revision,
+        "files": [{"path": path.relative_to(target).as_posix(), "size": path.stat().st_size,
+                   "sha256": _sha256(path)} for path in _files(target)],
+    }
+
+
+def verify_model(model_id: str, revision: str | None = None, target: Path | None = None) -> dict:
+    model_id = model_id.strip()
+    revision = (revision or "").strip() or None
+    target = secure_io.checked_path(target or model_dir(model_id, revision))
+    manifest_path = target / MANIFEST_NAME
+    if not target.is_dir() or not manifest_path.is_file():
+        raise VlmUnavailable(f"所选模型未安装，请先运行 vlm-setup（期望目录 {target}）")
+    _check_write_permissions(target.parent)
+    _check_write_permissions(target)
+    _check_write_permissions(manifest_path)
+    try:
+        expected = json.loads(secure_io.read_bytes(manifest_path, 4 * 1024 * 1024))
+        if (expected.get("format") != "safefill-model-manifest/1"
+                or expected.get("model_id") != model_id or expected.get("revision") != revision):
+            raise ValueError
+        actual = _manifest(target, model_id, revision)
+        if actual != expected:
+            raise ValueError
+    except VlmUnavailable:
+        raise
+    except Exception:
+        raise VlmUnavailable("模型完整性校验失败；请重新安装所选模型") from None
+    return expected
+
+
+def setup(model_id: str, revision: str | None = None) -> dict:
     try:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
-        raise VlmUnavailable("缺少 huggingface_hub，请先 pip install -r requirements-vlm.txt") from exc
-    repo = model_id or DEFAULT_MODEL_ID
-    target = _model_dir(repo)
-    target.mkdir(parents=True, exist_ok=True)
-    snapshot_download(repo_id=repo, local_dir=str(target))
-    return {"model": repo, "path": str(target)}
+        raise VlmUnavailable("缺少 huggingface_hub，请在独立 VLM 环境安装 requirements-vlm.txt") from exc
+    model_id = model_id.strip()
+    revision = (revision or "").strip() or None
+    root, target = model_root(), model_dir(model_id, revision)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _check_write_permissions(root)
+    with secure_io.file_lock(str(target) + ".setup.lock"):
+        if target.exists():
+            manifest = verify_model(model_id, revision, target)
+            return {"model": model_id, "revision": revision, "path": str(target), "files": len(manifest["files"])}
+        temporary = Path(tempfile.mkdtemp(prefix=".safefill-vlm-", dir=root))
+        try:
+            options = {"repo_id": model_id, "local_dir": str(temporary)}
+            if revision:
+                options["revision"] = revision
+            snapshot_download(**options)
+            shutil.rmtree(temporary / ".cache", ignore_errors=True)
+            manifest = _manifest(temporary, model_id, revision)
+            secure_io.atomic_write(temporary / MANIFEST_NAME, collection.canonical(manifest), overwrite=False)
+            verify_model(model_id, revision, temporary)
+            temporary.rename(target)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+    return {"model": model_id, "revision": revision, "path": str(target), "files": len(manifest["files"])}
 
 
-def _run_model(image_path: Path) -> str:
+def _run_model(image_path: Path, model_id: str, revision: str | None = None) -> str:
     try:
-        from optimum.intel.openvino import OVModelForVisualCausalLM
-        from transformers import AutoProcessor
-    except ImportError as exc:
-        raise VlmUnavailable("缺少 VLM 依赖，请 pip install -r requirements-vlm.txt（与 rapidocr 环境分开）") from exc
-    target = _model_dir()
-    if not target.is_dir():
-        raise VlmUnavailable(f"本地模型未安装，请先运行 vlm-setup（期望目录 {target}）")
-    try:
+        import numpy as np
+        import openvino as ov
+        import openvino_genai as ov_genai
         from PIL import Image
-
+    except ImportError as exc:
+        raise VlmUnavailable("缺少固定 VLM 依赖，请在独立环境安装 requirements-vlm.txt") from exc
+    target = model_dir(model_id, revision)
+    verify_model(model_id, revision, target)
+    device = os.environ.get("YINTIAN_VLM_DEVICE", "CPU").strip().upper()
+    if device not in {"CPU", "GPU", "NPU", "AUTO"}:
+        raise VlmUnavailable("YINTIAN_VLM_DEVICE 仅支持 CPU/GPU/NPU/AUTO")
+    try:
         image = Image.open(str(image_path)).convert("RGB")
-        processor = AutoProcessor.from_pretrained(str(target), trust_remote_code=True)
-        model = OVModelForVisualCausalLM.from_pretrained(str(target), trust_remote_code=True)
-        tokenizer = getattr(processor, "tokenizer", processor)
-        answer = model.chat(msgs=[{"role": "user", "content": [image, PROMPT]}], tokenizer=tokenizer)
-        if isinstance(answer, tuple):
-            answer = answer[0]
-        if not isinstance(answer, str) or not answer.strip():
+        array = np.asarray(image, dtype=np.uint8)[None, ...]
+        with mock.patch.dict(os.environ, {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}):
+            pipe = ov_genai.VLMPipeline(str(target), device)
+            answer = pipe.generate(PROMPT, image=ov.Tensor(array), max_new_tokens=256)
+        text = str(answer)
+        if not text.strip():
             raise ValueError("模型无文本输出")
-        return answer
-    except VlmUnavailable:
-        raise
+        return text
     except Exception as exc:
-        raise VlmUnavailable(f"VLM 推理失败: {exc}") from exc
+        raise VlmUnavailable(f"VLM 离线推理失败: {exc}") from exc
 
 
 def _valid_flag(field: str, value: str):
@@ -79,26 +190,25 @@ def _valid_flag(field: str, value: str):
     return None
 
 
-def extract_fields(image_path) -> dict:
-    """返回与 fill_extract.extract_fields 相同的结构，confidence 标记为 vlm。"""
-    text = _run_model(Path(image_path))
-    match = re.search(r"\{.*\}", text, re.S)
+def extract_fields(image_path, model_id: str, revision: str | None = None) -> dict:
+    text = _run_model(Path(image_path), model_id, revision)
+    match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         raise VlmUnavailable("VLM 输出不含 JSON 对象")
     try:
         parsed = json.loads(match.group(0))
     except json.JSONDecodeError as exc:
-        raise VlmUnavailable("VLM 输出 JSON 无法解析") from exc
+        raise VlmUnavailable("VLM 输出不是有效 JSON") from exc
     if not isinstance(parsed, dict):
-        raise VlmUnavailable("VLM 输出 JSON 结构无效")
-    fields: dict = {}
-    candidates: dict = {}
-    for field in FIELD_TYPES:
-        value = parsed.get(field)
-        if not isinstance(value, str) or not value.strip():
-            continue
+        raise VlmUnavailable("VLM 输出结构无效")
+    candidates, fields = [], {}
+    for name, entry_type in FIELD_TYPES.items():
+        value = parsed.get(name, "")
+        if not isinstance(value, str):
+            raise VlmUnavailable(f"VLM 字段 {name} 不是文本")
         value = value.strip()
-        candidate = {"value": value, "confidence": "vlm", "valid": _valid_flag(field, value)}
-        fields[field] = {"value": value, "confidence": "vlm"}
-        candidates[field] = [candidate]
+        if value:
+            fields[name] = value
+            candidates.append({"field": name, "type": entry_type, "value": value,
+                               "confidence": "vlm", "valid": _valid_flag(name, value)})
     return {"fields": fields, "candidates": candidates, "ambiguous": []}

@@ -1,15 +1,14 @@
 """SafeFill · 填写端：读取 Agent 请求包，优先用本机保险柜取值后产出 .yintian 密文。
 
-只在员工自己的电脑上运行：纯本地、不联网；只读显式指定的文件；
+只在员工自己的电脑上运行：业务操作纯本地、不联网；仅显式 vlm-setup 安装模型时联网；只读显式指定的文件；
 默认 AI 请求包使用 yintian-request/1，提交使用 yintian-submission/4；旧表单协议仅作兼容。
-保险柜（vault-*.yintian-vault）静态加密存于 SKILL_ROOT/data/，本机密钥解锁；
+保险柜静态加密存于系统用户数据目录，本机密钥存于独立用户密钥目录；
 无保险柜或缺字段时回退到对话收集（submit）。
 """
 from __future__ import annotations
 
 import argparse
 import base64
-import getpass
 import json
 import os
 import re
@@ -45,9 +44,9 @@ def _bootstrap_repo_scripts() -> None:
 
 _bootstrap_repo_scripts()
 import collection  # noqa: E402
+import evidence_routing  # noqa: E402
 import fill_extract  # noqa: E402
 import secure_io  # noqa: E402
-import evidence_routing  # noqa: E402
 import vault  # noqa: E402
 
 
@@ -338,7 +337,6 @@ def _build_attachments(form: dict[str, Any], specs: Any) -> tuple[dict[str, list
     problems: list[str] = []
     if not isinstance(specs, dict):
         raise FillError("values.json 的 attachments 必须是 {字段id: 文件路径} 对象")
-    labels = {field["id"]: field["label"] for field in form["fields"]}
     attachment_fields = {field["id"]: field for field in form["fields"] if field["type"] in collection.ATTACHMENT_TYPES}
     for key in specs:
         if key not in attachment_fields:
@@ -398,16 +396,12 @@ def _build_attachments(form: dict[str, Any], specs: Any) -> tuple[dict[str, list
     return payload, problems
 
 
-def _warn_values_permissions(values_path: Path) -> None:
-    if os.name == "nt":
-        return
-    if stat.S_IMODE(values_path.stat().st_mode) & 0o077:
-        print(f"警告: {values_path} 含明文且权限宽于 0600，建议执行 chmod 600，并在用后删除。", file=sys.stderr)
-
-
 def _require_private_answers(values_path: Path) -> None:
-    if os.name != "nt" and stat.S_IMODE(values_path.stat().st_mode) & 0o077:
-        raise FillError("ANSWERS_PERMISSIONS: 临时明文必须使用 0600 权限")
+    if not values_path.is_file():
+        raise FillError("ANSWERS_INVALID: 临时明文路径必须是普通文件")
+    if os.name != "nt" and (stat.S_IMODE(values_path.stat().st_mode) & 0o077
+                            or stat.S_IMODE(values_path.parent.stat().st_mode) & 0o077):
+        raise FillError("ANSWERS_PERMISSIONS: 临时明文必须位于 0700 目录且文件权限为 0600")
 
 
 def reply_filename(name: str) -> str:
@@ -415,22 +409,7 @@ def reply_filename(name: str) -> str:
     return f"{cleaned}-{collection.random_id('', 6)}.yintian"
 
 
-def seal_form(form_path, values_path, out_path, *, confirmed=False, credential_path=None):
-    if confirmed is not True:
-        raise FillError('CONSENT_REQUIRED: 未确认时不读取填写资料')
-    form = bind_credential(load_form(form_path), credential_path)
-    values_file = secure_io.checked_path(values_path)
-    _warn_values_permissions(values_file)
-    data = json.loads(secure_io.read_bytes(values_file, collection.MAX_ENVELOPE_BYTES))
-    if not isinstance(data, dict):
-        raise FillError("VALUES_INVALID: 填写值必须是 JSON 对象")
-    attachments, problems = _build_attachments(form, data.get("attachments", {}))
-    if problems:
-        raise FillError("ATTACHMENTS_INVALID: " + "; ".join(problems))
-    return seal_data(form, data.get("values", {}), attachments, out_path, confirmed=confirmed)
-
-
-def seal_data(form, values, attachments, out_path, *, confirmed=False, agent_ocr=None, agent_confirmed=False, invite_id=None):
+def seal_data(form, values, attachments, out_path, *, confirmed=False, invite_id=None):
     """No files/passwords/terminal I/O: consume the exact in-memory data approved by the caller."""
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -465,10 +444,6 @@ def seal_data(form, values, attachments, out_path, *, confirmed=False, agent_ocr
     }
     if form["mode"] != "open":
         payload["invite_token"] = form["_token"]
-    if agent_ocr is not None:
-        if agent_confirmed is not True:
-            raise FillError('AGENT_CONSENT_REQUIRED: 本人尚未确认使用宿主 Agent 识别候选')
-        payload.update(agent_ocr=agent_ocr, agent_ocr_confirmed=True)
     envelope: dict[str, Any] = {
         "format_version": form.get("format_version", collection.FORMAT_VERSION),
         "task_id": form["task_id"],
@@ -547,57 +522,6 @@ def cmd_openvino_status(_args) -> dict[str, Any]:
     return runtime_info()
 
 
-def prepare_agent_result(form, attachments, path):
-    if path is None:
-        return None
-    result = evidence_routing.load_result(path)
-    items = [{'field_id': field_id, 'data': base64.b64decode(item['data_b64'], validate=True)}
-             for field_id, group in attachments.items() for item in group]
-    return evidence_routing.validate_result(form, items, result)
-
-
-def confirm_submission(form, values, attachments, agent_ocr=None):
-    collection.require_tty("fill confirmation")
-    print_inspect(inspect_info(form))
-    if input("输入通过独立渠道与 HR 核对的公钥指纹: ").strip() != form["key_id"]:
-        raise FillError("KEY_UNCONFIRMED: 收集方公钥未确认")
-    print("本次提供的信息（仅本人终端显示）：")
-    for field in form["fields"]:
-        field_id = field["id"]
-        value = f"{len(attachments.get(field_id, []))} 个附件" if field["type"] in collection.ATTACHMENT_TYPES else values.get(field_id, "")
-        print(f"{collection.terminal_text(field['label'])}: {value!r}")
-    if agent_ocr is not None:
-        print('本次包含宿主 Agent 识别候选；若宿主使用云端模型，所选原始附件已由云端处理。候选不会自动放行。')
-        if input('确认是本人授权识别的附件，并同意随密文交回候选，输入 AGENT: ').strip() != 'AGENT':
-            raise FillError('AGENT_CONSENT_REQUIRED: 已取消，不生成文件')
-    expected = form["task_id"]
-    if input(f"确认收集用途及以上内容，同意生成加密文件，请输入任务编号 {expected}: ").strip() != expected:
-        raise FillError("CONSENT_REQUIRED: 已取消，不生成文件")
-
-
-def cmd_seal(args):
-    collection.require_tty("seal")
-    form = bind_credential(load_form(args.form), getattr(args, "credential", None))
-    path = secure_io.checked_path(args.values)
-    _warn_values_permissions(path)
-    data = json.loads(secure_io.read_bytes(path, collection.MAX_ENVELOPE_BYTES))
-    if not isinstance(data, dict):
-        raise FillError("VALUES_INVALID: 填写值格式无效")
-    attachments, problems = _build_attachments(form, data.get("attachments", {}))
-    values, value_problems = _check_values(form, data.get("values", {}))
-    if problems or value_problems:
-        raise FillError("VALUES_INVALID: " + "; ".join(problems + value_problems))
-    agent_ocr = prepare_agent_result(form, attachments, getattr(args, 'agent_ocr', None))
-    if agent_ocr is not None:
-        confirm_submission(form, values, attachments, agent_ocr)
-    else:
-        confirm_submission(form, values, attachments)
-    summary = seal_data(form, values, attachments, args.out, confirmed=True,
-                        agent_ocr=agent_ocr, agent_confirmed=agent_ocr is not None)
-    print("只交回 .yintian；手工 values.json 仍含明文，请自行清理。", file=sys.stderr)
-    return summary
-
-
 def cmd_submit(args):
     form = bind_credential(load_form(args.form), getattr(args, "credential", None))
     path = secure_io.checked_path(args.answers)
@@ -616,7 +540,8 @@ def cmd_submit(args):
         invite_id = _previous_invite_id(form, getattr(args, "previous", None))
         return seal_data(form, values, attachments, out, confirmed=True, invite_id=invite_id)
     finally:
-        path.unlink(missing_ok=True)
+        if path.is_file():
+            path.unlink()
 
 
 def _previous_invite_id(form, previous):
@@ -631,9 +556,20 @@ def _previous_invite_id(form, previous):
         raise FillError("PREVIOUS_INVALID: 旧回执不属于本请求包或已损坏") from exc
 
 
-def _vault_path(args) -> Path:
-    override = getattr(args, "vault", None)
-    return secure_io.checked_path(override) if override else vault.default_vault_path()
+def _storage_paths(args) -> tuple[Path, Path, dict[str, Any] | None]:
+    vault_override = getattr(args, "vault", None)
+    key_override = getattr(args, "key_file", None)
+    if bool(vault_override) != bool(key_override):
+        raise FillError("VAULT_STORAGE_INVALID: 自定义 --vault 必须同时提供 --key-file")
+    if vault_override:
+        vault_path, key_path = secure_io.checked_path(vault_override), secure_io.checked_path(key_override)
+        if vault_path == key_path:
+            raise FillError("VAULT_STORAGE_INVALID: 保险柜与密钥路径必须不同")
+        return vault_path, key_path, None
+    try:
+        return vault.resolve_default_storage()
+    except (RuntimeError, ValueError) as exc:
+        raise FillError(str(exc)) from exc
 
 
 def _read_temp_answers(path_str) -> dict[str, Any]:
@@ -646,7 +582,8 @@ def _read_temp_answers(path_str) -> dict[str, Any]:
             raise FillError("VAULT_ANSWERS_INVALID: 临时 JSON 必须是对象")
         return data
     finally:
-        path.unlink(missing_ok=True)
+        if path.is_file():
+            path.unlink()
 
 
 def _build_vault_attachments(entry_id: str, entry_type: str, paths: list) -> list:
@@ -677,17 +614,21 @@ def _build_entries(specs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _unlock(args, *, create_key=False):
-    vault_path = _vault_path(args)
-    data_dir = vault.ensure_data_dir(vault_path.parent)
-    key = vault.load_or_create_key(data_dir, create=create_key)
-    return vault_path, key
+    vault_path, key_path, migration = _storage_paths(args)
+    try:
+        if vault_path.is_file() and vault.vault_format(vault_path) == vault.FORMAT_V1:
+            raise RuntimeError("VAULT_MIGRATION_REQUIRED: 请先用 vault-migrate 迁移旧保险柜")
+        key = vault.load_or_create_key(key_path, create=create_key)
+    except (RuntimeError, ValueError) as exc:
+        raise FillError(str(exc)) from exc
+    return vault_path, key_path, key, migration
 
 
 def cmd_vault_status(args) -> dict[str, Any]:
     form = load_form(args.request) if getattr(args, "request", None) else None
-    vault_path = _vault_path(args)
+    vault_path, key_path, migration = _storage_paths(args)
     if not vault_path.is_file():
-        result: dict[str, Any] = {"vault": False, "vault_path": str(vault_path)}
+        result: dict[str, Any] = {"vault": False, "vault_path": str(vault_path), "key_path": str(key_path)}
         if form is not None:
             result["fields"] = [
                 {"id": field["id"], "label": field["label"], "type": field["type"],
@@ -695,48 +636,180 @@ def cmd_vault_status(args) -> dict[str, Any]:
                 for field in form["fields"]
             ]
         return result
-    vault_path, key = _unlock(args)
+    try:
+        if vault.vault_format(vault_path) == vault.FORMAT_V1:
+            return {"vault": True, "format": vault.FORMAT_V1, "vault_path": str(vault_path),
+                    "migration_required": True, "migration_target": str(vault.default_vault_path())}
+    except ValueError as exc:
+        raise FillError(str(exc)) from exc
+    vault_path, key_path, key, migration = _unlock(args)
     try:
         profile = vault.load_vault(vault_path, key)
     except ValueError as exc:
         raise FillError(str(exc)) from exc
-    return vault.status_view(profile, form)
+    result = vault.status_view(profile, form)
+    result.update(vault_path=str(vault_path), key_path=str(key_path))
+    if migration:
+        result["storage_migration"] = migration
+    return result
 
 
-def cmd_vault_init(args) -> dict[str, Any]:
-    vault_path = _vault_path(args)
-    if vault_path.exists():
-        raise FillError("VAULT_EXISTS: 保险柜已存在，请用 vault-add 增补条目")
-    entries = _build_entries(_entry_specs(_read_temp_answers(args.answers)))
-    profile = vault.validate_profile({"format": vault.FORMAT_V2, "entries": entries})
-    vault_path, key = _unlock(args, create_key=True)
+def _entry_preview(entry: dict[str, Any] | None) -> Any:
+    if entry is None:
+        return None
+    if entry["type"] in collection.ATTACHMENT_TYPES:
+        return [{"name": item["name"], "size": item["size"], "sha256": item["sha256"]}
+                for item in entry.get("attachments", [])]
+    return entry.get("value", "")
+
+
+def cmd_vault_stage(args) -> dict[str, Any]:
+    answers_path = secure_io.checked_path(args.answers)
+    try:
+        vault_path, key_path, _migration = _storage_paths(args)
+        confirmation_path = secure_io.checked_path(args.confirmation_out)
+    except Exception:
+        if answers_path.is_file():
+            answers_path.unlink()
+        raise
+    if answers_path in {vault_path, key_path}:
+        raise FillError("VAULT_PATH_COLLISION: 临时文件、确认文件、保险柜和密钥路径必须分开")
+    if confirmation_path in {vault_path, key_path}:
+        if answers_path.is_file():
+            answers_path.unlink()
+        raise FillError("VAULT_PATH_COLLISION: 临时文件、确认文件、保险柜和密钥路径必须分开")
+    entries = _build_entries(_entry_specs(_read_temp_answers(str(answers_path))))
+    try:
+        vault.ensure_private_dir(vault_path.parent)
+        vault.ensure_private_dir(key_path.parent)
+        vault.ensure_private_dir(confirmation_path.parent)
+    except (RuntimeError, ValueError) as exc:
+        raise FillError(str(exc)) from exc
+    vault_path, key_path, key, _migration = _unlock(args, create_key=True)
     with secure_io.file_lock(str(vault_path) + ".lock"):
         try:
-            vault.save_vault(vault_path, key, profile, create=True)
-        except FileExistsError:
-            raise FillError("VAULT_EXISTS: 保险柜已存在，请用 vault-add 增补条目") from None
-    return {"vault": True, "vault_path": str(vault_path), "entry_count": len(entries)}
-
-
-def cmd_vault_add(args) -> dict[str, Any]:
-    vault_path = _vault_path(args)
-    if not vault_path.is_file():
-        raise FillError("VAULT_MISSING: 保险柜不存在，请先 vault-init")
-    entries = _build_entries(_entry_specs(_read_temp_answers(args.answers)))
-    vault_path, key = _unlock(args)
-    with secure_io.file_lock(str(vault_path) + ".lock"):
-        try:
-            profile = vault.load_vault(vault_path, key)
-        except ValueError as exc:
+            if vault_path.is_file() and vault.vault_format(vault_path) == vault.FORMAT_V1:
+                raise FillError("VAULT_MIGRATION_REQUIRED: 请先用 vault-migrate 迁移旧保险柜")
+            profile = (vault.load_vault(vault_path, key) if vault_path.is_file()
+                       else {"format": vault.FORMAT_V2, "entries": {}})
+        except (RuntimeError, ValueError) as exc:
             raise FillError(str(exc)) from exc
-        profile["entries"].update(entries)
-        if len(profile["entries"]) > vault.MAX_ENTRIES:
+        candidate = {"format": vault.FORMAT_V2, "entries": {**profile["entries"], **entries}}
+        if len(candidate["entries"]) > vault.MAX_ENTRIES:
             raise FillError("VAULT_LIMIT: 保险柜条目超过数量上限")
         try:
-            vault.save_vault(vault_path, key, profile)
-        except ValueError as exc:
+            vault.validate_profile(candidate)
+            confirmation = vault.seal_confirmation(
+                confirmation_path, key, "vault-change",
+                {"vault_path": str(vault_path), "key_path": str(key_path),
+                 "base_vault_sha256": vault.file_digest(vault_path) if vault_path.is_file() else None,
+                 "entries": entries})
+        except (FileExistsError, RuntimeError, ValueError) as exc:
             raise FillError(str(exc)) from exc
-    return {"vault": True, "updated": sorted(entries), "entry_count": len(profile["entries"])}
+    changes = [
+        {"id": entry_id, "type": entry["type"], "action": "update" if entry_id in profile["entries"] else "add",
+         "old_value": _entry_preview(profile["entries"].get(entry_id)), "new_value": _entry_preview(entry),
+         "source": entry["source"]["kind"]}
+        for entry_id, entry in entries.items()
+    ]
+    return {"vault_path": str(vault_path), "changes": changes, **confirmation,
+            "instruction": "请把以上完整新旧值交给员工确认；确认后才运行 vault-apply。"}
+
+
+def cmd_vault_apply(args) -> dict[str, Any]:
+    confirmation_path = secure_io.checked_path(args.confirmation)
+    vault_path, key_path, key, _migration = _unlock(args)
+    if confirmation_path in {vault_path, key_path}:
+        raise FillError("VAULT_PATH_COLLISION: 确认文件、保险柜和密钥路径必须分开")
+    verified = False
+    try:
+        staged = vault.open_confirmation(confirmation_path, key, "vault-change")
+        verified = True
+        if staged.get("vault_path") != str(vault_path) or staged.get("key_path") != str(key_path):
+            raise FillError("CONFIRMATION_STALE: 确认文件不属于当前保险柜或密钥")
+        entries = {entry_id: vault.validate_entry(entry) for entry_id, entry in staged.get("entries", {}).items()}
+        with secure_io.file_lock(str(vault_path) + ".lock"):
+            current_digest = vault.file_digest(vault_path) if vault_path.is_file() else None
+            if current_digest != staged.get("base_vault_sha256"):
+                raise FillError("CONFIRMATION_STALE: 保险柜已变化，请重新预览")
+            old_blob = secure_io.read_bytes(vault_path, vault.MAX_BYTES) if vault_path.is_file() else None
+            profile = (vault.load_vault(vault_path, key) if vault_path.is_file()
+                       else {"format": vault.FORMAT_V2, "entries": {}})
+            created = sorted(set(entries) - set(profile["entries"]))
+            updated = sorted(set(entries) & set(profile["entries"]))
+            profile["entries"].update(entries)
+            if len(profile["entries"]) > vault.MAX_ENTRIES:
+                raise FillError("VAULT_LIMIT: 保险柜条目超过数量上限")
+            try:
+                vault.ensure_private_dir(vault_path.parent)
+                vault.save_vault(vault_path, key, profile, create=old_blob is None)
+                vault.load_vault(vault_path, key)
+                confirmation_path.unlink()
+            except Exception:
+                try:
+                    if old_blob is None:
+                        vault_path.unlink(missing_ok=True)
+                    else:
+                        secure_io.atomic_write(vault_path, old_blob)
+                except Exception as rollback_exc:
+                    raise FillError("VAULT_ROLLBACK_FAILED: 变更失败且保险柜回滚失败，请停止操作并保留现场") from rollback_exc
+                raise
+    except FillError:
+        if verified:
+            try:
+                confirmation_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    except (RuntimeError, ValueError) as exc:
+        if verified:
+            try:
+                confirmation_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise FillError(str(exc)) from exc
+    return {"vault": True, "vault_path": str(vault_path), "created": created, "updated": updated,
+            "entry_count": len(profile["entries"])}
+
+
+def _read_password_file(path_str: str) -> str:
+    path = secure_io.checked_path(path_str)
+    try:
+        _require_private_answers(path)
+        password = secure_io.read_bytes(path, 4096).decode("utf-8").rstrip("\r\n")
+        if not password:
+            raise FillError("VAULT_PASSWORD_INVALID: 旧保险柜密码为空")
+        return password
+    finally:
+        if path.is_file():
+            path.unlink()
+
+
+def cmd_vault_migrate(args) -> dict[str, Any]:
+    password_path = secure_io.checked_path(args.password_file)
+    try:
+        source = secure_io.checked_path(args.source_vault) if args.source_vault else vault.legacy_vault_path()
+        target = secure_io.checked_path(args.target_vault) if args.target_vault else vault.default_vault_path()
+        target_key = secure_io.checked_path(args.target_key) if args.target_key else vault.default_key_path()
+    except Exception:
+        if password_path.is_file():
+            password_path.unlink()
+        raise
+    if password_path in {source, target, target_key}:
+        raise FillError("VAULT_PATH_COLLISION: 密码临时文件、源保险柜、目标保险柜和密钥路径必须分开")
+    if len({source, target, target_key}) != 3:
+        if password_path.is_file():
+            password_path.unlink()
+        raise FillError("VAULT_PATH_COLLISION: 密码临时文件、源保险柜、目标保险柜和密钥路径必须分开")
+    password = _read_password_file(str(password_path))
+    if bool(args.target_vault) != bool(args.target_key):
+        raise FillError("VAULT_STORAGE_INVALID: 自定义 --target-vault 必须同时提供 --target-key")
+    if source == target:
+        raise FillError("VAULT_MIGRATION_INVALID: 迁移目标必须与旧保险柜不同，以保留原文件")
+    try:
+        return vault.migrate_v1(source, password, target, target_key)
+    except (RuntimeError, ValueError) as exc:
+        raise FillError(str(exc)) from exc
 
 
 def cmd_vault_scan(args) -> dict[str, Any]:
@@ -746,32 +819,28 @@ def cmd_vault_scan(args) -> dict[str, Any]:
         if not path.is_file():
             raise FillError(f"图片不存在: {image}")
         digest = collection.sha256_bytes(secure_io.read_bytes(path, collection.MAX_FILE_BYTES))
-        backend, note, extracted = "openvino-ocr", None, None
+        backend, extracted = "openvino-ocr", None
         if getattr(args, "vlm", False):
+            if not args.model:
+                raise FillError("VLM_MODEL_REQUIRED: 使用 --vlm 时必须用 --model 指定兼容模型")
             try:
                 import vlm_extract
 
-                extracted = vlm_extract.extract_fields(path)
+                extracted = vlm_extract.extract_fields(path, args.model, args.revision)
                 backend = "openvino-vlm"
-            except Exception as exc:
-                note = f"VLM 不可用，已回退本地 OCR: {exc}"
+            except vlm_extract.VlmUnavailable as exc:
+                raise FillError(f"VLM_UNAVAILABLE: {exc}；请由 Agent 改用核心 Python 重新运行不带 --vlm 的 vault-scan") from exc
         if extracted is None:
-            try:
-                extracted = extract_ocr_fields(path)
-            except FillError as exc:
-                if note:
-                    raise FillError(f"{note}；本地 OCR 也不可用: {exc}") from exc
-                raise
+            extracted = extract_ocr_fields(path)
         scans.append({
             "image": path.name,
             "sha256": digest,
             "backend": backend,
-            **({"note": note} if note else {}),
             "fields": extracted["fields"],
             "candidates": extracted["candidates"],
             "ambiguous": extracted["ambiguous"],
         })
-    return {"scans": scans, "hint": "候选仅供本人确认；确认后用 vault-add 写入保险柜（source.kind 记为对应 backend）。"}
+    return {"scans": scans, "hint": "候选仅供本人确认；确认后用 vault-stage/vault-apply 写入保险柜。"}
 
 
 def _check_vault_attachments(form: dict[str, Any], attachments: dict[str, list]) -> list[str]:
@@ -802,92 +871,172 @@ def _check_vault_attachments(form: dict[str, Any], attachments: dict[str, list])
     return problems
 
 
-def cmd_vault_fill(args) -> dict[str, Any]:
-    if not args.confirmed:
-        raise FillError("CONSENT_REQUIRED: 需本人在对话中确认本次内容后，Agent 才能加 --confirmed 生成回执")
-    form = bind_credential(load_form(args.form), getattr(args, "credential", None))
-    if collection.task_expired(form):
-        raise FillError("TASK_EXPIRED: 请求包已过期，请向 HR 索取新请求包")
-    vault_path = _vault_path(args)
-    if not vault_path.is_file():
-        raise FillError("VAULT_MISSING: 保险柜不存在，请先 vault-init")
-    mapping = {}
-    if getattr(args, "mapping", None):
-        mapping = json.loads(secure_io.read_bytes(secure_io.checked_path(args.mapping), 64 * 1024))
-    vault_path, key = _unlock(args)
+def _mapping(path_str: str | None) -> dict[str, str]:
+    if not path_str:
+        return {}
     try:
-        profile = vault.load_vault(vault_path, key)
+        data = json.loads(secure_io.read_bytes(secure_io.checked_path(path_str), 64 * 1024))
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise FillError("MAPPING_INVALID: 映射文件不是有效 JSON") from exc
+    if not isinstance(data, dict):
+        raise FillError("MAPPING_INVALID: 映射必须是对象")
+    return data
+
+
+def _prepare_vault_selection(form, profile, mapping):
+    try:
         values, attachments, missing, matches = vault.select_fields(form, profile, mapping)
     except ValueError as exc:
         raise FillError(str(exc)) from exc
     if not values.get("name") and form.get("name"):
         values["name"] = form["name"]
+        missing = [field_id for field_id in missing if field_id != "name"]
     if form.get("_employee_id") and not values.get("employee_id"):
         values["employee_id"] = form["_employee_id"]
+        missing = [field_id for field_id in missing if field_id != "employee_id"]
     labels = {field["id"]: field["label"] for field in form["fields"]}
-    required_missing = [field_id for field_id in missing
-                        if next(field for field in form["fields"] if field["id"] == field_id).get("required")]
+    required_missing = [field["id"] for field in form["fields"] if field.get("required") and field["id"] in missing]
     if required_missing:
-        raise FillError("VAULT_FIELDS_MISSING: 保险柜缺少必填字段，请询问本人后用 vault-add 补录: "
+        raise FillError("VAULT_FIELDS_MISSING: 保险柜缺少必填字段，请询问本人后用 vault-stage/vault-apply 补录: "
                         + ", ".join(f"{labels[field_id]}（{field_id}）" for field_id in required_missing))
     attachment_problems = _check_vault_attachments(form, attachments)
     if attachment_problems:
         raise FillError("ATTACHMENTS_INVALID: " + "; ".join(attachment_problems))
-    out = args.out
-    if not out:
-        out = secure_io.checked_path(args.out_dir) / reply_filename(values.get("name", ""))
-    invite_id = _previous_invite_id(form, getattr(args, "previous", None))
-    result = seal_data(form, values, attachments, out, confirmed=True, invite_id=invite_id)
-    result["matched"] = matches
-    return result
+    return values, attachments, missing, matches
 
 
-def cmd_vault_edit(args) -> dict[str, Any]:
-    collection.require_tty("vault-edit")
-    vault_path = _vault_path(args)
+def _optional_digest(path_str: str | None, limit: int) -> str | None:
+    return vault.file_digest(secure_io.checked_path(path_str), limit) if path_str else None
+
+
+def cmd_vault_preview(args) -> dict[str, Any]:
+    form = bind_credential(load_form(args.form), getattr(args, "credential", None))
+    if collection.task_expired(form):
+        raise FillError("TASK_EXPIRED: 请求包已过期，请向 HR 索取新请求包")
+    vault_path, key_path, key, _migration = _unlock(args)
     if not vault_path.is_file():
-        raise FillError("VAULT_MISSING: 保险柜不存在，请由 Agent 通过 vault-init 创建")
-    vault_path, key = _unlock(args)
+        raise FillError("VAULT_MISSING: 保险柜不存在，请先 vault-stage/vault-apply")
+    if vault.vault_format(vault_path) == vault.FORMAT_V1:
+        raise FillError("VAULT_MIGRATION_REQUIRED: 请先用 vault-migrate 迁移旧保险柜")
+    mapping = _mapping(getattr(args, "mapping", None))
+    confirmation_path = secure_io.checked_path(args.confirmation_out)
+    if confirmation_path in {vault_path, key_path}:
+        raise FillError("VAULT_PATH_COLLISION: 确认文件、保险柜和密钥路径必须分开")
     with secure_io.file_lock(str(vault_path) + ".lock"):
         try:
             profile = vault.load_vault(vault_path, key)
-        except ValueError as exc:
+            values, attachments, missing, matches = _prepare_vault_selection(form, profile, mapping)
+            invite_id = _previous_invite_id(form, getattr(args, "previous", None))
+            vault.ensure_private_dir(confirmation_path.parent)
+            confirmation = vault.seal_confirmation(
+                confirmation_path, key, "submission",
+                {"request_sha256": vault.file_digest(Path(form["_path"]), 1024 * 1024),
+                 "vault_path": str(vault_path), "key_path": str(key_path),
+                 "vault_sha256": vault.file_digest(vault_path), "mapping": mapping,
+                 "selection_sha256": collection.sha256_bytes(collection.canonical({"values": values, "attachments": attachments})),
+                 "previous_sha256": _optional_digest(getattr(args, "previous", None), collection.MAX_ENVELOPE_BYTES),
+                 "credential_sha256": _optional_digest(getattr(args, "credential", None), 16 * 1024),
+                 "invite_id": invite_id})
+        except (FileExistsError, RuntimeError, ValueError) as exc:
             raise FillError(str(exc)) from exc
-        print("当前条目（标量值只显示首字；附件条目请由 Agent 用 vault-add 维护）：")
-        for entry_id, entry in profile["entries"].items():
-            shown = f"{len(entry['attachments'])} 个附件" if entry["type"] in collection.ATTACHMENT_TYPES else (entry["value"][:1] + "***" if entry.get("value") else "（空）")
-            print(f"  - {entry_id}（{entry['type']}）: {shown}")
-        while True:
-            entry_id = input("输入要修改的条目 id（回车结束）: ").strip()
-            if not entry_id:
-                break
-            if not collection.FIELD_ID_RE.fullmatch(entry_id):
-                print("条目 id 无效，需小写英文/数字/下划线")
-                continue
-            old = profile["entries"].get(entry_id)
-            raw = getpass.getpass(f"{entry_id} 新值（输入隐藏；- 删除该条目；回车保留）: ")
-            if raw == "-":
-                profile["entries"].pop(entry_id, None)
-            elif raw:
-                entry_type = old["type"] if old else input("新条目类型（text/phone_cn/cn_id/date/address）: ").strip()
+        preview = []
+        for field in form["fields"]:
+            field_id = field["id"]
+            if field_id in attachments:
+                content = [{"name": item["name"], "size": item["size"], "sha256": item["sha256"]}
+                           for item in attachments[field_id]]
+            else:
+                content = values.get(field_id)
+            preview.append({"id": field_id, "label": field["label"], "type": field["type"],
+                            "value": content, "source_entry": matches.get(field_id),
+                            "source": (profile["entries"][matches[field_id]]["source"]["kind"]
+                                       if field_id in matches else "request_identity" if field_id in values else None)})
+    return {"fields": preview, "mapping": mapping, "optional_missing": missing, **confirmation,
+            "instruction": "请在员工私有会话中逐项展示以上完整值；员工确认后才运行 vault-fill。"}
+
+
+def cmd_vault_fill(args) -> dict[str, Any]:
+    vault_path, key_path, key, _migration = _unlock(args)
+    if not vault_path.is_file():
+        raise FillError("VAULT_MISSING: 保险柜不存在，请先 vault-stage/vault-apply")
+    confirmation_path = secure_io.checked_path(args.confirmation)
+    if confirmation_path in {vault_path, key_path}:
+        raise FillError("VAULT_PATH_COLLISION: 确认文件、保险柜和密钥路径必须分开")
+    verified = False
+    with secure_io.file_lock(str(vault_path) + ".lock"):
+        try:
+            approved = vault.open_confirmation(confirmation_path, key, "submission")
+            verified = True
+            mapping = approved.get("mapping")
+            if not isinstance(mapping, dict):
+                raise FillError("CONFIRMATION_INVALID: 确认文件中的映射无效")
+            try:
+                form = bind_credential(load_form(args.form), getattr(args, "credential", None))
+                if collection.task_expired(form):
+                    raise FillError("TASK_EXPIRED: 请求包已过期，请向 HR 索取新请求包")
+                profile = vault.load_vault(vault_path, key)
+                values, attachments, _missing, matches = _prepare_vault_selection(form, profile, mapping)
+                expected = {
+                    "request_sha256": vault.file_digest(Path(form["_path"]), 1024 * 1024),
+                    "vault_path": str(vault_path),
+                    "key_path": str(key_path),
+                    "vault_sha256": vault.file_digest(vault_path),
+                    "selection_sha256": collection.sha256_bytes(collection.canonical({"values": values, "attachments": attachments})),
+                    "previous_sha256": _optional_digest(getattr(args, "previous", None), collection.MAX_ENVELOPE_BYTES),
+                    "credential_sha256": _optional_digest(getattr(args, "credential", None), 16 * 1024),
+                    "invite_id": _previous_invite_id(form, getattr(args, "previous", None)),
+                }
+            except FillError as exc:
+                if str(exc).startswith("TASK_EXPIRED"):
+                    raise
+                raise FillError("CONFIRMATION_STALE: 请求、保险柜、取值、凭据或旧回执已变化，请重新预览") from exc
+            except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
+                raise FillError("CONFIRMATION_STALE: 请求、保险柜、取值、凭据或旧回执已变化，请重新预览") from exc
+            if any(approved.get(key_name) != expected_value for key_name, expected_value in expected.items()):
+                raise FillError("CONFIRMATION_STALE: 请求、保险柜、取值、凭据或旧回执已变化，请重新预览")
+        except FillError:
+            if verified:
                 try:
-                    profile["entries"][entry_id] = vault.build_entry(
-                        entry_id, {"type": entry_type, "value": raw}, _build_vault_attachments)
-                except ValueError as exc:
-                    print(f"未保存: {collection.terminal_text(exc)}")
-        if input("保存修改？输入 SAVE: ").strip() != "SAVE":
-            raise FillError("CANCELLED: 已取消保存")
-        vault.save_vault(vault_path, key, profile)
-        return {"saved": True, "entry_count": len(profile["entries"])}
+                    confirmation_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+        except (RuntimeError, ValueError) as exc:
+            if verified:
+                try:
+                    confirmation_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            message = str(exc) if str(exc).startswith("CONFIRMATION_") else "CONFIRMATION_INVALID: 确认文件无效"
+            raise FillError(message) from exc
+        out = args.out
+        if not out:
+            out = secure_io.checked_path(args.out_dir) / reply_filename(values.get("name", ""))
+        result = seal_data(form, values, attachments, out, confirmed=True, invite_id=approved.get("invite_id"))
+        try:
+            confirmation_path.unlink()
+        except OSError as exc:
+            try:
+                Path(result["out"]).unlink()
+            except OSError as rollback_exc:
+                raise FillError("REPLY_ROLLBACK_FAILED: 确认文件无法消费且新回执无法撤回，请停止重试") from rollback_exc
+            raise FillError("CONFIRMATION_CONSUME_FAILED: 确认文件无法消费，未保留回执") from exc
+        result["matched"] = matches
+    return result
 
 
 def cmd_vlm_setup(args) -> dict[str, Any]:
     try:
         import vlm_extract
 
-        return vlm_extract.setup(model_id=getattr(args, "model", None))
+        return vlm_extract.setup(args.model, args.revision)
     except Exception as exc:
         raise FillError(str(exc)) from exc
+
+
+def _add_storage_args(parser) -> None:
+    parser.add_argument("--vault", help="覆盖默认保险柜路径；必须同时提供 --key-file")
+    parser.add_argument("--key-file", help="覆盖默认保险柜密钥路径；必须同时提供 --vault")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -903,14 +1052,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("image", metavar="IMAGE")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_scan_idcard)
-    p = sub.add_parser("seal", help="校验 values.json 并加密产出 .yintian 提交文件")
-    p.add_argument("form", metavar="REQUEST.yintian-request")
-    p.add_argument("--credential", help="HR 私下发放的个人凭据（群发必需）")
-    p.add_argument("--agent-ocr", help="本人已授权宿主 Agent 生成的附件候选 JSON；不调用 API")
-    p.add_argument("--values", required=True, help="填写值 JSON：{\"values\": {...}, \"attachments\": {...}}")
-    p.add_argument("--out", required=True, help="输出 .yintian 路径")
-    p.add_argument("--json", action="store_true")
-    p.set_defaults(func=cmd_seal)
     p = sub.add_parser("submit", help="读取机器请求包，并在字段齐全且本人确认后生成加密提交")
     p.add_argument("form", metavar="REQUEST.yintian-request")
     p.add_argument("--answers", required=True, help="仅供本次加密使用的 0600 临时 JSON")
@@ -922,36 +1063,50 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_submit)
     p = sub.add_parser("vault-status", help="查看本机保险柜摘要及与请求包的字段匹配预览（不输出条目值）")
     p.add_argument("--request", metavar="REQUEST.yintian-request", help="可选：按该请求包字段预览 match/missing")
-    p.add_argument("--vault", help="覆盖默认保险柜路径（默认 SKILL_ROOT/data/vault.yintian-vault）")
+    _add_storage_args(p)
     p.set_defaults(func=cmd_vault_status)
-    p = sub.add_parser("vault-init", help="首次创建本机加密保险柜（0600 临时 JSON 提供初始条目，用后删除）")
+    p = sub.add_parser("vault-stage", help="暂存新增或更新条目并输出完整新旧值；不立即修改保险柜")
     p.add_argument("--answers", required=True, help='0700 目录内的 0600 临时 JSON：{"entries": {"phone": {"type": "phone_cn", "value": "..."}}}')
-    p.add_argument("--vault", help="覆盖默认保险柜路径")
-    p.set_defaults(func=cmd_vault_init)
-    p = sub.add_parser("vault-add", help="向保险柜增补或更新条目（0600 临时 JSON，用后删除）")
-    p.add_argument("--answers", required=True, help="与 vault-init 相同的临时 JSON 结构")
-    p.add_argument("--vault", help="覆盖默认保险柜路径")
-    p.set_defaults(func=cmd_vault_add)
+    p.add_argument("--confirmation-out", required=True, help="写入 0600 加密确认文件；路径必须位于 0700 目录")
+    _add_storage_args(p)
+    p.set_defaults(func=cmd_vault_stage)
+    p = sub.add_parser("vault-apply", help="应用员工已确认的保险柜变更")
+    p.add_argument("--confirmation", required=True, help="vault-stage 生成的确认文件")
+    _add_storage_args(p)
+    p.set_defaults(func=cmd_vault_apply)
+    p = sub.add_parser("vault-migrate", help="用 0600 临时密码文件把 v1 保险柜无损迁移到 v2")
+    p.add_argument("--password-file", required=True, help="旧密码临时文件；无论成败都会删除")
+    p.add_argument("--source-vault", help="旧 v1 保险柜；默认读取旧 Skill data 目录")
+    p.add_argument("--target-vault", help="新 v2 保险柜；默认系统用户数据目录")
+    p.add_argument("--target-key", help="新 v2 密钥；默认系统用户密钥目录")
+    p.set_defaults(func=cmd_vault_migrate)
     p = sub.add_parser("vault-scan", help="OpenVINO 本地识别本人明确指定的证件图，输出候选供确认后写入保险柜")
     p.add_argument("images", nargs="+", metavar="IMAGE")
-    p.add_argument("--vlm", action="store_true", help="优先使用本地 VLM（需先 vlm-setup 并安装 requirements-vlm.txt），不可用自动回退 OCR")
+    p.add_argument("--vlm", action="store_true", help="使用独立 VLM 环境；不可用时由 Agent 改用核心环境重试普通 OCR")
+    p.add_argument("--model", help="使用 --vlm 时指定兼容的 Hugging Face 模型")
+    p.add_argument("--revision", help="可选模型 revision；不指定时使用模型仓库默认版本")
     p.set_defaults(func=cmd_vault_scan)
+    p = sub.add_parser("vault-preview", help="展示本次将提交的完整值并生成 30 分钟有效的加密确认文件")
+    p.add_argument("form", metavar="REQUEST.yintian-request")
+    p.add_argument("--mapping", help="请求字段 id → 保险柜条目 id 的显式映射 JSON")
+    p.add_argument("--confirmation-out", required=True, help="写入 0600 加密确认文件；路径必须位于 0700 目录")
+    p.add_argument("--previous", help="更正时指定本人上一次开放请求回执")
+    p.add_argument("--credential", help="旧 group 模式的个人凭据；open 模式不需要")
+    _add_storage_args(p)
+    p.set_defaults(func=cmd_vault_preview)
     p = sub.add_parser("vault-fill", help="用保险柜匹配请求包字段，本人确认后生成 姓名-短码.yintian 回执")
     p.add_argument("form", metavar="REQUEST.yintian-request")
-    p.add_argument("--mapping", help="请求字段 id → 保险柜条目 id 的映射 JSON（由 Agent 生成、本人确认）")
+    p.add_argument("--confirmation", required=True, help="vault-preview 生成的确认文件")
     output = p.add_mutually_exclusive_group(required=True)
     output.add_argument("--out", help="显式指定输出 .yintian 路径")
     output.add_argument("--out-dir", help="在目录中自动生成 姓名-短码.yintian")
-    p.add_argument("--confirmed", action="store_true", help="本人已在对话中确认本次取值与映射")
     p.add_argument("--previous", help="更正时指定本人上一次开放请求回执，以替换同一条记录")
     p.add_argument("--credential", help="旧 group 模式的个人凭据；open 模式不需要")
-    p.add_argument("--vault", help="覆盖默认保险柜路径")
+    _add_storage_args(p)
     p.set_defaults(func=cmd_vault_fill)
-    p = sub.add_parser("vault-edit", help="本人终端交互修改保险柜标量条目（人工回退通道）")
-    p.add_argument("--vault", help="覆盖默认保险柜路径")
-    p.set_defaults(func=cmd_vault_edit)
-    p = sub.add_parser("vlm-setup", help="下载本地 VLM 模型到 data/models/（可选增强，不随 skill 分发）")
-    p.add_argument("--model", help="Hugging Face 仓库 id（默认 OpenVINO 官方 int4 VLM）")
+    p = sub.add_parser("vlm-setup", help="下载用户指定的兼容模型（安装时联网，推理离线）")
+    p.add_argument("--model", required=True, help="Hugging Face 模型 ID")
+    p.add_argument("--revision", help="可选模型 revision；不指定时使用模型仓库默认版本")
     p.set_defaults(func=cmd_vlm_setup)
     return parser
 

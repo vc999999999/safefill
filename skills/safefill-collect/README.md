@@ -1,4 +1,4 @@
-# SafeFill · 收集者 4.2.0
+# SafeFill · 收集者 4.2.1
 
 HR 在对话中说明用途、字段、截止时间和联系人，Agent 生成无需名单的 `REQUEST.yintian-request`。这是给 `safefill-fill` Agent 读取的 JSON 请求包，不是让员工填写的表单。SafeFill 任何模式都不生成 HTML；员工只与 Agent 对话，HR 收到加密回执后由 Agent 汇总 Excel。
 
