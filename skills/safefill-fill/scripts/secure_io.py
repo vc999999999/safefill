@@ -131,7 +131,7 @@ def file_lock(value):
                 try:
                     pid = int(old.split()[0][4:])
                     if os.name == 'nt':
-                        raise RuntimeError('TASK_BUSY: 旧版锁需先经 cleanup 检查')
+                        raise RuntimeError('TASK_BUSY: 旧版任务锁无法确认，请先检查')
                     os.kill(pid, 0)
                 except ProcessLookupError:
                     pass
