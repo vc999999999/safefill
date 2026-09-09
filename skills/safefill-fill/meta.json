@@ -1,13 +1,13 @@
 {
   "display_name": "SafeFill · 填写者",
-  "display_description": "对话补齐本人资料并生成加密回执，无需终端",
-  "detail_describe": "员工提供模板所需资料，Agent 校验后自动生成可交回 HR 的加密文件",
+  "display_description": "读取 AI 请求包，对话生成加密回执",
+  "detail_describe": "员工把机器请求包交给 Agent，通过对话提供资料并生成可交回 HR 的加密文件",
   "name": "safefill-fill",
   "icon": "",
   "use_cases": [
-    "根据模板一次问齐缺失字段",
+    "根据机器请求包一次问齐缺失字段",
     "无需个人凭据或终端即可生成加密回执"
   ],
   "author": "vc999999999",
-  "version": "4.1.0"
+  "version": "4.2.0"
 }

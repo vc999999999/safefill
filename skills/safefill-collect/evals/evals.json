@@ -4,16 +4,16 @@
     {
       "id": 0,
       "prompt": "HR：我想收集员工姓名、手机号和入职日期，用于更新通讯录。",
-      "expected_output": "沿用已给用途和字段，只合并询问截止时间与联系人；不询问员工名单、人数或姓名。信息齐全后由 Agent 生成开放模板。",
+      "expected_output": "沿用已给用途和字段，只合并询问截止时间与联系人；不询问员工名单、人数或姓名。信息齐全后由 Agent 生成供 safefill-fill 读取的机器请求包。",
       "files": [],
       "expectations": ["不索取名单", "只问缺失配置", "name 由员工填写"]
     },
     {
       "id": 1,
-      "prompt": "字段都说齐了，请生成模板发到我指定的员工群。",
-      "expected_output": "Agent 运行 create-open 生成唯一 FORM.yintian-form；有已授权发送工具时发送并检查回执，否则交付模板与转发文案。",
+      "prompt": "字段都说齐了，请生成给员工 Agent 使用的信息请求；不要让员工自己填网页。",
+      "expected_output": "Agent 必须运行 create-request，生成唯一 REQUEST.yintian-request JSON 请求包；绝不生成 HTML/PDF/Word/Excel 或在线表单。有已授权发送工具时原样发送，否则交付请求包与转发文案。",
       "files": [],
-      "expectations": ["Agent 执行脚本", "不让 HR 运行终端", "不生成个人凭据"]
+      "expectations": ["Agent 执行确定性脚本", "只生成 yintian-request/1", "不生成面向人的表单", "不让 HR 运行终端", "不生成个人凭据"]
     },
     {
       "id": 2,
@@ -25,7 +25,7 @@
     {
       "id": 3,
       "prompt": "这个任务必须保证只有我预先指定的员工能提交。",
-      "expected_output": "说明开放模板只有自报身份，改用兼容 group 模式，并仅在此时索取 employee_id,name 名单以生成逐人凭据。",
+      "expected_output": "说明默认请求包只有自报身份，改用兼容 group 模式，并仅在此时索取 employee_id,name 名单以生成逐人凭据。",
       "files": [],
       "expectations": ["准确说明身份保证", "强认证才索取名单"]
     },

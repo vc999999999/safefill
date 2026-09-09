@@ -39,7 +39,8 @@ TASK_PACKAGE_VERSION = "yintian-task/2"
 ENCRYPTED_TASK_PACKAGE_VERSION = "yintian-task/3"
 KEY_ENVELOPE_VERSION = "yintian-key/1"
 FORM_FORMAT_VERSION = "yintian-form/1"
-OPEN_FORM_FORMAT_VERSION = "yintian-form/3"
+LEGACY_OPEN_FORM_FORMAT_VERSION = "yintian-form/3"
+OPEN_REQUEST_FORMAT_VERSION = "yintian-request/1"
 GROUP_INVITE_PREFIX = "GRP-"
 OPEN_INVITE_PREFIX = "OPEN-"
 TASK_MODES = {"directed", "group", "open"}
@@ -218,9 +219,9 @@ def load_task(task_dir: str | Path) -> tuple[Path, dict[str, Any]]:
     if task.get("format_version") == GROUP_FORMAT_VERSION and (task_mode(task) != "group" or task.get("submission_auth") != AUTH_VERSION):
         raise ValueError("GROUP_AUTH_REQUIRED: 群发任务缺少认证配置")
     if task.get("format_version") == OPEN_FORMAT_VERSION and task_mode(task) != "open":
-        raise ValueError("开放模板任务格式与 mode 不匹配")
+        raise ValueError("开放请求任务格式与 mode 不匹配")
     if task_mode(task) == "open" and task.get("format_version") != OPEN_FORMAT_VERSION:
-        raise ValueError("开放模板任务必须使用当前开放协议")
+        raise ValueError("开放请求任务必须使用当前提交协议")
     required = ("key_id", "title", "purpose", "deadline", "retention_until", "contact", "correction", "template_version", "schema_hash", "notice_hash", "fields")
     if any(key not in task for key in required) or not isinstance(task["fields"], list):
         raise ValueError("task.json 缺少必要配置")
@@ -725,8 +726,8 @@ def create_task(roster_path: Path | None, config_path: Path, out_parent: Path, p
 
         db_rows, index_rows = [], []
         if mode == "open":
-            form = {"format": OPEN_FORM_FORMAT_VERSION, **task, "public_key_pem": public_pem.decode("ascii")}
-            dump_json(root / "FORM.yintian-form", form)
+            request = {"format": OPEN_REQUEST_FORMAT_VERSION, "kind": "agent_request", "target_skill": "safefill-fill", **task, "public_key_pem": public_pem.decode("ascii")}
+            dump_json(root / "REQUEST.yintian-request", request)
         elif mode == "group":
             form = {"format": "yintian-form/2", **task, "public_key_pem": public_pem.decode("ascii")}
             dump_json(root / "FORM.yintian-form", form)
@@ -764,7 +765,8 @@ def create_task(roster_path: Path | None, config_path: Path, out_parent: Path, p
         init_db(root, db_rows)
         if local_secret is not None:
             saved_secret_path = save_local_task_secret(root, task_id, local_secret)
-        return {"task_id": task_id, "task_dir": str(root), "form": str(root / "FORM.yintian-form") if mode in {"open", "group"} else None, "invite_count": len(index_rows)}
+        artifact = root / ("REQUEST.yintian-request" if mode == "open" else "FORM.yintian-form")
+        return {"task_id": task_id, "task_dir": str(root), "request": str(artifact) if mode == "open" else None, "form": str(artifact) if mode == "group" else None, "invite_count": len(index_rows)}
     except BaseException:
         shutil.rmtree(root, ignore_errors=True)
         if saved_secret_path is not None:
@@ -1569,7 +1571,7 @@ def collect_open_rows(root: Path, task: dict[str, Any], private_key, attachment_
 def collect_open(task_dir: str | Path, submissions_dir: str | Path, out: str | Path) -> dict[str, Any]:
     root, task = load_task(task_dir)
     if task_mode(task) != "open":
-        raise ValueError("collect 仅用于无需名单的开放模板任务；旧任务继续使用 ingest/review/export-clear")
+        raise ValueError("collect 仅用于无需名单的开放请求任务；旧任务继续使用 ingest/review/export-clear")
     ingested = ingest_task(root, submissions_dir)
     reviewed = review_task(root, None)
     field_ids = [field["id"] for field in task["fields"] if field["id"] not in {"employee_id", "name"}]
@@ -1739,8 +1741,9 @@ def build_task_package(task_dir, *, include_open_secret: bool = False):
         candidates += list((root / "invites").glob("*.html"))
         candidates += list((root / "invites").glob("*.yintian-form"))
         candidates += list((root / "credentials").glob("*.yintian-credential"))
-        if (root / "FORM.yintian-form").exists():
-            candidates.append(root / "FORM.yintian-form")
+        for public_artifact in (root / "REQUEST.yintian-request", root / "FORM.yintian-form"):
+            if public_artifact.exists():
+                candidates.append(public_artifact)
         candidates += list((root / "submissions").glob("*/*.yintian"))
         candidates += [p for p in (root / "reports").glob("progress.*") if p.suffix in {".json", ".xlsx"}]
         if len(candidates) + (task_mode(task) == "open") > MAX_PACKAGE_FILES:
@@ -1875,7 +1878,7 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
             parts = rel_path.parts
             allowed = (
                 rel in required
-                or rel in {"FORM.yintian-form", "local-open-key"}
+                or rel in {"REQUEST.yintian-request", "FORM.yintian-form", "local-open-key"}
                 or (len(parts) == 2 and parts[0] == "invites" and parts[1].endswith(".yintian-form") and INVITE_ID_RE.fullmatch(parts[1][:-13]))
                 or (len(parts) == 2 and parts[0] == "credentials" and parts[1].endswith(".yintian-credential") and valid_invite_identifier(parts[1][:-19]))
                 or (len(parts) == 2 and parts[0] == "invites" and parts[1].endswith(".html") and INVITE_ID_RE.fullmatch(parts[1][:-5]))
@@ -2021,7 +2024,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("init-config", help="生成基础身份信息收集配置")
     p.add_argument("--out", required=True); p.add_argument("--force", action="store_true"); p.add_argument('--mode', choices=['directed', 'group', 'open'], default='open'); p.set_defaults(func=cmd_init_config)
-    p = sub.add_parser("create-open", help="无需名单或人工密码，生成可公开发放的统一加密模板")
+    p = sub.add_parser("create-request", aliases=["create-open"], help="生成供 safefill-fill Agent 读取的机器请求包；不生成 HTML 表单")
     p.add_argument("--config", required=True); p.add_argument("--out", required=True); p.set_defaults(func=cmd_create_open)
     p = sub.add_parser("create", help="创建任务并批量生成离线邀请")
     p.add_argument("--roster", required=True); p.add_argument("--config", required=True); p.add_argument("--out", required=True)
@@ -2029,7 +2032,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_create)
     p = sub.add_parser("ingest", help="接收 .yintian 密文提交")
     p.add_argument("task_dir"); p.add_argument("submissions_dir"); p.set_defaults(func=cmd_ingest)
-    p = sub.add_parser("collect", help="开放模板一键收件、校验、解密并导出 Excel")
+    p = sub.add_parser("collect", help="开放请求一键收件、校验、解密并导出 Excel")
     p.add_argument("task_dir"); p.add_argument("submissions_dir"); p.add_argument("--out", required=True); p.set_defaults(func=cmd_collect_open)
     p = sub.add_parser("review", help="本地解密、校验和 OpenVINO OCR 复核")
     p.add_argument("task_dir"); p.add_argument("--retry-needs-review", action="store_true"); p.add_argument("--invite"); p.set_defaults(func=cmd_review)

@@ -44,7 +44,7 @@ def test_reply_filename_is_readable_and_safe():
     assert re.fullmatch(r"张_三-[A-Z0-9]{6}\.yintian", fill.reply_filename(' 张/三:*? '))
 
 
-def test_open_template_to_excel(tmp_path):
+def test_agent_request_to_excel(tmp_path):
     initialized = tmp_path / "initialized.json"
     collection.cmd_init_config(SimpleNamespace(out=str(initialized), force=False, mode="open"))
     assert [field["id"] for field in collection.load_json(initialized)["fields"]] == ["name"]
@@ -64,8 +64,24 @@ def test_open_template_to_excel(tmp_path):
     }
     config_path = tmp_path / "collection.json"
     collection.dump_json(config_path, config)
-    created = collection.create_task(None, config_path, tmp_path / "tasks", None, require_terminal=False, mode="open")
+    args = collection.build_parser().parse_args(["create-request", "--config", str(config_path), "--out", str(tmp_path / "tasks")])
+    created = args.func(args)
     task_dir = Path(created["task_dir"])
+    request_path = Path(created["request"])
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request_path.name == "REQUEST.yintian-request"
+    assert request["format"] == "yintian-request/1" and request["kind"] == "agent_request" and request["target_skill"] == "safefill-fill"
+    assert not (task_dir / "FORM.yintian-form").exists()
+    assert not list(task_dir.rglob("*.html"))
+    assert b"<html" not in request_path.read_bytes().lower()
+    assert all(key not in request for key in ("name", "employee_id", "invite_id", "invite_token"))
+    legacy_request = dict(request)
+    legacy_request["format"] = collection.LEGACY_OPEN_FORM_FORMAT_VERSION
+    legacy_request.pop("kind")
+    legacy_request.pop("target_skill")
+    legacy_path = tmp_path / "legacy-open.yintian-form"
+    collection.dump_json(legacy_path, legacy_request)
+    assert fill.load_form(legacy_path)["mode"] == "open"
     private_blob = (task_dir / "private.pem.enc").read_bytes()
     assert private_blob.lstrip().startswith(b"{") and b"PRIVATE KEY" not in private_blob
     local_key = collection.local_task_secret_path(task_dir, created["task_id"])
@@ -82,7 +98,7 @@ def test_open_template_to_excel(tmp_path):
         ("张三", "13800138000", {"photo": str(photo)}),
         ("李四", "13900139000", {}),
     ):
-        result = submit(created["form"], {"consent_confirmed": True, "values": {"name": name, "phone": phone}, "attachments": attachments}, incoming)
+        result = submit(created["request"], {"consent_confirmed": True, "values": {"name": name, "phone": phone}, "attachments": attachments}, incoming)
         reply = Path(result["out"])
         replies[name] = reply
         assert name in reply.name
@@ -107,7 +123,7 @@ def test_open_template_to_excel(tmp_path):
     correction_incoming = tmp_path / "correction-incoming"
     correction_incoming.mkdir()
     corrected = submit(
-        created["form"],
+        created["request"],
         {"consent_confirmed": True, "values": {"name": "张三", "phone": "13700137000"}, "attachments": {"photo": str(photo)}},
         correction_incoming,
         previous=replies["张三"],
@@ -125,6 +141,7 @@ def test_open_template_to_excel(tmp_path):
     assert secret.encode() not in handoff.read_bytes()
     imported = collection.import_task(handoff, tmp_path / "imported", handoff_password="handoff-password-2026")
     imported_dir = Path(imported["task_dir"])
+    assert (imported_dir / "REQUEST.yintian-request").is_file()
     assert collection.load_local_task_secret(imported_dir, created["task_id"]) == secret
     empty = tmp_path / "empty"
     empty.mkdir()
@@ -136,7 +153,7 @@ def test_open_template_to_excel(tmp_path):
         unsafe.write_text(json.dumps({"consent_confirmed": True, "values": {"name": "王五", "phone": "13600136000"}, "attachments": {}}), encoding="utf-8")
         unsafe.chmod(0o644)
         try:
-            fill.cmd_submit(SimpleNamespace(form=created["form"], answers=str(unsafe), out=None, out_dir=str(tmp_path / "unsafe-out"), credential=None, previous=None))
+            fill.cmd_submit(SimpleNamespace(form=created["request"], answers=str(unsafe), out=None, out_dir=str(tmp_path / "unsafe-out"), credential=None, previous=None))
         except fill.FillError as exc:
             assert "ANSWERS_PERMISSIONS" in str(exc)
         else:
@@ -149,8 +166,8 @@ def test_open_template_to_excel(tmp_path):
     except ValueError:
         pass
     else:
-        raise AssertionError("开放模板必须拒绝非必填姓名")
-    form = fill.load_form(created["form"])
+        raise AssertionError("开放请求必须拒绝非必填姓名")
+    form = fill.load_form(created["request"])
     try:
         fill._check_values(form, {"name": "名" * (collection.MAX_NAME_CHARS + 1), "phone": "13800138000"})
     except fill.FillError:
@@ -162,5 +179,5 @@ def test_open_template_to_excel(tmp_path):
 if __name__ == "__main__":
     test_reply_filename_is_readable_and_safe()
     with tempfile.TemporaryDirectory(prefix="safefill-open-") as directory:
-        test_open_template_to_excel(Path(directory))
+        test_agent_request_to_excel(Path(directory))
     print("open workflow ok")

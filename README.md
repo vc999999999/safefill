@@ -1,6 +1,6 @@
 # SafeFill Skills
 
-SafeFill 是一个面向多人私密资料收集的双 Skill 集合仓库。HR 通过对话生成统一模板，员工通过对话填写本人资料并得到加密回执，HR 收回后由 Agent 在授权环境中统一校验并导出 Excel。
+SafeFill 是一个 AI→AI 的私密资料收集协议。HR Agent 把需求编译成机器请求包，员工 Agent 读取字段并通过对话填写、加密，HR Agent 收回密文后统一校验并导出 Excel。
 
 > Fill locally. Share securely.
 
@@ -10,20 +10,20 @@ SafeFill 是一个面向多人私密资料收集的双 Skill 集合仓库。HR �
 
 | Skill | 使用者 | 职责 | 说明 |
 |---|---|---|---|
-| `safefill-collect` | HR、行政等收集者 | 对话补齐需求、生成开放模板、收取加密回执并汇总 Excel | [README](skills/safefill-collect/README.md) · [SKILL.md](skills/safefill-collect/SKILL.md) |
-| `safefill-fill` | 提交资料的员工 | 检查模板、对话补齐本人资料、确认并生成加密回执 | [README](skills/safefill-fill/README.md) · [SKILL.md](skills/safefill-fill/SKILL.md) |
+| `safefill-collect` | HR、行政等收集者 | 对话补齐需求、生成机器请求包、收取加密回执并汇总 Excel | [README](skills/safefill-collect/README.md) · [SKILL.md](skills/safefill-collect/SKILL.md) |
+| `safefill-fill` | 提交资料的员工 | 读取机器请求包、对话补齐本人资料、确认并生成加密回执 | [README](skills/safefill-fill/README.md) · [SKILL.md](skills/safefill-fill/SKILL.md) |
 
 `skills/` 下的两个目录都是独立 Skill。收集者和填写者可以在不同设备上只安装自己需要的一端；开发、回归测试和组合打包时，两个目录需保持同级。
 
-## 默认使用方式：开放模板，对话完成
+## 默认使用方式：AI 请求包，对话完成
 
-新任务默认采用 `open` 模式：HR 不准备员工名单、个人凭据、任务密码或配置文件，也不需要运行终端。Agent 只补问尚未说明的用途、字段、必填性、截止时间和联系人，然后生成一份 `FORM.yintian-form`。
+新任务默认采用 `open` 模式：HR 不准备员工名单、个人凭据、任务密码、配置文件或网页表单，也不需要运行终端。Agent 只补问尚未说明的用途、字段、必填性、截止时间和联系人，然后生成 `REQUEST.yintian-request`。
 
-员工把模板交给安装了 `safefill-fill` 的 Agent，在当前对话中提供本人的字段和明确指定的附件。Agent 做确定性校验并生成 `姓名-随机短码.yintian`；姓名在文件名中可见，文件载荷仍加密。员工本人把回执发送给 HR。HR 指出回执目录和 Excel 输出位置后，`safefill-collect` 完成收件、解密校验、最新版本选择以及 Excel/附件导出。
+`REQUEST.yintian-request` 是规范 JSON 的 AI→AI 协议文件，不是给员工打开或填写的界面，也不得替换为 HTML、PDF、Word、Excel 或在线表单。员工只需把请求包交给安装了 `safefill-fill` 的 Agent，在对话中提供本人资料和明确指定的附件。Agent 校验后生成 `姓名-随机短码.yintian`；员工本人把回执发送给 HR。HR 指出回执目录和输出位置后，`safefill-collect` 完成收件、解密校验、最新版本选择以及 Excel/附件导出。
 
 这意味着当前 Agent 会实际处理用户主动提供的明文。加密保护回执在传输和静态保存时的内容，不把明文对正在执行填写或汇总的 Agent 隐藏。若部署方不允许 Agent 接触明文，可继续使用兼容的本地保险柜、人工复核和白名单导出流程。
 
-开放模板的身份是提交者自报，不能防止同名、冒名、模板转发或垃圾提交。只有 HR 明确要求预先限定人员或绑定工号时，才启用兼容的 `group` 名单凭据模式。`directed`、加密保险柜、OCR、本地证据窗口、加密任务交接和旧格式只读能力继续保留。
+开放请求包的身份是提交者自报，不能防止同名、冒名、请求包转发或垃圾提交。只有 HR 明确要求预先限定人员或绑定工号时，才启用兼容的 `group` 名单凭据模式。`directed`、加密保险柜、OCR、本地证据窗口、加密任务交接和旧格式只读能力继续保留。
 
 收集端和填写端的可选 OCR 均支持用 `YINTIAN_OCR_DEVICE` 选择 `CPU/GPU/NPU/AUTO`，并用 `YINTIAN_MODEL_DIR` 指向准备好的 INT8 模型目录。默认开放流程的附件不启用 OCR 绑定，除非 HR 明确要求原件和值自动比对。模型分工、授权回退和已验证范围见[识别说明](skills/safefill-collect/references/recognition.md)、[隐私边界](skills/safefill-collect/references/privacy-extraction-workflow.md)与[验证记录](skills/safefill-collect/references/validation.md)。
 
@@ -31,14 +31,14 @@ SafeFill 是一个面向多人私密资料收集的双 Skill 集合仓库。HR �
 
 ```text
 HR 说明用途、字段、期限和联系人
-  → safefill-collect 生成统一 FORM.yintian-form
-  → 员工用 safefill-fill 补齐本人资料并生成加密回执
+  → safefill-collect 生成 REQUEST.yintian-request
+  → 员工 Agent 读取请求包，通过对话补齐本人资料并加密
   → 员工本人把回执发送给 HR
   → safefill-collect 校验并汇总 Excel 与附件目录
 ```
 
 1. Agent 从对话提取需求，只合并询问缺项；`name` 自动作为必填字段，不向 HR 索取名单。
-2. HR 发送统一模板；员工 Agent 只使用当前任务中明确提供的本人资料，并在员工确认后加密。
+2. HR 原样转发机器请求包；员工不打开、不手工填写，员工 Agent 读取后只询问缺项并在本人确认后加密。
 3. 首次回执生成随机记录编号；更正时必须携带本人上一次回执沿用编号，不能按姓名猜测覆盖。
 4. 收集端不信任文件名，以解密后的姓名和字段为准；异常、待复核或非最新记录不进入 Excel。
 5. 附件解密到 Excel 同名目录，单元格保存相对路径；明文输出只留给获授权的 HR。
@@ -68,7 +68,8 @@ Windows 中将 `.venv/bin/python` 换为 `.venv\Scripts\python.exe`。核心流�
 
 | 文件 | 用途 | 应留在哪里 |
 |---|---|---|
-| `FORM.yintian-form` / 定向表单 | 收集规则与收集方公钥 | 开放模板可统一发放；定向表单私发 |
+| `REQUEST.yintian-request` | 默认 AI→AI 信息请求包；不含名单或个人值 | HR 原样转发给员工 Agent |
+| `FORM.yintian-form` / 定向表单 | 旧 `group/direct` 兼容协议 | 按兼容模式公开或私发 |
 | `*.yintian-credential` | 兼容 `group` 模式的个人认证凭据 | 只私下发给对应本人 |
 | `*.yintian-vault` | 员工的加密个人保险柜 | 只留在员工设备 |
 | `姓名-短码.yintian` | 本次加密提交；仅文件名显示姓名 | 由员工本人按授权渠道交回收集者 |

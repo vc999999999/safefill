@@ -1,13 +1,13 @@
 {
   "display_name": "SafeFill · 收集者",
-  "display_description": "对话生成无名单加密模板，收件后直接汇总 Excel",
-  "detail_describe": "HR 说明用途和字段，Agent 生成统一模板并将员工加密回执汇总为 Excel",
+  "display_description": "生成 AI 信息请求包，收件后直接汇总 Excel",
+  "detail_describe": "HR 说明用途和字段，Agent 生成机器请求包并将员工加密回执汇总为 Excel",
   "name": "safefill-collect",
   "icon": "",
   "use_cases": [
-    "无需姓名名单生成统一加密模板",
+    "无需姓名名单生成 AI 信息请求包",
     "员工回执一键解密校验并汇总 Excel"
   ],
   "author": "vc999999999",
-  "version": "4.1.0"
+  "version": "4.2.0"
 }

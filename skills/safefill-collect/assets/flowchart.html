@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="SafeFill 4.1：HR 对话生成无名单加密模板，员工由 Agent 填写并加密，HR Agent 汇总 Excel 与附件。">
-  <meta name="safefill-page-version" content="4.1.0-flowchart-1">
+  <meta name="description" content="SafeFill 4.2：HR Agent 生成机器请求包，员工 Agent 对话填写并加密，HR Agent 汇总 Excel 与附件。">
+  <meta name="safefill-page-version" content="4.2.0-flowchart-1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
-  <title>SafeFill 4.1 · 无名单加密收集流程</title>
+  <title>SafeFill 4.2 · AI 到 AI 的加密收集流程</title>
   <style>
     :root{color-scheme:light;--ink:#172033;--muted:#5d687a;--line:#dce2eb;--blue:#2456d9;--green:#08745b;--bg:#f4f6fa}
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
@@ -18,14 +18,14 @@
 </head>
 <body>
 <main>
-  <span class="tag">SAFEFILL 4.1 · OPEN WORKFLOW</span>
-  <h1>HR 不做表、不准备名单、不运行终端</h1>
-  <p>默认流程由两个 Skill 协作：Agent 把需求变成模板，员工 Agent 填写并加密，HR Agent 在本地收件并生成 Excel。</p>
+  <span class="tag">SAFEFILL 4.2 · AGENT REQUEST WORKFLOW</span>
+  <h1>人只对话，Agent 之间传请求包</h1>
+  <p>HR Agent 把需求编译成机器请求包；员工 Agent 读取字段、通过对话填写并加密；HR Agent 收件并生成 Excel。默认流程没有人工 HTML 表单。</p>
 
   <section class="flow" aria-label="默认流程">
     <article class="step"><span class="no">01 · HR</span><b>说清需求</b><span>用途、字段、必填性、截止时间、联系人</span></article>
-    <article class="step"><span class="no">02 · 收集 Agent</span><b>生成统一模板</b><span class="file">FORM.yintian-form</span><span>不询问员工姓名或名单</span></article>
-    <article class="step"><span class="no">03 · 员工 Agent</span><b>一次问齐并加密</b><span class="file">姓名-短码.yintian</span><span>临时明文无论成功失败都删除</span></article>
+    <article class="step"><span class="no">02 · 收集 Agent</span><b>生成机器请求包</b><span class="file">REQUEST.yintian-request</span><span>规范 JSON，不生成 HTML</span></article>
+    <article class="step"><span class="no">03 · 员工 Agent</span><b>读取、问齐、加密</b><span class="file">姓名-短码.yintian</span><span>员工不打开或填写请求文件</span></article>
     <article class="step"><span class="no">04 · 员工</span><b>本人发送</b><span>只把 .yintian 交给 HR</span></article>
     <article class="step"><span class="no">05 · HR Agent</span><b>统一汇总</b><span class="file">结果.xlsx + 结果-attachments/</span><span>只纳入最新且通过校验的记录</span></article>
   </section>
@@ -34,21 +34,21 @@
 
   <h2>数据与安全边界</h2>
   <section class="grid">
-    <article class="card"><h3>回执内容</h3><p>AES-256-GCM 加密；随机数据密钥由 RSA-OAEP-3072/SHA-256 包裹。信封头只有任务、模板、公钥标识和随机回执编号。</p></article>
+    <article class="card"><h3>回执内容</h3><p>AES-256-GCM 加密；随机数据密钥由 RSA-OAEP-3072/SHA-256 包裹。信封头只有任务、请求结构摘要、公钥标识和随机回执编号。</p></article>
     <article class="card"><h3>HR 私钥</h3><p>私钥文件始终加密；随机本地密钥以 0600 存在任务目录外。跨设备只能使用带独立密码的加密任务交接包。</p></article>
     <article class="card"><h3>附件</h3><p>通过校验的附件解密到 Excel 同名目录，单元格写相对路径。默认不启用 OCR，避免识别环境阻塞普通材料收集。</p></article>
     <article class="card"><h3>更正</h3><p>员工把本人上一次回执交给填写 Agent；新回执沿用随机编号，收集端保留历史并只导出最新通过版本。</p></article>
   </section>
 
-  <div class="note warn"><strong>开放模板不是身份认证。</strong> 姓名由员工自报，不能防止同名、冒名或模板转发。只有确需预先限定提交者时，才启用需要名单和逐人凭据的 group 兼容模式。</div>
+  <div class="note warn"><strong>开放请求包不是身份认证。</strong> 姓名由员工自报，不能防止同名、冒名或请求包转发。只有确需预先限定提交者时，才启用需要名单和逐人凭据的 group 兼容模式。</div>
 
   <h2>确定性闸门</h2>
   <section class="grid">
-    <article class="card"><h3>填写前</h3><ul><li>校验模板格式、公钥指纹、字段与告知摘要</li><li>只使用员工当前明确提供的值和附件</li><li>缺项、格式错误、越界或过期时不生成回执</li></ul></article>
+    <article class="card"><h3>填写前</h3><ul><li>校验请求包格式、目标 Skill、公钥指纹、字段与告知摘要</li><li>只使用员工当前明确提供的值和附件</li><li>缺项、格式错误、越界或过期时不生成回执</li></ul></article>
     <article class="card"><h3>导出前</h3><ul><li>验证信封、解密认证、必填项、类型、附件哈希与内容</li><li>异常和待复核记录不混入 Excel</li><li>已有 Excel 或附件目录绝不覆盖</li></ul></article>
   </section>
 
-  <footer>SafeFill 4.1.0 · 合成数据验证 · 明文 Excel 和附件导出后的权限与保留由 HR 管理。</footer>
+  <footer>SafeFill 4.2.0 · AI→AI 请求包 · 明文 Excel 和附件导出后的权限与保留由 HR 管理。</footer>
 </main>
 </body>
 </html>

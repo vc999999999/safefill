@@ -1,10 +1,11 @@
 {
-  "version": "4.1.0",
+  "version": "4.2.0",
   "tested_at": "2026-09-09",
   "tests": {
     "pytest": 168,
     "subtests": 17,
-    "open_template_to_excel": true,
+    "agent_request_to_excel": true,
+    "no_human_form_default": true,
     "visible_name_filename": true,
     "attachment_export": true,
     "correction_reuses_invite": true,
@@ -15,5 +16,5 @@
     "package_files": 49,
     "package_integrity": true
   },
-  "scope": "Synthetic data; no-roster open template, two employee encrypted replies, readable names, attachment export, correction versioning, separated local key, encrypted handoff, bounded validation, and legacy regression suite."
+  "scope": "Synthetic data; AI-to-AI yintian-request/1 with no human form, legacy yintian-form/3 read compatibility, two encrypted replies, readable names, attachment export, correction versioning, separated local key, encrypted handoff, bounded validation, and legacy regression suite."
 }

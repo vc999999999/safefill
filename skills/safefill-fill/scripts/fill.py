@@ -1,7 +1,7 @@
-"""SafeFill · 填写端：员工本机填写需求格式文件并产出 .yintian 密文。
+"""SafeFill · 填写端：读取 Agent 请求包，对话取值后产出 .yintian 密文。
 
 只在员工自己的电脑上运行：纯本地、不联网；只读显式指定的文件；
-默认开放模板使用 yintian-submission/4；定向 /2 与带个人认证的群发 /3 仅作兼容。
+默认 AI 请求包使用 yintian-request/1，提交使用 yintian-submission/4；旧表单协议仅作兼容。
 """
 from __future__ import annotations
 
@@ -17,7 +17,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 FORM_FORMAT = "yintian-form/1"
-OPEN_FORM_FORMAT = "yintian-form/3"
+LEGACY_OPEN_FORM_FORMAT = "yintian-form/3"
+OPEN_REQUEST_FORMAT = "yintian-request/1"
 GROUP_INVITE_PREFIX = "GRP-"
 IMAGE_MIME_BY_SUFFIX = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
 PDF_SUFFIX = ".pdf"
@@ -57,34 +58,36 @@ def _public_key_fingerprint(public_key_pem: str) -> str:
 
 
 def load_form(form_path: str | Path) -> dict[str, Any]:
-    """读取并校验定向 /1、群发 /2 或开放 /3 模板；不修改文件。"""
+    """读取机器请求包；兼容旧定向、群发和开放表单协议，不修改文件。"""
     path = secure_io.checked_path(form_path)
     if not path.is_file():
-        raise FillError(f"需求格式文件不存在: {form_path}")
+        raise FillError(f"信息请求包不存在: {form_path}")
     try:
         form = json.loads(secure_io.read_bytes(path, 1024 * 1024))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise FillError("需求格式文件不是有效 JSON") from exc
-    if not isinstance(form, dict) or form.get("format") not in {FORM_FORMAT, "yintian-form/2", OPEN_FORM_FORMAT}:
-        raise FillError(f"不是 {FORM_FORMAT} 需求格式文件")
+        raise FillError("信息请求包不是有效 JSON") from exc
+    if not isinstance(form, dict) or form.get("format") not in {FORM_FORMAT, "yintian-form/2", LEGACY_OPEN_FORM_FORMAT, OPEN_REQUEST_FORMAT}:
+        raise FillError("不是受支持的 SafeFill 机器请求包")
     mode = form.get("mode")
     if mode not in ("group", "directed", "open"):
-        raise FillError("需求格式文件 mode 无效（应为 group、directed 或 open）")
-    expected_form = {"directed": FORM_FORMAT, "group": "yintian-form/2", "open": OPEN_FORM_FORMAT}[mode]
-    if form.get("format") != expected_form:
-        raise FillError("FORM_MODE_MISMATCH: 模板格式与 mode 不匹配")
+        raise FillError("信息请求包 mode 无效（应为 group、directed 或 open）")
+    expected_formats = {"directed": {FORM_FORMAT}, "group": {"yintian-form/2"}, "open": {LEGACY_OPEN_FORM_FORMAT, OPEN_REQUEST_FORMAT}}[mode]
+    if form.get("format") not in expected_formats:
+        raise FillError("REQUEST_MODE_MISMATCH: 请求文件格式与 mode 不匹配")
     if mode == "group" and (form.get("format") != "yintian-form/2" or form.get("submission_auth") != collection.AUTH_VERSION or form.get("format_version") != collection.GROUP_FORMAT_VERSION):
         raise FillError("GROUP_AUTH_REQUIRED: 旧群发模板没有个人认证，请向 HR 索取新版模板及个人凭据")
-    if mode == "open" and (form.get("format") != OPEN_FORM_FORMAT or form.get("format_version") != collection.OPEN_FORMAT_VERSION):
-        raise FillError("OPEN_FORM_INVALID: 开放模板格式无效")
+    if mode == "open" and form.get("format_version") != collection.OPEN_FORMAT_VERSION:
+        raise FillError("OPEN_REQUEST_INVALID: 开放请求包格式无效")
+    if form.get("format") == OPEN_REQUEST_FORMAT and (form.get("kind") != "agent_request" or form.get("target_skill") != "safefill-fill"):
+        raise FillError("OPEN_REQUEST_INVALID: 不是发给 safefill-fill 的 Agent 请求包")
     missing = [key for key in REQUIRED_FORM_KEYS if not form.get(key)]
     if missing:
-        raise FillError(f"需求格式文件缺少必要字段: {', '.join(missing)}")
+        raise FillError(f"信息请求包缺少必要字段: {', '.join(missing)}")
     for key in (*NOTICE_KEYS, "template_version"):
         if not isinstance(form[key], str) or len(form[key]) > collection.MAX_VALUE_CHARS:
             raise FillError(f"FORM_INVALID: {key} 必须是长度受限的文本")
     if not collection.TASK_ID_RE.fullmatch(str(form["task_id"])):
-        raise FillError("需求格式文件 task_id 无效")
+        raise FillError("信息请求包 task_id 无效")
     if not isinstance(form["public_key_pem"], str):
         raise FillError("FORM_INVALID: public_key_pem 必须是文本")
     if not re.fullmatch(r"[0-9a-f]{24}", str(form["key_id"])) or any(not re.fullmatch(r"[0-9a-f]{64}", str(form[key])) for key in ("schema_hash", "notice_hash")):
@@ -134,7 +137,7 @@ def bind_credential(form, credential_path=None):
         return form
     if form['mode'] == 'open':
         if credential_path:
-            raise FillError('CREDENTIAL_UNEXPECTED: 开放模板不需要个人凭据')
+            raise FillError('CREDENTIAL_UNEXPECTED: 开放请求包不需要个人凭据')
         return form
     if not credential_path:
         raise FillError('CREDENTIAL_REQUIRED: 群发填写需要 HR 私下发给本人的 .yintian-credential')
@@ -195,8 +198,8 @@ def print_inspect(info: dict[str, Any]) -> None:
     info = {key: collection.terminal_text(value) if isinstance(value, str) else value for key, value in info.items()}
     info['fields'] = [{**field, 'label': collection.terminal_text(field['label']),
                        **({'options': [collection.terminal_text(value) for value in field['options']]} if 'options' in field else {})} for field in info['fields']]
-    mode_label = {"directed": "directed 定向邀请", "group": "group 群组模式（需要个人凭据）", "open": "open 开放模板（姓名由本人填写）"}[info["mode"]]
-    print(f"需求格式文件：{info['format']} · {mode_label}")
+    mode_label = {"directed": "directed 定向邀请", "group": "group 群组模式（需要个人凭据）", "open": "open AI 请求包（姓名由本人填写）"}[info["mode"]]
+    print(f"SafeFill 请求包：{info['format']} · {mode_label}")
     print(f"标题：{info['title']}")
     print(f"用途：{info['purpose']}")
     print(f"截止时间：{info['deadline']}")
@@ -427,7 +430,7 @@ def seal_data(form, values, attachments, out_path, *, confirmed=False, agent_ocr
     if confirmed is not True:
         raise FillError("CONSENT_REQUIRED: 必须先由本人确认本次字段及附件")
     if collection.task_expired(form):
-        raise FillError("TASK_EXPIRED: 已超过保存期限，请向 HR 索取新模板")
+        raise FillError("TASK_EXPIRED: 已超过保存期限，请向 HR 索取新请求包")
     if form["_key_fingerprint"] != form["key_id"]:
         raise FillError("KEY_MISMATCH: 公钥指纹不一致")
     if form["mode"] != "open" and not form.get("_token"):
@@ -605,12 +608,12 @@ def cmd_submit(args):
         previous = getattr(args, "previous", None)
         if previous:
             if form["mode"] != "open":
-                raise FillError("PREVIOUS_UNEXPECTED: 仅开放模板可沿用旧回执进行更正")
+                raise FillError("PREVIOUS_UNEXPECTED: 仅开放请求包可沿用旧回执进行更正")
             try:
                 envelope = json.loads(secure_io.read_bytes(previous, collection.MAX_ENVELOPE_BYTES))
                 invite_id = collection.validate_envelope_header(envelope, form)
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                raise FillError("PREVIOUS_INVALID: 旧回执不属于本模板或已损坏") from exc
+                raise FillError("PREVIOUS_INVALID: 旧回执不属于本请求包或已损坏") from exc
         return seal_data(form, values, attachments, out, confirmed=True, invite_id=invite_id)
     finally:
         path.unlink(missing_ok=True)
@@ -629,7 +632,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SafeFill · 填写端：本机填写需求格式文件并产出 .yintian 密文")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("inspect", help="查看需求格式文件的告知内容、字段清单与公钥指纹（不修改文件）")
-    p.add_argument("form", metavar="FORM.yintian-form")
+    p.add_argument("form", metavar="REQUEST.yintian-request")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_inspect)
     p = sub.add_parser("openvino-status", help="查看 OpenVINO 版本、可用设备和当前设备选择")
@@ -639,20 +642,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_scan_idcard)
     p = sub.add_parser("seal", help="校验 values.json 并加密产出 .yintian 提交文件")
-    p.add_argument("form", metavar="FORM.yintian-form")
+    p.add_argument("form", metavar="REQUEST.yintian-request")
     p.add_argument("--credential", help="HR 私下发放的个人凭据（群发必需）")
     p.add_argument("--agent-ocr", help="本人已授权宿主 Agent 生成的附件候选 JSON；不调用 API")
     p.add_argument("--values", required=True, help="填写值 JSON：{\"values\": {...}, \"attachments\": {...}}")
     p.add_argument("--out", required=True, help="输出 .yintian 路径")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_seal)
-    p = sub.add_parser("submit", help="供 Agent 在字段齐全并获本人确认后直接生成加密提交；不需要员工操作终端")
-    p.add_argument("form", metavar="FORM.yintian-form")
+    p = sub.add_parser("submit", help="读取机器请求包，并在字段齐全且本人确认后生成加密提交")
+    p.add_argument("form", metavar="REQUEST.yintian-request")
     p.add_argument("--answers", required=True, help="仅供本次加密使用的 0600 临时 JSON")
     output = p.add_mutually_exclusive_group(required=True)
     output.add_argument("--out", help="兼容入口：显式指定输出 .yintian 路径")
     output.add_argument("--out-dir", help="推荐入口：在目录中自动生成 姓名-短码.yintian")
-    p.add_argument("--previous", help="更正时指定本人上一次开放模板回执，以替换同一条记录")
+    p.add_argument("--previous", help="更正时指定本人上一次开放请求回执，以替换同一条记录")
     p.add_argument("--credential", help="旧 group 模式的个人凭据；open 模式不需要")
     p.set_defaults(func=cmd_submit)
     for command in ('vault-init', 'vault-edit'):

@@ -5,8 +5,8 @@
 ## 默认开放流程
 
 1. HR 在对话中说明用途、字段、必填性、截止时间和联系人。
-2. Agent 生成一份 `FORM.yintian-form`；HR 只负责把它发给员工。
-3. 员工 Agent 解释告知、一次问齐缺项并生成 `姓名-短码.yintian`；员工本人发送给 HR。
+2. Agent 生成 `REQUEST.yintian-request` 机器请求包；HR 只负责原样转发，不打开或改造成网页表单。
+3. 员工 Agent 直接读取请求包、解释告知、一次问齐缺项并生成 `姓名-短码.yintian`；员工本人发送给 HR。
 4. HR 指出回执目录和输出位置，Agent 一次完成收件、校验、解密、Excel 与附件目录导出。
 
 更正时员工必须把本人上一次 `.yintian` 一并交给填写 Agent。Agent 使用 `submit --previous` 生成同一随机回执编号的新版本。无法取得旧回执时不要按姓名覆盖，联系 HR 处理重复记录。
