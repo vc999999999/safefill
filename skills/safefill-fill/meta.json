@@ -1,0 +1,13 @@
+{
+  "display_name": "SafeFill · 填写者",
+  "display_description": "本人解锁保险柜、按模板取值确认、生成可安全交回的加密文件",
+  "detail_describe": "本人解锁保险柜、按模板取值确认、生成可安全交回的加密文件",
+  "name": "safefill-fill",
+  "icon": "",
+  "use_cases": [
+    "从加密个人保险柜匹配本次字段",
+    "本人确认用途、取值和附件后加密提交"
+  ],
+  "author": "vc999999999",
+  "version": "3.5.0"
+}

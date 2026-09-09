@@ -1,4 +1,0 @@
-interface:
-  display_name: "隐填 · 填写者"
-  short_description: "本地保险柜填写、可选 Agent 识别、本人确认后加密提交"
-  default_prompt: "Use $yintian-fill to inspect my collection template and guide me through local vault filling without exposing my private values or password."

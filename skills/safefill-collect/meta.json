@@ -1,0 +1,13 @@
+{
+  "display_name": "SafeFill · 收集者",
+  "display_description": "群发模板与个人凭据、加密收件、本地复核和已通过信息的 Excel 汇总",
+  "detail_describe": "群发模板与个人凭据、加密收件、本地复核和已通过信息的 Excel 汇总",
+  "name": "safefill-collect",
+  "icon": "",
+  "use_cases": [
+    "公共模板与个人凭据分开发放",
+    "加密收件、最新状态、逐项复核与合格 Excel"
+  ],
+  "author": "vc999999999",
+  "version": "3.5.0"
+}

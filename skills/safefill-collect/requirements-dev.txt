@@ -1,0 +1,3 @@
+# SafeFill 开发与测试环境依赖
+-r requirements-core.txt
+pytest>=8.0.0

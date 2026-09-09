@@ -1,0 +1,35 @@
+{
+  "version": "3.5.0",
+  "tests": {
+    "pytest": 165,
+    "subtests": 17,
+    "mcp_package_cases": 2,
+    "browser_real_download": true,
+    "real_tk": true,
+    "sensitive_boundary_files": 37,
+    "leaks": 0
+  },
+  "platform": "macOS arm64/Python 3.11.15",
+  "hardware_tested": false,
+  "requires_api_key": false,
+  "implementation_commit": "704a1b95b2d432b490ce564420565bc8b97351c9",
+  "scope": "Synthetic data; prior real CLI, browser download and Tk flow. Collection layout validation rerun after moving both Skills under skills/.",
+  "layout_validation": {
+    "pytest": 165,
+    "subtests": 17,
+    "seconds": 85.93,
+    "independent_skill_tests": 2,
+    "seconds_independent": 3.521,
+    "broken_document_links": 0,
+    "skill_entrypoints_valid": 2,
+    "repository_skill_root": "skills",
+    "repository_skills": [
+      "skills/safefill-collect",
+      "skills/safefill-fill"
+    ],
+    "package_top_level": [
+      "safefill-collect",
+      "safefill-fill"
+    ]
+  }
+}

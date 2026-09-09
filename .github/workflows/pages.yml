@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - skills/yintian-skill/assets/flowchart.html
+      - skills/safefill-collect/assets/flowchart.html
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -32,13 +32,13 @@ jobs:
       - name: Prepare public pages only
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/yintian-pages"
-          cp skills/yintian-skill/assets/flowchart.html "$RUNNER_TEMP/yintian-pages/flowchart.html"
-          cp skills/yintian-skill/assets/flowchart.html "$RUNNER_TEMP/yintian-pages/index.html"
-          touch "$RUNNER_TEMP/yintian-pages/.nojekyll"
+          mkdir -p "$RUNNER_TEMP/safefill-pages"
+          cp skills/safefill-collect/assets/flowchart.html "$RUNNER_TEMP/safefill-pages/flowchart.html"
+          cp skills/safefill-collect/assets/flowchart.html "$RUNNER_TEMP/safefill-pages/index.html"
+          touch "$RUNNER_TEMP/safefill-pages/.nojekyll"
       - uses: actions/upload-pages-artifact@v4
         with:
-          path: ${{ runner.temp }}/yintian-pages
+          path: ${{ runner.temp }}/safefill-pages
       - name: Publish
         id: deployment
         uses: actions/deploy-pages@v4
