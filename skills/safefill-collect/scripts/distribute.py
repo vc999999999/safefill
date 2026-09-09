@@ -37,7 +37,7 @@ def load_invite_index(task_dir: Path) -> list[dict[str, str]]:
 
 
 def safe_invite_relpath(invite_file: str) -> Path | None:
-    """invite_file 只允许纯文件名或 invites/ 下的相对路径；含 ..、绝对路径或反斜杠的一律拒绝，防路径穿越。"""
+    """只接受公共或逐人机器协议文件，并拒绝路径穿越。"""
     if not invite_file or "\\" in invite_file:
         return None
     rel = Path(invite_file)
@@ -45,7 +45,10 @@ def safe_invite_relpath(invite_file: str) -> Path | None:
         return None
     if len(rel.parts) > 1 and rel.parts[0] != "invites":
         return None
-    return rel
+    name = rel.name
+    if len(rel.parts) == 1 and name == "FORM.yintian-form":
+        return rel
+    return rel if name.endswith(".yintian-form") and collection.INVITE_ID_RE.fullmatch(name[:-13]) else None
 
 
 def verify_invites(task_dir: Path) -> dict[str, Any]:
@@ -89,9 +92,8 @@ def generate_messages(task_dir: Path, template: str | None = None) -> list[dict[
 
     default_tpl = (
         "【{title}】您好，{name}（工号：{employee_id}）：\n"
-        "请接收您的专属离线加密填报单：{invite_name}\n"
-        "说明：请使用 Chrome 或 Edge 浏览器双击打开此单文件直接填写，断网亦可导出加密文件；"
-        "提交后生成的 .yintian 密文文件请直接私聊交回。截止时间：{deadline}。"
+        "请把专属机器请求文件 {invite_name} 交给 safefill-fill Agent，由 Agent 在对话中问齐并加密；"
+        "不要打开或手工编辑请求文件。生成的 .yintian 密文请直接私聊交回。截止时间：{deadline}。"
     )
     if collection.task_mode(task) == 'group':
         default_tpl = (
@@ -133,7 +135,7 @@ def generate_messages(task_dir: Path, template: str | None = None) -> list[dict[
 
 
 def export_messages_csv(msgs: list[dict[str, str]], out_csv: str, force: bool = False) -> Path:
-    """导出分发文案 CSV；落盘只含邀请单页文件名，拒绝符号链接与意外覆盖，写后收紧权限为 0600。"""
+    """导出分发文案 CSV；落盘只含机器请求文件名，拒绝符号链接与意外覆盖，写后收紧权限为 0600。"""
     out_path = Path(out_csv).expanduser()
     try:
         secure_io.checked_path(out_path)
@@ -190,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     m_cmd = sub.add_parser("messages", help="生成防串发个性化私聊发送文案")
     m_cmd.add_argument("task_dir", help="任务目录路径")
     m_cmd.add_argument("--json", action="store_true", help="以 JSON 格式输出")
-    m_cmd.add_argument("--out-csv", help="导出为分发文案 CSV 文件（只含邀请单页文件名，已存在时拒绝覆盖）")
+    m_cmd.add_argument("--out-csv", help="导出为分发文案 CSV 文件（只含机器请求文件名，已存在时拒绝覆盖）")
     m_cmd.add_argument("--force", action="store_true", help="允许覆盖已存在的 --out-csv 文件")
     m_cmd.add_argument("--template", help="自定义文案模板，可用占位符 {title} {name} {employee_id} {invite_id} {invite_file} {invite_name} {deadline}")
 
@@ -230,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
                 for item in msgs:
                     invite_filename = Path(item["invite_path"]).name
                     print(f"--- [工号 {item['employee_id']} - {item['name']}] ---")
-                    print(f"邀请单页: {invite_filename}")
+                    print(f"机器请求文件: {invite_filename}")
                     print(item["message"])
                     print()
             return 0

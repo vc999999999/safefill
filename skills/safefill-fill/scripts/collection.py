@@ -646,16 +646,8 @@ def load_local_task_secret(root: Path, task_id: str) -> str:
     return secret
 
 
-def safe_json_for_html(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=True, separators=(",", ":")).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-
-
 def csv_text(value: str) -> str:
     return "'" + value if value.startswith(("=", "+", "-", "@")) else value
-
-
-def render_invite(template: str, config: dict[str, Any]) -> str:
-    return template.replace("__YINTIAN_CONFIG__", safe_json_for_html(config))
 
 
 def cmd_init_config(args) -> dict[str, Any]:
@@ -744,15 +736,13 @@ def create_task(roster_path: Path | None, config_path: Path, out_parent: Path, p
                 db_rows.append({**item, "invite_id": invite_id, "token_hash": sha256_bytes(token.encode()), "created_at": now_iso()})
                 index_rows.append({**item, "invite_id": invite_id, "invite_file": "FORM.yintian-form"})
         else:
-            template = (Path(__file__).resolve().parents[1] / "assets" / "invite_template.html").read_text(encoding="utf-8")
             for item in roster:
                 invite_id = random_id("INV-", 10)
                 invite_token = secrets.token_urlsafe(32)
-                invite_name = invite_id + ".html"
+                invite_name = invite_id + ".yintian-form"
                 invite_config = dict(task)
                 invite_config.update({"invite_id": invite_id, "invite_token": invite_token, "name": item["name"], "public_key_pem": public_pem.decode("ascii")})
-                atomic_write(root / "invites" / invite_name, render_invite(template, invite_config).encode("utf-8"))
-                dump_json(root / "invites" / (invite_id + ".yintian-form"), {"format": FORM_FORMAT_VERSION, **invite_config})
+                dump_json(root / "invites" / invite_name, {"format": FORM_FORMAT_VERSION, **invite_config})
                 created_at = now_iso()
                 db_rows.append({**item, "invite_id": invite_id, "token_hash": sha256_bytes(invite_token.encode()), "created_at": created_at})
                 index_rows.append({**item, "invite_id": invite_id, "invite_file": f"invites/{invite_name}"})
@@ -1738,7 +1728,6 @@ def build_task_package(task_dir, *, include_open_secret: bool = False):
         candidates = [root / name for name in ("task.json", "public.pem", "private.pem.enc", "roster.csv", "invite-index.csv", "state.sqlite3")]
         if any(not path.is_file() for path in candidates):
             raise ValueError("任务目录缺少必要文件")
-        candidates += list((root / "invites").glob("*.html"))
         candidates += list((root / "invites").glob("*.yintian-form"))
         candidates += list((root / "credentials").glob("*.yintian-credential"))
         for public_artifact in (root / "REQUEST.yintian-request", root / "FORM.yintian-form"):
@@ -1881,7 +1870,6 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
                 or rel in {"REQUEST.yintian-request", "FORM.yintian-form", "local-open-key"}
                 or (len(parts) == 2 and parts[0] == "invites" and parts[1].endswith(".yintian-form") and INVITE_ID_RE.fullmatch(parts[1][:-13]))
                 or (len(parts) == 2 and parts[0] == "credentials" and parts[1].endswith(".yintian-credential") and valid_invite_identifier(parts[1][:-19]))
-                or (len(parts) == 2 and parts[0] == "invites" and parts[1].endswith(".html") and INVITE_ID_RE.fullmatch(parts[1][:-5]))
                 or (len(parts) == 3 and parts[0] == "submissions" and valid_invite_identifier(parts[1]) and re.fullmatch(r"v\d{4}_[0-9a-f]{12}\.yintian", parts[2]))
                 or rel in {"reports/progress.json", "reports/progress.xlsx"}
             )

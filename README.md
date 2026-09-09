@@ -19,7 +19,7 @@ SafeFill 是一个 AI→AI 的私密资料收集协议。HR Agent 把需求编�
 
 新任务默认采用 `open` 模式：HR 不准备员工名单、个人凭据、任务密码、配置文件或网页表单，也不需要运行终端。Agent 只补问尚未说明的用途、字段、必填性、截止时间和联系人，然后生成 `REQUEST.yintian-request`。
 
-`REQUEST.yintian-request` 是规范 JSON 的 AI→AI 协议文件，不是给员工打开或填写的界面，也不得替换为 HTML、PDF、Word、Excel 或在线表单。员工只需把请求包交给安装了 `safefill-fill` 的 Agent，在对话中提供本人资料和明确指定的附件。Agent 校验后生成 `姓名-随机短码.yintian`；员工本人把回执发送给 HR。HR 指出回执目录和输出位置后，`safefill-collect` 完成收件、解密校验、最新版本选择以及 Excel/附件导出。
+`REQUEST.yintian-request` 是规范 JSON 的 AI→AI 协议文件，不是给员工打开或填写的界面。SafeFill 不生成 HTML 表单；`open`、`group`、`directed` 全部只交换机器协议文件。员工只需把请求包交给安装了 `safefill-fill` 的 Agent，在对话中提供本人资料和明确指定的附件。Agent 校验后生成 `姓名-随机短码.yintian`；员工本人把回执发送给 HR。HR 指出回执目录和输出位置后，`safefill-collect` 完成收件、解密校验、最新版本选择以及 Excel/附件导出。
 
 这意味着当前 Agent 会实际处理用户主动提供的明文。加密保护回执在传输和静态保存时的内容，不把明文对正在执行填写或汇总的 Agent 隐藏。若部署方不允许 Agent 接触明文，可继续使用兼容的本地保险柜、人工复核和白名单导出流程。
 
@@ -93,7 +93,7 @@ safefill/
 │   │   ├── agents/          # Skill 界面元数据
 │   │   ├── scripts/         # 收集、复核、导出与测试
 │   │   ├── references/      # 配置、文件协议、操作与验证说明
-│   │   └── assets/          # 邀请模板、MCP 示例与项目流程图
+│   │   └── assets/          # MCP 示例与项目流程图
 │   └── safefill-fill/        # 填写者 Skill，可独立安装
 │       ├── SKILL.md
 │       ├── agents/
@@ -109,7 +109,6 @@ safefill/
 ```bash
 python -m pip install -r skills/safefill-collect/requirements-dev.txt
 python -m pytest skills/safefill-collect/scripts -q -p no:cacheprovider
-node skills/safefill-collect/tests/browser_contract.cjs
 python skills/safefill-collect/scripts/package_skill.py --out /absolute/path/safefill-skills.zip
 ```
 

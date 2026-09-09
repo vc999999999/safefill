@@ -50,7 +50,8 @@ class DeliveryTests(unittest.TestCase):
                 str(collector / 'scripts'), str(ns.task_dir / 'roster.csv'), str(ns.task_dir / 'task.json'), str(root / 'isolated-created')],
                 cwd=collector, env=env, capture_output=True, text=True, check=True, timeout=20)
             isolated_task = Path(json.loads(create.stdout)['task_dir'])
-            self.assertTrue(list((isolated_task / 'invites').glob('*.html')))
+            self.assertTrue(list((isolated_task / 'invites').glob('*.yintian-form')))
+            self.assertFalse(list(isolated_task.rglob('*.html')))
             inspected = subprocess.run([sys.executable, str(filler / 'scripts/fill.py'), 'inspect',
                                         str(ns.task_dir / 'FORM.yintian-form'), '--json'],
                                        cwd=filler, env=env, capture_output=True, text=True, check=True, timeout=20)

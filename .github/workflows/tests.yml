@@ -14,4 +14,3 @@ jobs:
       - run: python -m pytest skills/safefill-collect/scripts -q -p no:cacheprovider
         env:
           PYTHONDONTWRITEBYTECODE: "1"
-      - run: node skills/safefill-collect/tests/browser_contract.cjs

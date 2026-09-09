@@ -41,8 +41,6 @@ def keep_rule(path: Path) -> tuple[str, str] | None:
         return "邀请索引", GUIDE_PURGE
     if name.startswith("roster") and path.suffix == ".csv":
         return "名单文件", GUIDE_PURGE
-    if re.fullmatch(r"INV-[A-Z0-9]{10}\.html", name):
-        return "个人邀请页", GUIDE_PURGE
     if path.suffix == ".yintian":
         return "员工密文提交", GUIDE_PURGE
     if path.suffix == ".yintian-task":

@@ -34,9 +34,7 @@ VALID_ID = "110105198503071230"
 
 
 def invite_token(task_dir: Path, invite_id: str) -> str:
-    html = (task_dir / "invites" / f"{invite_id}.html").read_text(encoding="utf-8")
-    marker = '<script id="cfg" type="application/json">'
-    return json.loads(html.split(marker, 1)[1].split("</script>", 1)[0])["invite_token"]
+    return collection.load_json(task_dir / "invites" / f"{invite_id}.yintian-form")["invite_token"]
 
 
 def wrap_payload(task_dir: Path, invite_id: str, payload: dict) -> dict:
@@ -195,7 +193,8 @@ def test_placeholder_config_rejected(tmp_path: Path) -> None:
 
 def test_create_task_layout(tmp_path: Path) -> None:
     ns = make_scenario(tmp_path)
-    assert len(list((ns.task_dir / "invites").glob("*.html"))) == 1
+    assert len(list((ns.task_dir / "invites").glob("*.yintian-form"))) == 1
+    assert not list(ns.task_dir.rglob("*.html"))
 
 
 def test_ingest_and_dedup(tmp_path: Path) -> None:
@@ -967,24 +966,20 @@ def submit_group(ns: types.SimpleNamespace, employee_id: str, filename: str, val
     collection.dump_json(ns.incoming / filename, make_group_envelope(ns.task_dir, employee_id, values if values is not None else ns.values, **kwargs))
 
 
-def test_directed_invite_form_matches_html_config(tmp_path: Path) -> None:
+def test_directed_invite_is_machine_form_only(tmp_path: Path) -> None:
     ns = make_scenario(tmp_path)
     form = collection.load_json(ns.task_dir / "invites" / f"{ns.invite_id}.yintian-form")
     assert form["format"] == collection.FORM_FORMAT_VERSION == "yintian-form/1"
     assert form["mode"] == "directed"
-    html = (ns.task_dir / "invites" / f"{ns.invite_id}.html").read_text(encoding="utf-8")
-    marker = '<script id="cfg" type="application/json">'
-    embedded = json.loads(html.split(marker, 1)[1].split("</script>", 1)[0])
-    for key in ("invite_id", "invite_token", "key_id", "schema_hash", "notice_hash", "task_id", "public_key_pem"):
-        assert form[key] == embedded[key], key  # .yintian-form 与 HTML 内嵌配置是同一份数据
     assert form["invite_id"] == ns.invite_id and form["invite_token"] == invite_token(ns.task_dir, ns.invite_id)
-    assert "yintian-form/1 的人类可读渲染版" in html  # 真伪核对区已标注渲染关系
+    assert not list(ns.task_dir.rglob("*.html"))
 
 
 def test_group_create_layout(tmp_path: Path) -> None:
     ns = make_group_scenario(tmp_path)
     task = collection.load_json(ns.task_dir / "task.json")
     assert task["mode"] == "group"
+    assert not list(ns.task_dir.rglob("*.html"))
     form = collection.load_json(ns.task_dir / "FORM.yintian-form")
     assert form["format"] == "yintian-form/2" and form["mode"] == "group"
     assert "invite_id" not in form and "invite_token" not in form and "name" not in form  # 单份群发，无任何个人标识与令牌

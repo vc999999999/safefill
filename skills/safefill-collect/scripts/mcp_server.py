@@ -75,7 +75,7 @@ def generate_redacted_report(task_dir: str, formats: list[str] | None = None) ->
 
 @mcp.tool()
 def verify_invites(task_dir: str) -> dict[str, Any]:
-    """校验任务目录下所有员工离线邀请单页文件是否完整且非空。"""
+    """校验任务目录下所有员工机器邀请文件是否完整且非空。"""
     return distribute.verify_invites(Path(scoped_path(task_dir)))
 
 

@@ -92,7 +92,7 @@ def test_never_delete_set(tmp_path):
         task / "reports" / "progress.json",
         task / "roster.csv",
         task / "invite-index.csv",
-        task / "INV-AAAAAAAAAA.html",
+        task / "INV-AAAAAAAAAA.yintian-form",
         task / "task.json",
         task / "state.sqlite3",
         task / "private.pem.enc",
@@ -109,7 +109,7 @@ def test_never_delete_set(tmp_path):
         assert path.exists(), f"用户数据被误删: {path}"
     kept = under(tmp_path, result["keep"])
     kept_names = {Path(item["path"]).name for item in kept}
-    for name in ("progress.xlsx", "roster.csv", "invite-index.csv", "INV-AAAAAAAAAA.html", "task.json",
+    for name in ("progress.xlsx", "roster.csv", "invite-index.csv", "INV-AAAAAAAAAA.yintian-form", "task.json",
                  "state.sqlite3", "private.pem.enc", "task.yintian-task", "received", "submissions"):
         assert name in kept_names, f"保留清单缺少: {name}"
 

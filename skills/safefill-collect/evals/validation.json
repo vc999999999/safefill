@@ -5,16 +5,15 @@
     "pytest": 168,
     "subtests": 17,
     "agent_request_to_excel": true,
-    "no_human_form_default": true,
+    "no_html_form_any_mode": true,
     "visible_name_filename": true,
     "attachment_export": true,
     "correction_reuses_invite": true,
     "encrypted_private_key": true,
     "encrypted_task_handoff": true,
-    "browser_contract": true,
     "skill_entrypoints_valid": 2,
-    "package_files": 49,
+    "package_files": 48,
     "package_integrity": true
   },
-  "scope": "Synthetic data; AI-to-AI yintian-request/1 with no human form, legacy yintian-form/3 read compatibility, two encrypted replies, readable names, attachment export, correction versioning, separated local key, encrypted handoff, bounded validation, and legacy regression suite."
+  "scope": "Synthetic data; AI-to-AI yintian-request/1, no HTML form generation in any mode, legacy yintian-form/3 read compatibility, two encrypted replies, readable names, attachment export, correction versioning, separated local key, encrypted handoff, bounded validation, and legacy regression suite."
 }

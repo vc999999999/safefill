@@ -1,9 +1,8 @@
-"""Reproducible synthetic CLI/GUI integration. Pauses for actual host vision + browser download.
+"""Reproducible synthetic CLI/GUI integration. Pauses for actual host vision.
 Run with Python 3.11 and --out OUT. No transcript or password is written to disk.
 """
 import argparse
 import base64
-import hashlib
 import importlib.util
 import io
 import json
@@ -100,12 +99,9 @@ def main():
     config['fields'] = [f for f in config['fields'] if f['id'] != 'id_back']
     group_config = {**config, 'fields': [{'id': 'employee_id', 'label': '工号', 'type': 'text', 'required': True}, *config['fields']]}
     secure_io.atomic_write(root / 'group-config.json', collection.canonical(group_config))
-    secure_io.atomic_write(root / 'directed-config.json', collection.canonical(config))
     secure_io.atomic_write(root / 'roster.csv', 'employee_id,name\nS001,合成甲\n'.encode())
     group, password = cli('hr', ['create', '--mode', 'group', '--roster', root / 'roster.csv', '--config', root / 'group-config.json', '--out', root / 'hr'], secret_heading='任务密码（仅显示一次，丢失不可恢复）：')
-    directed, directed_password = cli('hr', ['create', '--roster', root / 'roster.csv', '--config', root / 'directed-config.json', '--out', root / 'hr'], secret_heading='任务密码（仅显示一次，丢失不可恢复）：')
     task = Path(group['task_dir'])
-    browser_task = Path(directed['task_dir'])
     employee = root / 'employee'
     employee.mkdir(mode=0o700)
     form = employee / 'FORM.yintian-form'
@@ -139,16 +135,12 @@ def main():
         ('身份证号（输入隐藏', identity), ('住址（输入隐藏', address), ('身份证正面：输入文件路径', str(image_path)),
         ('不应提交的保险柜备注（输入隐藏', secret_note), ('输入 SAVE: ', 'SAVE')])
     record('create_and_vault_init', public_template=True, private_credential=True, extra_vault_field=True)
-    invite_html = next((browser_task / 'invites').glob('*.html'))
     ready = {'form': str(form), 'image': str(image_path), 'agent_result': str(employee / 'agent-result.json'),
-             'browser_html': str(invite_html), 'browser_download_dir': str(root / 'browser-download'),
-             'task_dir': str(task), 'browser_task_dir': str(browser_task),
-             'browser_synthetic_values': {'phone': phone, 'id_number': identity, 'address': address}}
-    (root / 'browser-download').mkdir(mode=0o700)
+             'task_dir': str(task)}
     secure_io.atomic_write(root / 'ready.json', collection.canonical(ready))
-    record('waiting_for_host_vision_and_browser', ready=str(root / 'ready.json'))
+    record('waiting_for_host_vision', ready=str(root / 'ready.json'))
     started = time.monotonic()
-    while not (employee / 'agent-result.json').exists() or not list((root / 'browser-download').glob('*.yintian')):
+    while not (employee / 'agent-result.json').exists():
         if time.monotonic() - started > 1800:
             raise AssertionError('EXTERNAL_SYNTHETIC_STEP_TIMEOUT')
         time.sleep(1)
@@ -187,19 +179,6 @@ def main():
     cli('hr', ['decide', task, 'GRP-S001', '--version', '2', '--action', 'return', '--operator', 'synthetic.hr'], [('任务密码: ', password), (f"输入任务 ID {info['task_id']}: ", info['task_id'])])
     assert cli('hr', ['review', task, '--retry-needs-review'], [('任务密码: ', password)]) == {'verified': 0, 'needs_review': 0, 'invalid': 0}
     record('resubmit_return_retry', newest_version=2, previous_approved=1, pending_export_rows=0, manual_resolution_preserved=True)
-    assert cli('hr', ['ingest', browser_task, root / 'browser-download'])['accepted'] == 1
-    assert cli('hr', ['review', browser_task], [('任务密码: ', directed_password)])['needs_review'] == 1
-    with collection.connect_db(browser_task) as db:
-        browser_invite = db.execute('SELECT invite_id FROM invites').fetchone()[0]
-    browser_info = collection.load_json(browser_task / 'task.json')
-    cli('hr', ['decide', browser_task, browser_invite, '--version', '1', '--action', 'confirm', '--operator', 'synthetic.hr'], [('任务密码: ', directed_password)], gui=True)
-    browser_export = cli('hr', ['export-clear', browser_task, '--fields', 'phone,id_number,address', '--out', root / 'browser-approved.xlsx', '--purpose', '合成浏览器测试', '--recipient', '合成HR'], [('任务密码: ', directed_password), ('以确认导出明文: ', browser_info['task_id'])])
-    assert browser_export['rows'] == 1
-    browser_book = load_workbook(browser_export['xlsx'], read_only=True)
-    browser_cells = list(browser_book.active.values)
-    browser_book.close()
-    assert phone in browser_cells[1] and identity in browser_cells[1] and address in browser_cells[1]
-    record('browser_download_python_decrypt_and_excel', actual_download=True, values_match=True, source='manual', rows=1)
     report = cli('hr', ['report', task])
     package, handoff = cli('hr', ['export-task', task, '--out', root / 'handoff.yintian-task'], secret_heading='交接密码（仅显示一次，丢失不可恢复）：')
     imported = cli('hr', ['import-task', root / 'handoff.yintian-task', '--out', root / 'imported'], [('交接密码: ', handoff)])
@@ -207,7 +186,7 @@ def main():
     # Scan non-sensitive boundaries. Original employee inputs and authorized clear exports are intentional.
     needles = [phone.encode(), identity.encode(), address.encode(), secret_note.encode(), password.encode(), vault_password.encode()]
     scanned = 0
-    for folder in (task, browser_task, root / 'incoming', root / 'imported'):
+    for folder in (task, root / 'incoming', root / 'imported'):
         for path in folder.rglob('*'):
             if not path.is_file():
                 continue

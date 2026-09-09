@@ -21,7 +21,7 @@ def build_package(out):
             if (base / name).is_file():
                 files[skill + '/' + name] = base / name
         for directory, patterns in {'scripts': ['*.py'], 'references': ['*.md'],
-                                    'assets': ['invite_template.html', 'mcp.example.json'],
+                                    'assets': ['mcp.example.json'],
                                     'agents': ['*.yaml']}.items():
             for pattern in patterns:
                 for path in (base / directory).glob(pattern):

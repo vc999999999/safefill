@@ -54,8 +54,8 @@ def test_verify_invites_all_valid(sample_task: Path) -> None:
 
 def test_verify_invites_missing_detected(sample_task: Path) -> None:
     # 模拟人为误删或遗漏某个邀请文件
-    first_html = next((sample_task / "invites").glob("*.html"))
-    first_html.unlink()
+    first_request = next((sample_task / "invites").glob("*.yintian-form"))
+    first_request.unlink()
 
     res = distribute.verify_invites(sample_task)
     assert res["total"] == 2
@@ -89,7 +89,7 @@ def test_verify_invites_rejects_traversal(sample_task: Path) -> None:
         writer.writerow(["E901", "王五", "INVA00000001", "../task.json"])
         writer.writerow(["E902", "赵六", "INVA00000002", "/etc/passwd"])
         writer.writerow(["E903", "孙七", "INVA00000003", "invites\\..\\task.json"])
-        writer.writerow(["E904", "周八", "INVA00000004", "other/INV-BBBBBBBBBB.html"])
+        writer.writerow(["E904", "周八", "INVA00000004", "other/INV-BBBBBBBBBB.yintian-form"])
         writer.writerow(["E905", "吴九", "INVA00000005", "invites/../task.json"])
     res = distribute.verify_invites(sample_task)
     assert res["total"] == 7
@@ -100,9 +100,10 @@ def test_verify_invites_rejects_traversal(sample_task: Path) -> None:
 
 
 def test_safe_invite_relpath_accepts_legit_forms() -> None:
-    assert distribute.safe_invite_relpath("INV-AAAAAAAAAA.html") == Path("INV-AAAAAAAAAA.html")
-    assert distribute.safe_invite_relpath("invites/INV-AAAAAAAAAA.html") == Path("invites/INV-AAAAAAAAAA.html")
-    for bad in ("", "../x", "a/../b", "/abs/x", "C:\\x", "invites\\x", "sub/x"):
+    assert distribute.safe_invite_relpath("INV-AAAAAAAAAA.yintian-form") == Path("INV-AAAAAAAAAA.yintian-form")
+    assert distribute.safe_invite_relpath("invites/INV-AAAAAAAAAA.yintian-form") == Path("invites/INV-AAAAAAAAAA.yintian-form")
+    assert distribute.safe_invite_relpath("FORM.yintian-form") == Path("FORM.yintian-form")
+    for bad in ("", "../x", "a/../b", "/abs/x", "C:\\x", "invites\\x", "sub/x", "INV-AAAAAAAAAA.html", "x.json"):
         assert distribute.safe_invite_relpath(bad) is None, bad
 
 
@@ -131,7 +132,7 @@ def test_out_csv_only_filenames_and_permissions(sample_task: Path) -> None:
     with out.open("r", encoding="utf-8-sig", newline="") as s:
         rows = list(csv.DictReader(s))
     assert "invite_path" not in rows[0], "落盘 CSV 不应再有 invite_path 绝对路径列"
-    assert all("/" not in row["invite_file"] and row["invite_file"].endswith(".html") for row in rows)
+    assert all("/" not in row["invite_file"] and row["invite_file"].endswith(".yintian-form") for row in rows)
     if os.name != "nt":
         assert (out.stat().st_mode & 0o777) == 0o600, "导出 CSV 权限应为 0600"
 

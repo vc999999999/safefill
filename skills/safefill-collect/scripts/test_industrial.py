@@ -69,7 +69,7 @@ class IndustrialTests(unittest.TestCase):
         outside.mkdir()
         (self.root / 'link').symlink_to(outside, target_is_directory=True)
         messages = [{'employee_id': '=1+1', 'name': '+cmd', 'invite_id': 'INV-AAAAAAAAAA',
-                     'invite_path': 'INV-AAAAAAAAAA.html', 'message': 'test'}]
+                     'invite_path': 'INV-AAAAAAAAAA.yintian-form', 'message': 'test'}]
         with self.assertRaisesRegex(RuntimeError, 'PATH_UNSAFE'):
             distribute.export_messages_csv(messages, str(self.root / 'link' / 'out.csv'))
         self.assertFalse((outside / 'out.csv').exists())
