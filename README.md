@@ -15,6 +15,36 @@ SafeFill 是一个面向多人私密资料收集的双 Skill 集合仓库。收�
 
 `skills/` 下的两个目录都是独立 Skill。收集者和填写者可以在不同设备上只安装自己需要的一端；开发、回归测试和组合打包时，两个目录需保持同级。
 
+## 最佳使用方式：云端协调，本地处理
+
+SafeFill 不是把 `safefill-collect` 固定在云端、把 `safefill-fill` 固定在本地。Skill 是工作规则，真正使用云端还是本地大模型，取决于安装它的 Agent。当前项目没有捆绑本地大语言模型；本地模型主要指 RapidOCR/OpenVINO，密码、加密、格式和身份校验则由确定性 Python 完成。
+
+推荐采用下面的混合架构：
+
+| 位置 | 适合处理 | 不应处理 |
+|---|---|---|
+| 云端或宿主 Agent | 理解用途、选择流程、准备字段配置、调用文档 Skill、协助分发和解释进度 | 密码、私钥、保险柜内容、原始附件、填写明文和明文 Excel |
+| HR 本地程序 | 创建任务密钥、解密复核、OpenVINO OCR、人工确认和白名单 Excel 导出 | 未获授权的任务或接收方 |
+| 员工本地程序 | 解锁本人保险柜、匹配本次字段、可选本地 OCR、本人确认和加密提交 | 未请求字段和未明确指定的本地资料 |
+
+### `safefill-collect`：推荐云端协调、本地复核
+
+使用云端 Agent 时，让它处理收集用途、字段、期限、公开联系方式、分发步骤和最小化状态；密钥解锁、明文复核、原始附件查看及 Excel 导出仍由 HR 在未被 Agent 控制或录制的本地终端完成。收集端的本地 OCR 支持通过 OpenVINO 选择 `CPU/GPU/NPU/AUTO`，也保留 INT8 量化与模型目录入口。
+
+`safefill-collect` 也可以安装到支持 Skills 和本地脚本调用的本地 Agent 上，但本仓库不提供或启动本地大语言模型。如果姓名、工号、名单和催办状态也不能进入云端，应使用本地 Agent，或只让云端 Agent 接收匿名计数；当前权限设计允许 HR Agent 在授权范围内处理这些名单级信息，但始终不允许它取得解密权限。
+
+### `safefill-fill`：核心填写闭环可完全离线
+
+填写者可以不使用任何大语言模型，直接在本人电脑完成：检查模板、解锁保险柜、匹配资料、确认内容、加密并生成提交。需要识别证件时，可选安装 RapidOCR/OpenVINO 在本地运行；不安装 OCR 也可以手工填写。
+
+如果 `safefill-fill` 安装在云端 Agent 中，Agent 推理本身仍发生在云端，但保险柜、密码和填写明文不会交给 Agent。只有填写者在看图前明确授权“宿主 Agent 识别”时，指定原始附件才会由宿主处理；要保持全程本地，就使用本地 OCR 或手工填写，不启用这个云端补位入口。
+
+因此更准确的项目表述是：
+
+> `safefill-fill` 的敏感填写闭环可完全离线执行；`safefill-collect` 采用 Agent 协调、本地 Python 与 OpenVINO 处理敏感数据的混合架构。当前本地模型用于 OCR，而不是本地大语言模型。
+
+当前填写端的 `scan-idcard` 已使用本地 RapidOCR/OpenVINO，但尚未复用收集端的异构设备选择和 INT8 模型路径。模型分工、授权回退和已验证范围见[识别说明](skills/safefill-collect/references/recognition.md)、[隐私边界](skills/safefill-collect/references/privacy-extraction-workflow.md)与[验证记录](skills/safefill-collect/references/validation.md)。
+
 ## 工作流程
 
 ```text
