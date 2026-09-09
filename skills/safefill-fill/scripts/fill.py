@@ -937,6 +937,120 @@ def cmd_vlm_setup(args) -> dict[str, Any]:
         raise FillError(str(exc)) from exc
 
 
+def _importable(module: str) -> bool:
+    try:
+        __import__(module)
+        return True
+    except Exception:
+        return False
+
+
+def _ocr_report() -> dict[str, Any]:
+    install_hint = "pip install -r requirements-ocr.txt"
+    rapidocr_ok = _importable("rapidocr_openvino")
+    openvino_ok = _importable("openvino")
+    devices: list[str] = []
+    details: list[str] = []
+    if openvino_ok:
+        try:
+            from openvino import Core
+
+            devices = sorted(str(device) for device in Core().available_devices)
+        except Exception:
+            details.append("OpenVINO 设备探测失败")
+    try:
+        import config
+
+        configured = config.OCR_DEVICE
+    except Exception:
+        configured = "AUTO"
+        details.append("YINTIAN_OCR_DEVICE 配置无效，按 AUTO 处理")
+    # openvino 缺失时无法探测设备，device_ok 置 True 表示"不适用"，避免误报设备不匹配
+    device_ok = configured == "AUTO" or not openvino_ok or configured in devices
+    missing = [name for name, available in (("rapidocr_openvino", rapidocr_ok), ("openvino", openvino_ok)) if not available]
+    if missing:
+        details.insert(0, "缺少模块: " + ", ".join(missing))
+    if devices:
+        details.append("可用设备: " + ", ".join(devices))
+    if configured != "AUTO" and devices and configured not in devices:
+        details.append(f"配置的 OCR 设备 {configured} 不在可用设备中")
+    if not details:
+        details.append(f"OCR 本地推理可用（设备配置 {configured}）")
+    return {"ok": not missing, "detail": "；".join(details), "install_hint": install_hint if missing else None,
+            "devices": devices, "device_ok": device_ok}
+
+
+def _vlm_report() -> dict[str, Any]:
+    install_hint = "在独立环境 pip install -r requirements-vlm.txt 后运行 vlm-setup --model MODEL"
+    missing = [name for name in ("openvino", "openvino_genai", "huggingface_hub") if not _importable(name)]
+    models: list[str] = []
+    try:
+        import vlm_extract
+
+        root = vlm_extract.model_root()
+        if root.is_dir():
+            models = sorted(path.name for path in root.iterdir() if (path / vlm_extract.MANIFEST_NAME).is_file())
+    except Exception:
+        pass
+    if missing:
+        detail = "缺少模块: " + ", ".join(missing)
+    else:
+        detail = "VLM 依赖可用；已下载模型: " + (", ".join(models) if models else "无")
+    return {"ok": not missing, "detail": detail, "install_hint": install_hint if missing else None, "models": models}
+
+
+def _storage_report(args) -> dict[str, Any]:
+    vault_override = getattr(args, "vault", None)
+    key_override = getattr(args, "key_file", None)
+    if bool(vault_override) != bool(key_override):
+        return {"ok": False, "detail": "自定义 --vault 必须同时提供 --key-file", "install_hint": None}
+    try:
+        if vault_override:
+            vault_path, key_path = secure_io.checked_path(vault_override), secure_io.checked_path(key_override)
+            if vault_path == key_path:
+                return {"ok": False, "detail": "保险柜与密钥路径必须不同", "install_hint": None}
+        else:
+            vault_path, key_path = vault.default_vault_path(), vault.default_key_path()
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "detail": f"无法解析保险柜路径: {exc}", "install_hint": None}
+    problems: list[str] = []
+    if os.name != "nt":
+        for path, what in ((vault_path, "保险柜"), (key_path, "密钥")):
+            if path.is_file() and stat.S_IMODE(path.stat().st_mode) & 0o077:
+                problems.append(f"{what}权限宽于 0600: {path}")
+            if path.parent.is_dir() and stat.S_IMODE(path.parent.stat().st_mode) & 0o077:
+                problems.append(f"{what}目录权限宽于 0700: {path.parent}")
+    if problems:
+        return {"ok": False, "detail": "；".join(problems), "install_hint": None}
+    state = "已就绪" if vault_path.is_file() else "尚未创建（首次写入时自动创建）"
+    return {"ok": True, "detail": f"保险柜{state}: {vault_path}", "install_hint": None}
+
+
+def _environment_report(args) -> dict[str, Any]:
+    python_ok = sys.version_info >= (3, 11)
+    core_missing = [name for name in ("cryptography", "PIL") if not _importable(name)]
+    return {
+        "python": {
+            "ok": python_ok,
+            "detail": f"Python {sys.version.split()[0]}",
+            "install_hint": None if python_ok else "安装 Python 3.11 或更高版本",
+        },
+        "core": {
+            "ok": not core_missing,
+            "detail": "核心依赖可用" if not core_missing else "缺少模块: " + ", ".join(core_missing),
+            "install_hint": "pip install -r requirements.txt" if core_missing else None,
+        },
+        "ocr": _ocr_report(),
+        "vlm": _vlm_report(),
+        "storage": _storage_report(args),
+    }
+
+
+def cmd_doctor(args) -> dict[str, Any]:
+    """只读环境检测：不联网、不写盘、不创建任何目录或文件。"""
+    return _environment_report(args)
+
+
 def _add_storage_args(parser) -> None:
     parser.add_argument("--vault", help="覆盖默认保险柜路径；必须同时提供 --key-file")
     parser.add_argument("--key-file", help="覆盖默认保险柜密钥路径；必须同时提供 --vault")
@@ -945,6 +1059,9 @@ def _add_storage_args(parser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SafeFill · 填写端：本机填写需求格式文件并产出 .yintian 密文")
     sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("doctor", help="只读检查 Python、核心/OCR/VLM 依赖与保险柜存储状态（不联网、不写盘）")
+    _add_storage_args(p)
+    p.set_defaults(func=cmd_doctor)
     p = sub.add_parser("inspect", help="查看需求格式文件的告知内容、字段清单与公钥指纹（不修改文件）")
     p.add_argument("form", metavar="REQUEST.yintian-request")
     p.set_defaults(func=cmd_inspect)

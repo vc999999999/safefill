@@ -179,3 +179,51 @@ def test_vlm_setup_uses_the_model_selected_by_user(tmp_path, monkeypatch):
     result = vlm_extract.setup("any-compatible/model")
     assert calls[0]["repo_id"] == "any-compatible/model" and "revision" not in calls[0]
     assert vlm_extract.verify_model("any-compatible/model", target=Path(result["path"]))
+
+
+def test_doctor_core_ok_shape():
+    report = run(["doctor"])
+    assert set(report) == {"python", "core", "ocr", "vlm", "storage"}
+    for item in report.values():
+        assert isinstance(item["ok"], bool) and isinstance(item["detail"], str)
+        assert item["install_hint"] is None or isinstance(item["install_hint"], str)
+    assert report["python"]["ok"] is True
+    assert report["core"]["ok"] is True
+    assert isinstance(report["ocr"]["devices"], list) and isinstance(report["ocr"]["device_ok"], bool)
+
+
+def test_doctor_reports_missing_ocr_and_device_mismatch(monkeypatch):
+    import config
+
+    monkeypatch.setitem(sys.modules, "rapidocr_openvino", None)
+    monkeypatch.setitem(sys.modules, "openvino", None)
+    report = run(["doctor"])
+    assert report["ocr"]["ok"] is False
+    assert "requirements-ocr.txt" in report["ocr"]["install_hint"]
+
+    fake_openvino = types.SimpleNamespace(Core=lambda: types.SimpleNamespace(available_devices=["CPU"]))
+    monkeypatch.setitem(sys.modules, "openvino", fake_openvino)
+    monkeypatch.setattr(config, "OCR_DEVICE", "GPU")
+    report = run(["doctor"])
+    assert report["ocr"]["devices"] == ["CPU"]
+    assert report["ocr"]["device_ok"] is False
+    assert "GPU" in report["ocr"]["detail"]
+
+
+def test_doctor_device_ok_not_applicable_when_openvino_missing(monkeypatch):
+    import config
+
+    monkeypatch.setitem(sys.modules, "openvino", None)
+    monkeypatch.setattr(config, "OCR_DEVICE", "GPU")
+    report = run(["doctor"])
+    assert report["ocr"]["ok"] is False
+    assert report["ocr"]["device_ok"] is True  # 依赖缺失时设备匹配不适用，不误报
+
+
+def test_doctor_storage_overrides(tmp_path):
+    report = run(["doctor", "--vault", str(tmp_path / "v.yintian-vault")])
+    assert report["storage"]["ok"] is False  # 只给 --vault 不给 --key-file
+    custom_vault = tmp_path / "custom" / "v.yintian-vault"
+    report = run(["doctor", "--vault", str(custom_vault), "--key-file", str(tmp_path / "custom" / "k.key")])
+    assert report["storage"]["ok"] is True
+    assert str(custom_vault) in report["storage"]["detail"]
