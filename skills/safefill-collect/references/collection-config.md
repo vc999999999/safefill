@@ -1,64 +1,18 @@
-# 收集配置与名单格式
+# 开放收集配置
 
-## 名单 CSV
+默认使用 `open`：一份公共 `FORM.yintian-form`，不需要名单或个人凭据。姓名是模板中的必填字段，由员工通过 `safefill-fill` 填入加密载荷，收集端解密后写入 Excel。
 
-名单必须包含 `employee_id,name` 两列，工号在任务内唯一：
+## HR 需要说明的内容
 
-```csv
-employee_id,name
-E001,张三
-E002,李四
-```
+- `purpose`：为何收集；
+- `fields`：要哪些信息、是否必填；
+- `deadline`：截止时间；
+- `contact`：联系人及联系方式。
 
-## 收集配置
+Agent 自动补齐：`title` 从用途概括，`name` 设为必填，`retention_until` 默认为截止后 30 天，`correction` 默认为联系任务联系人后重新提交，`template_version` 为 `1.0`。
 
-`collection.py init-config` 生成模板后必须逐项改为真实、具体的内容：
+字段 id 使用小写英文和下划线。支持：`text`、`phone_cn`、`cn_id`、`date`、`address`、`single_choice`、`image_attachment`、`pdf_attachment`。单选字段必须提供不重复的 `options`。附件不会嵌入 Excel，而是解密到同名附件目录，Excel 单元格保存相对路径。字段有确定格式时使用对应类型，不要全部降级成 `text`。
 
-- `purpose`：收集用途；
-- `deadline`：截止时间，过期提交只标记为 late，不拒收；
-- `retention_until`：保存期限，到期后任务停止接收、复核、报告、导出和查看；
-- `contact`：联系人；
-- `correction`：更正方式。
+默认附件配置 `ocr_fields: []`，避免普通材料收集因 OCR 环境或误识别而阻塞。只有 HR 明确要求附件内容与某些字段自动比对时，才把这些标量字段 id 写入 `ocr_fields`；无法确定性通过的回执会被排除，不能自动放行。
 
-配置和告知文案会计算哈希并绑定进每份提交；提交后修改配置不会溯及已收密文，只会触发复核标记。
-
-## 创建模式
-
-| 模式 | 模板与凭据 | 提交 |
-|---|---|---|
-| directed（默认） | 个人 HTML/JSON 内含随机令牌，私下发放 | 保留 v2；解密时检查令牌 |
-| group | 公共 JSON 发群，个人凭据分别私下发放 | v3；收件前验证 HMAC，解密后核对令牌与名单 |
-
-group 必须含 `employee_id` 和 `name` 字段。公共 `FORM.yintian-form` 不含个人名单或令牌。数据库认证摘要同时作为 HMAC 密钥材料，仍属私密凭据，Agent 不应读取数据库文件。
-
-## 字段类型
-
-内置模板收集姓名、手机号、身份证号、住址和身份证正反面照片。自定义字段只允许确定性校验类型：
-
-| 类型 | 说明 |
-| --- | --- |
-| `text` | 自由文本 |
-| `phone_cn` | 中国大陆手机号，归一化后正则校验 |
-| `cn_id` | 身份证号，按 GB 11643 校验日期和校验码 |
-| `date` | `YYYY-MM-DD`，严格日期校验 |
-| `address` | 住址，多行文本 |
-| `single_choice` | 单选，需提供 `options` |
-| `image_attachment` | JPG/PNG/WebP 图片附件 |
-| `pdf_attachment` | PDF 附件，扫描件会渲染后 OCR |
-
-附件单文件最大 5 MB、每份提交合计最大 15 MB、`.yintian` 信封最大 32 MB，PDF 最多渲染 20 页。字段 id 必须匹配 `^[a-z][a-z0-9_]{1,63}$`，且必须保留 `name` 字段。
-
-## OCR 证据绑定
-
-附件字段的 `ocr_fields` 显式列出需要对照的表单字段 id，参与字段哈希，例如：
-
-```json
-{"id":"id_front","label":"身份证正面","type":"image_attachment","required":true,
- "ocr_fields":["name","id_number","address"]}
-```
-
-字段须存在且为非附件类型。正面默认绑定姓名、证件号、住址，不要求身份证里有手机号。默认反面只收附件，`ocr_fields: []` 表示未要求 OCR 字段验证；如业务要核验签发机关/有效期，应增加相应表单字段并显式绑定，不支持自动提取的字段进入人工确认，不宣称已自动核验。
-
-旧邀请字段与哈希不改写：旧 `front` 附件推导姓名、证件号、住址；旧 `back` 不将正面字段套到反面。普通附件不被误判为身份证。缺证据、无效候选、多候选、低质量或内容冲突不能自动通过。
-
-人工确认只裁定 OCR 证据，硬性输入校验和身份认证不能例外通过。修改已发出任务字段会令旧模板不匹配，应创建新任务，不就地改模板哈希。
+开放模板只保证内容对非收集方保密，身份为员工自报。员工更正时必须带本人上一次 `.yintian`，以沿用随机回执编号；否则会形成新记录。HR 明确要求“只有预先指定员工可提交”或“提交必须绑定工号”时，才使用兼容的 `group` 模式；该模式需要 `employee_id,name` 名单和逐人凭据。

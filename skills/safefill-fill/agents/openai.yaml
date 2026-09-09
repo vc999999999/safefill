@@ -1,4 +1,4 @@
 interface:
   display_name: "SafeFill · 填写者"
-  short_description: "本地保险柜填写、可选 Agent 识别、本人确认后加密提交"
-  default_prompt: "Use $safefill-fill to inspect my collection template and guide me through local vault filling without exposing my private values or password."
+  short_description: "对话补齐本人资料并生成加密回执，无需终端"
+  default_prompt: "使用 $safefill-fill：检查这份模板，只一次问齐缺失字段，生成姓名可读但内容加密的回执，不让我运行终端。"

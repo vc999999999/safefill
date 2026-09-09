@@ -1,4 +1,4 @@
 interface:
   display_name: "SafeFill · 收集者"
-  short_description: "群发模板与个人凭据、加密收件、本地复核和已通过信息的 Excel 汇总"
-  default_prompt: "Use $safefill-collect to manage encrypted employee collection and hand private review and Excel export to the authorized local operator."
+  short_description: "对话生成无名单加密模板，收件后直接汇总 Excel"
+  default_prompt: "使用 $safefill-collect：只补问我尚未说明的收集需求，生成无需名单的员工模板；收到加密回执后直接汇总 Excel 和附件，不让我运行终端。"

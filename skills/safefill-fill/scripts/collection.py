@@ -20,7 +20,7 @@ import tempfile
 import unicodedata
 import zipfile
 from contextlib import closing, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -29,6 +29,7 @@ import evidence_routing
 
 FORMAT_VERSION = "yintian-submission/2"
 GROUP_FORMAT_VERSION = "yintian-submission/3"
+OPEN_FORMAT_VERSION = "yintian-submission/4"
 AUTH_VERSION = "hmac-sha256-token/1"
 CREDENTIAL_FORMAT = "yintian-credential/1"
 DB_VERSION = 1
@@ -38,8 +39,10 @@ TASK_PACKAGE_VERSION = "yintian-task/2"
 ENCRYPTED_TASK_PACKAGE_VERSION = "yintian-task/3"
 KEY_ENVELOPE_VERSION = "yintian-key/1"
 FORM_FORMAT_VERSION = "yintian-form/1"
+OPEN_FORM_FORMAT_VERSION = "yintian-form/3"
 GROUP_INVITE_PREFIX = "GRP-"
-TASK_MODES = {"directed", "group"}
+OPEN_INVITE_PREFIX = "OPEN-"
+TASK_MODES = {"directed", "group", "open"}
 MASK_RULES = {"last4", "mid4"}
 LEGACY_KEY_PEM_PREFIX = b"-----BEGIN ENCRYPTED PRIVATE KEY-----"
 SCRYPT_N = 2**15
@@ -58,6 +61,12 @@ MAX_PACKAGE_FILES = 20_000
 MAX_PACKAGE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_PACKAGE_MEMBER_BYTES = 128 * 1024 * 1024
 MAX_IMAGE_PIXELS = int(os.getenv("YINTIAN_MAX_IMAGE_PIXELS", "40000000"))
+MAX_FIELDS = 100
+MAX_LABEL_CHARS = 200
+MAX_VALUE_CHARS = 10_000
+MAX_NAME_CHARS = 200
+MAX_OPTIONS = 100
+MAX_ATTACHMENTS = 60
 
 
 def positive_int_env(name: str, default: int) -> int:
@@ -69,9 +78,13 @@ def positive_int_env(name: str, default: int) -> int:
 
 
 MAX_VERSIONS_PER_INVITE = positive_int_env("YINTIAN_MAX_VERSIONS_PER_INVITE", 10)
+MAX_OPEN_INVITES = positive_int_env("YINTIAN_MAX_OPEN_INVITES", 10_000)
+MAX_TASK_SUBMISSION_BYTES = positive_int_env("YINTIAN_MAX_TASK_SUBMISSION_BYTES", 1024 * 1024 * 1024)
 TASK_ID_RE = re.compile(r"^YT-[0-9]{8}-[A-Z0-9]{6}$")
 INVITE_ID_RE = re.compile(r"^INV-[A-Z0-9]{10}$")
+OPEN_INVITE_ID_RE = re.compile(r"^OPEN-[A-Z0-9]{16}$")
 FIELD_ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+ILLEGAL_XML_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
 
 def now_iso() -> str:
@@ -80,6 +93,14 @@ def now_iso() -> str:
 
 def terminal_text(value):
     return ''.join(char if unicodedata.category(char) not in {'Cc', 'Cf'} else ' ' for char in str(value))
+
+
+def safe_filename_component(value: Any, fallback: str = "item", max_chars: int = 60, max_bytes: int = 120) -> str:
+    text = unicodedata.normalize("NFKC", terminal_text(value))
+    text = re.sub(r'[<>:"/\\|?*]+', "_", text).strip(" ._")[:max_chars].strip(" ._")
+    while len(text.encode("utf-8")) > max_bytes:
+        text = text[:-1]
+    return text or fallback
 
 
 def parse_time(value: str) -> datetime:
@@ -188,22 +209,32 @@ def load_task(task_dir: str | Path) -> tuple[Path, dict[str, Any]]:
     if not task_path.is_file():
         raise FileNotFoundError(f"不是有效任务目录: {root}")
     task = load_json(task_path)
-    if not TASK_ID_RE.fullmatch(task.get("task_id", "")):
+    if not isinstance(task, dict) or not TASK_ID_RE.fullmatch(task.get("task_id", "")):
         raise ValueError("task.json 中的 task_id 无效")
-    if task.get("format_version") not in {LEGACY_FORMAT_VERSION, FORMAT_VERSION, GROUP_FORMAT_VERSION}:
+    if task.get("format_version") not in {LEGACY_FORMAT_VERSION, FORMAT_VERSION, GROUP_FORMAT_VERSION, OPEN_FORMAT_VERSION}:
         raise ValueError("任务格式版本不受支持")
     if task.get("mode", "directed") not in TASK_MODES:
         raise ValueError("task.json 中的 mode 无效")
     if task.get("format_version") == GROUP_FORMAT_VERSION and (task_mode(task) != "group" or task.get("submission_auth") != AUTH_VERSION):
         raise ValueError("GROUP_AUTH_REQUIRED: 群发任务缺少认证配置")
+    if task.get("format_version") == OPEN_FORMAT_VERSION and task_mode(task) != "open":
+        raise ValueError("开放模板任务格式与 mode 不匹配")
+    if task_mode(task) == "open" and task.get("format_version") != OPEN_FORMAT_VERSION:
+        raise ValueError("开放模板任务必须使用当前开放协议")
     required = ("key_id", "title", "purpose", "deadline", "retention_until", "contact", "correction", "template_version", "schema_hash", "notice_hash", "fields")
     if any(key not in task for key in required) or not isinstance(task["fields"], list):
         raise ValueError("task.json 缺少必要配置")
+    for key in ("title", "purpose", "deadline", "retention_until", "contact", "correction", "template_version"):
+        if not isinstance(task[key], str) or not task[key] or len(task[key]) > MAX_VALUE_CHARS:
+            raise ValueError(f"task.json 文本字段无效: {key}")
+    if not isinstance(task["key_id"], str) or not re.fullmatch(r"[0-9a-f]{24}", task["key_id"]) or any(not isinstance(task[key], str) or not re.fullmatch(r"[0-9a-f]{64}", task[key]) for key in ("schema_hash", "notice_hash")):
+        raise ValueError("task.json 公钥或摘要标识无效")
     if parse_time(task["retention_until"]) <= parse_time(task["deadline"]):
         raise ValueError("task.json 保存期限无效")
+    if validate_field_definitions(task["fields"], task_mode(task)) != task["fields"]:
+        raise ValueError("task.json 字段模板未规范化")
     if sha256_bytes(canonical(task["fields"])) != task["schema_hash"]:
         raise ValueError("task.json 字段模板哈希不匹配")
-    evidence_routing.validate_fields(task["fields"])
     notice = {key: task[key] for key in ("title", "purpose", "deadline", "retention_until", "contact", "correction")}
     if sha256_bytes(canonical(notice)) != task["notice_hash"]:
         raise ValueError("task.json 告知内容哈希不匹配")
@@ -211,7 +242,7 @@ def load_task(task_dir: str | Path) -> tuple[Path, dict[str, Any]]:
 
 
 def require_current_format(task: dict[str, Any], action: str) -> None:
-    if task["format_version"] not in {FORMAT_VERSION, GROUP_FORMAT_VERSION}:
+    if task["format_version"] not in {FORMAT_VERSION, GROUP_FORMAT_VERSION, OPEN_FORMAT_VERSION}:
         raise RuntimeError(f"旧版任务不支持{action}；请新建 v2 任务继续收集")
     if task_mode(task) == "group" and task.get("format_version") != GROUP_FORMAT_VERSION:
         raise RuntimeError("GROUP_AUTH_REQUIRED: 旧群发任务没有个人认证，保留只读；请新建群发任务")
@@ -226,6 +257,8 @@ def valid_invite_identifier(value):
     if not isinstance(value, str):
         return False
     if INVITE_ID_RE.fullmatch(value):
+        return True
+    if OPEN_INVITE_ID_RE.fullmatch(value):
         return True
     try:
         parse_group_employee_id(value)
@@ -385,11 +418,12 @@ def cmd_doctor(args):
 
 
 def default_config() -> dict[str, Any]:
+    deadline = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=30)
     return {
         "title": "基础身份信息收集",
         "purpose": "请填写本次工作所需的基础身份信息。请将用途修改为具体、必要的业务目的。",
-        "deadline": "2026-12-31T23:59:59+08:00",
-        "retention_until": "2027-01-31T23:59:59+08:00",
+        "deadline": deadline.isoformat().replace("+00:00", "Z"),
+        "retention_until": (deadline + timedelta(days=30)).isoformat().replace("+00:00", "Z"),
         "contact": "请填写联系人和联系方式",
         "correction": "如需更正，请联系任务发起人并使用原邀请重新提交。",
         "template_version": "1.0",
@@ -404,12 +438,68 @@ def default_config() -> dict[str, Any]:
     }
 
 
+def validate_field_definitions(raw_fields: Any, mode: str) -> list[dict[str, Any]]:
+    if mode not in TASK_MODES:
+        raise ValueError("字段定义的任务模式无效")
+    if not isinstance(raw_fields, list) or not (1 <= len(raw_fields) <= MAX_FIELDS):
+        raise ValueError(f"fields 必须包含 1 到 {MAX_FIELDS} 个字段")
+    seen, labels, fields = set(), set(), []
+    for raw in raw_fields:
+        if not isinstance(raw, dict):
+            raise ValueError("每个字段定义必须是对象")
+        field = dict(raw)
+        field_id, field_type = field.get("id", ""), field.get("type", "")
+        if not isinstance(field_id, str) or not FIELD_ID_RE.fullmatch(field_id) or field_id in seen:
+            raise ValueError(f"字段 id 无效或重复: {field_id}")
+        if field_type not in ALLOWED_TYPES:
+            raise ValueError(f"不支持的字段类型: {field_type}")
+        if not isinstance(field.get("label"), str) or not field["label"] or len(field["label"]) > MAX_LABEL_CHARS or ILLEGAL_XML_RE.search(field["label"]):
+            raise ValueError(f"字段缺少 label: {field_id}")
+        if field["label"] in labels:
+            raise ValueError(f"字段 label 重复: {field['label']}")
+        if any(key in field and not isinstance(field[key], bool) for key in ("required", "sensitive")):
+            raise ValueError(f"字段 required/sensitive 必须是布尔值: {field_id}")
+        if field_type == "single_choice":
+            options = field.get("options")
+            if not isinstance(options, list) or not (1 <= len(options) <= MAX_OPTIONS) or any(not isinstance(value, str) or not value or len(value) > MAX_LABEL_CHARS or ILLEGAL_XML_RE.search(value) for value in options) or len(set(options)) != len(options):
+                raise ValueError(f"单选字段 options 无效: {field_id}")
+        elif "options" in field:
+            raise ValueError(f"非单选字段不能包含 options: {field_id}")
+        if "multiple" in field and (field_type not in ATTACHMENT_TYPES or not isinstance(field["multiple"], bool)):
+            raise ValueError(f"multiple 只允许附件字段使用布尔值: {field_id}")
+        field["required"] = bool(field.get("required"))
+        field["sensitive"] = bool(field.get("sensitive", field_type in {"phone_cn", "cn_id", "address"} or field_type in ATTACHMENT_TYPES))
+        if field_type in ATTACHMENT_TYPES:
+            field["multiple"] = bool(field.get("multiple", False))
+        fields.append(field)
+        seen.add(field_id)
+        labels.add(field["label"])
+    definitions = {field["id"]: field for field in fields}
+    if definitions.get("name", {}).get("type") != "text" or definitions["name"].get("required") is not True:
+        raise ValueError("任务字段必须包含必填 text 字段 id=name")
+    if mode == "group" and (definitions.get("employee_id", {}).get("type") != "text" or definitions["employee_id"].get("required") is not True):
+        raise ValueError("group 模式必须包含必填 text 字段 id=employee_id")
+    scalar_fields = {field["id"] for field in fields if field["type"] not in ATTACHMENT_TYPES}
+    for field in fields:
+        if "ocr_fields" in field:
+            bindings = field["ocr_fields"]
+            if field["type"] not in ATTACHMENT_TYPES or not isinstance(bindings, list) or any(not isinstance(key, str) or key not in scalar_fields for key in bindings) or len(set(bindings)) != len(bindings):
+                raise ValueError("OCR_BINDING_INVALID: ocr_fields 必须引用不重复的表单值字段")
+    evidence_routing.validate_fields(fields)
+    return fields
+
+
 def validate_config(config: dict[str, Any], mode: str = "directed") -> dict[str, Any]:
     if mode not in TASK_MODES:
-        raise ValueError("mode 必须是 directed 或 group")
+        raise ValueError("mode 必须是 directed、group 或 open")
+    if not isinstance(config, dict):
+        raise ValueError("配置必须是 JSON 对象")
     for key in ("title", "purpose", "deadline", "retention_until", "contact", "correction", "template_version", "fields"):
         if not config.get(key):
             raise ValueError(f"配置缺少必填项: {key}")
+    for key in ("title", "purpose", "deadline", "retention_until", "contact", "correction", "template_version"):
+        if not isinstance(config[key], str) or len(config[key]) > MAX_VALUE_CHARS:
+            raise ValueError(f"配置字段必须是长度不超过 {MAX_VALUE_CHARS} 的文本: {key}")
     deadline, retention = parse_time(config["deadline"]), parse_time(config["retention_until"])
     if deadline <= datetime.now(timezone.utc):
         raise ValueError("deadline 必须晚于当前时间")
@@ -419,42 +509,13 @@ def validate_config(config: dict[str, Any], mode: str = "directed") -> dict[str,
     for key in ("purpose", "contact", "correction"):
         if config[key] == defaults[key]:
             raise ValueError(f"请先把 {key} 的占位内容改为真实、具体的信息")
-    seen = set()
-    fields = []
-    for raw in config["fields"]:
-        field = dict(raw)
-        field_id, field_type = field.get("id", ""), field.get("type", "")
-        if not FIELD_ID_RE.fullmatch(field_id) or field_id in seen:
-            raise ValueError(f"字段 id 无效或重复: {field_id}")
-        if field_type not in ALLOWED_TYPES:
-            raise ValueError(f"不支持的字段类型: {field_type}")
-        if not field.get("label"):
-            raise ValueError(f"字段缺少 label: {field_id}")
-        if field_type == "single_choice" and not field.get("options"):
-            raise ValueError(f"单选字段缺少 options: {field_id}")
-        field["required"] = bool(field.get("required"))
-        field["sensitive"] = bool(field.get("sensitive", field_type in {"phone_cn", "cn_id", "address"} or field_type in ATTACHMENT_TYPES))
-        if field_type in ATTACHMENT_TYPES:
-            field["multiple"] = bool(field.get("multiple", False))
-        fields.append(field)
-        seen.add(field_id)
-    if "name" not in seen:
-        raise ValueError("任务字段必须包含 id=name 的姓名字段")
-    if mode == "group" and "employee_id" not in seen:
-        raise ValueError("group 模式任务字段必须包含 id=employee_id 的工号字段（个人凭据及名单共同校验身份）")
-    scalar_fields = {field["id"] for field in fields if field["type"] not in ATTACHMENT_TYPES}
-    for field in fields:
-        if "ocr_fields" in field:
-            bindings = field["ocr_fields"]
-            if field["type"] not in ATTACHMENT_TYPES or not isinstance(bindings, list) or any(not isinstance(k, str) or k not in scalar_fields for k in bindings) or len(set(bindings)) != len(bindings):
-                raise ValueError("OCR_BINDING_INVALID: ocr_fields 必须引用不重复的表单值字段")
-    evidence_routing.validate_fields(fields)
+    fields = validate_field_definitions(config["fields"], mode)
     result = dict(config)
     result["fields"] = fields
     return result
 
 
-def read_roster(path: Path) -> list[dict[str, str]]:
+def read_roster(path: Path, *, allow_empty: bool = False) -> list[dict[str, str]]:
     with io.StringIO(secure_io.read_bytes(path).decode("utf-8-sig"), newline="") as stream:
         reader = csv.DictReader(stream)
         if not reader.fieldnames or not {"employee_id", "name"}.issubset(reader.fieldnames):
@@ -469,7 +530,7 @@ def read_roster(path: Path) -> list[dict[str, str]]:
                 raise ValueError(f"名单 employee_id 重复: {employee_id}")
             ids.add(employee_id)
             rows.append({"employee_id": employee_id, "name": name})
-    if not rows:
+    if not rows and not allow_empty:
         raise ValueError("名单为空")
     return rows
 
@@ -561,6 +622,29 @@ def generate_keys(password: str) -> tuple[bytes, bytes, str]:
     return public_pem, encrypt_private_key(private_der, password), hashlib.sha256(public_der).hexdigest()[:24]
 
 
+def local_task_secret_path(root: Path, task_id: str) -> Path:
+    return secure_io.checked_path(root.parent / ".safefill-keys" / f"{task_id}.key", root.parent)
+
+
+def save_local_task_secret(root: Path, task_id: str, secret: str) -> Path:
+    path = local_task_secret_path(root, task_id)
+    secure_io.atomic_write(path, secret.encode("ascii"), overwrite=False)
+    return path
+
+
+def load_local_task_secret(root: Path, task_id: str) -> str:
+    path = local_task_secret_path(root, task_id)
+    if not path.is_file() or (os.name != "nt" and path.stat().st_mode & 0o077):
+        raise RuntimeError("LOCAL_KEY_UNAVAILABLE: 开放任务的本地密钥缺失或权限不安全")
+    try:
+        secret = secure_io.read_bytes(path, 256).decode("ascii")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError("LOCAL_KEY_UNAVAILABLE: 开放任务的本地密钥无法读取") from exc
+    if not re.fullmatch(r"[A-Za-z0-9_.~-]{28,128}", secret):
+        raise RuntimeError("LOCAL_KEY_INVALID: 开放任务的本地密钥格式无效")
+    return secret
+
+
 def safe_json_for_html(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":")).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
@@ -578,17 +662,21 @@ def cmd_init_config(args) -> dict[str, Any]:
     if out.exists() and not args.force:
         raise FileExistsError(f"文件已存在: {out}")
     config = default_config()
-    if getattr(args, 'mode', 'directed') == 'group':
+    mode = getattr(args, 'mode', 'open')
+    if mode == 'open':
+        config['correction'] = '如需更正，请联系任务联系人，并使用本人上一次 .yintian 重新提交。'
+        config['fields'] = [config['fields'][0]]
+    elif mode == 'group':
         config['fields'].insert(0, {'id': 'employee_id', 'label': '工号', 'type': 'text', 'required': True, 'sensitive': False})
     dump_json(out, config)
     return {"config": str(out.resolve())}
 
 
-def create_task(roster_path: Path, config_path: Path, out_parent: Path, password: str, require_terminal: bool = True, mode: str = "directed") -> dict[str, Any]:
+def create_task(roster_path: Path | None, config_path: Path, out_parent: Path, password: str | None, require_terminal: bool = True, mode: str = "directed") -> dict[str, Any]:
     if require_terminal:
         require_tty("create")
     config = validate_config(load_json(config_path), mode=mode)
-    roster = read_roster(roster_path)
+    roster = [] if mode == "open" else read_roster(roster_path)
     if mode == 'group':
         for person in roster:
             parse_group_employee_id(group_invite_id(person['employee_id']))
@@ -597,17 +685,21 @@ def create_task(roster_path: Path, config_path: Path, out_parent: Path, password
     if root.exists():
         raise FileExistsError(f"任务目录已存在: {root}")
     root.mkdir(parents=True, mode=0o700)
+    saved_secret_path = None
     try:
         (root / "invites").mkdir(mode=0o700)
         (root / "submissions").mkdir(mode=0o700)
         (root / "reports").mkdir(mode=0o700)
 
-        public_pem, private_pem, key_id = generate_keys(password)
+        local_secret = secrets.token_urlsafe(32) if mode == "open" else None
+        if mode != "open" and not isinstance(password, str):
+            raise ValueError("非开放任务必须提供任务密码")
+        public_pem, private_pem, key_id = generate_keys(local_secret if local_secret is not None else password)
         schema_hash = sha256_bytes(canonical(config["fields"]))
         notice = {key: config[key] for key in ("title", "purpose", "deadline", "retention_until", "contact", "correction")}
         notice_hash = sha256_bytes(canonical(notice))
         task = {
-            "format_version": GROUP_FORMAT_VERSION if mode == "group" else FORMAT_VERSION,
+            "format_version": GROUP_FORMAT_VERSION if mode == "group" else OPEN_FORMAT_VERSION if mode == "open" else FORMAT_VERSION,
             "mode": mode,
             "task_id": task_id,
             "key_id": key_id,
@@ -628,10 +720,14 @@ def create_task(roster_path: Path, config_path: Path, out_parent: Path, password
         dump_json(root / "task.json", task)
         atomic_write(root / "public.pem", public_pem)
         atomic_write(root / "private.pem.enc", private_pem)
-        atomic_write(root / "roster.csv", secure_io.read_bytes(roster_path))
+        roster_bytes = secure_io.read_bytes(roster_path) if roster_path else b"employee_id,name\n"
+        atomic_write(root / "roster.csv", roster_bytes)
 
         db_rows, index_rows = [], []
-        if mode == "group":
+        if mode == "open":
+            form = {"format": OPEN_FORM_FORMAT_VERSION, **task, "public_key_pem": public_pem.decode("ascii")}
+            dump_json(root / "FORM.yintian-form", form)
+        elif mode == "group":
             form = {"format": "yintian-form/2", **task, "public_key_pem": public_pem.decode("ascii")}
             dump_json(root / "FORM.yintian-form", form)
             (root / "credentials").mkdir(mode=0o700)
@@ -666,9 +762,13 @@ def create_task(roster_path: Path, config_path: Path, out_parent: Path, password
         writer.writerows([{key: csv_text(value) for key, value in row.items()} for row in index_rows])
         atomic_write(index_path, index_buffer.getvalue().encode("utf-8-sig"))
         init_db(root, db_rows)
-        return {"task_id": task_id, "task_dir": str(root), "invite_count": len(index_rows)}
+        if local_secret is not None:
+            saved_secret_path = save_local_task_secret(root, task_id, local_secret)
+        return {"task_id": task_id, "task_dir": str(root), "form": str(root / "FORM.yintian-form") if mode in {"open", "group"} else None, "invite_count": len(index_rows)}
     except BaseException:
         shutil.rmtree(root, ignore_errors=True)
+        if saved_secret_path is not None:
+            saved_secret_path.unlink(missing_ok=True)
         raise
 
 
@@ -680,8 +780,16 @@ def cmd_create(args) -> dict[str, Any]:
     return result
 
 
+def cmd_create_open(args) -> dict[str, Any]:
+    return create_task(None, Path(args.config), Path(args.out), None, require_terminal=False, mode="open")
+
+
 def validate_envelope_header(envelope: dict[str, Any], task: dict[str, Any]) -> str:
-    for key in ("format_version", "task_id", "invite_id", "schema_hash", "key_id", "encrypted_key_b64", "iv_b64", "ciphertext_b64"):
+    required = {"format_version", "task_id", "invite_id", "schema_hash", "key_id", "algorithms", "encrypted_key_b64", "iv_b64", "ciphertext_b64"}
+    allowed = required | ({"auth_tag"} if task_mode(task) == "group" else set())
+    if not isinstance(envelope, dict) or set(envelope) != allowed:
+        raise ValueError("提交包字段集合无效")
+    for key in required - {"algorithms"}:
         if not isinstance(envelope.get(key), str) or not envelope[key]:
             raise ValueError(f"提交包缺少字段: {key}")
     if envelope["format_version"] != task["format_version"] or envelope["task_id"] != task["task_id"]:
@@ -693,6 +801,9 @@ def validate_envelope_header(envelope: dict[str, Any], task: dict[str, Any]) -> 
     invite_id = envelope["invite_id"]
     if task_mode(task) == "group":
         parse_group_employee_id(invite_id)
+    elif task_mode(task) == "open":
+        if not OPEN_INVITE_ID_RE.fullmatch(invite_id):
+            raise ValueError("open 提交的 invite_id 格式无效")
     elif not INVITE_ID_RE.fullmatch(invite_id):
         raise ValueError("invite_id 格式无效")
     for key in ("encrypted_key_b64", "iv_b64", "ciphertext_b64"):
@@ -720,9 +831,19 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path) -> dict[str, 
     source = secure_io.checked_path(submissions_dir)
     if not source.is_dir():
         raise NotADirectoryError(source)
+    paths = []
+    for path in source.iterdir():
+        if path.suffix == ".yintian":
+            paths.append(path)
+            if len(paths) > MAX_PACKAGE_FILES:
+                raise ValueError(f"INBOX_LIMIT: 单次收件最多处理 {MAX_PACKAGE_FILES} 个回执")
     summary = {"accepted": 0, "duplicates": 0, "rejected": 0, "errors": []}
     with task_lock(root), closing(connect_db(root)) as db, db:
-        for index, path in enumerate(sorted(source.glob("*.yintian")), start=1):
+        stored_bytes = 0
+        for stored in db.execute("SELECT path FROM submissions"):
+            stored_path = secure_io.checked_path(root / stored["path"], root)
+            stored_bytes += stored_path.stat().st_size
+        for index, path in enumerate(sorted(paths), start=1):
             digest = None
             created_path = None
             db.execute("SAVEPOINT receive_one")
@@ -740,12 +861,22 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path) -> dict[str, 
                 envelope = json.loads(raw)
                 invite_id = validate_envelope_header(envelope, task)
                 invite = db.execute("SELECT * FROM invites WHERE invite_id=?", (invite_id,)).fetchone()
+                if not invite and task_mode(task) == "open":
+                    if db.execute("SELECT COUNT(*) FROM invites").fetchone()[0] >= MAX_OPEN_INVITES:
+                        raise ValueError(f"OPEN_INVITE_LIMIT: 开放任务最多接收 {MAX_OPEN_INVITES} 个不同回执编号")
+                    db.execute(
+                        "INSERT INTO invites(invite_id,employee_id,name,token_hash,status,created_at) VALUES(?,?,?,'','invited',?)",
+                        (invite_id, invite_id, "", now_iso()),
+                    )
+                    invite = db.execute("SELECT * FROM invites WHERE invite_id=?", (invite_id,)).fetchone()
                 if not invite:
                     raise ValueError("invite_id 不属于当前任务")
                 verify_submission_auth(task, envelope, invite)
                 existing_versions = db.execute("SELECT COUNT(*) FROM submissions WHERE invite_id=?", (invite_id,)).fetchone()[0]
                 if existing_versions >= MAX_VERSIONS_PER_INVITE:
                     raise ValueError(f"该邀请的提交版本数已达上限 {MAX_VERSIONS_PER_INVITE}，拒绝继续存储")
+                if stored_bytes + len(raw) > MAX_TASK_SUBMISSION_BYTES:
+                    raise ValueError("TASK_STORAGE_LIMIT: 任务密文总量达到安全上限")
                 version = db.execute("SELECT COALESCE(MAX(version),0)+1 FROM submissions WHERE invite_id=?", (invite_id,)).fetchone()[0]
                 target_dir = secure_io.checked_path(root / "submissions" / invite_id, root)
                 target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -764,6 +895,7 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path) -> dict[str, 
                 audit(db, "ingest", db.execute("SELECT last_insert_rowid()").fetchone()[0])
                 db.execute("RELEASE receive_one")
                 summary["accepted"] += 1
+                stored_bytes += len(raw)
             except Exception as exc:
                 db.execute("ROLLBACK TO receive_one")
                 db.execute("RELEASE receive_one")
@@ -780,12 +912,19 @@ def cmd_ingest(args) -> dict[str, Any]:
     return ingest_task(args.task_dir, args.submissions_dir)
 
 
-def unlock_private_key(root: Path, password: str):
+def unlock_private_key(root: Path, password: str | None):
     from cryptography.hazmat.primitives import serialization
 
     data = secure_io.read_bytes(root / "private.pem.enc", 128 * 1024)
     blob = data.lstrip()
+    if blob.startswith(b"-----BEGIN PRIVATE KEY-----"):
+        raise ValueError("未加密私钥不受支持")
     if blob.startswith(b"{"):
+        if password is None:
+            task = load_task(root)[1]
+            if task_mode(task) != "open":
+                raise ValueError("任务私钥需要密码")
+            password = load_local_task_secret(root, task["task_id"])
         private_der = decrypt_private_key(json.loads(data), password)
         return serialization.load_der_private_key(private_der, password=None)
     if not blob.startswith(LEGACY_KEY_PEM_PREFIX):
@@ -814,6 +953,13 @@ def decrypt_envelope(root: Path, task: dict[str, Any], path: Path, private_key, 
     aes_key = private_key.decrypt(encrypted_key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
     plaintext = AESGCM(aes_key).decrypt(base64.b64decode(envelope["iv_b64"], validate=True), base64.b64decode(envelope["ciphertext_b64"], validate=True), aad_for(envelope))
     payload = json.loads(plaintext)
+    if not isinstance(payload, dict):
+        raise ValueError("解密载荷必须是对象")
+    payload_fields = {"format_version", "task_id", "invite_id", "schema_hash", "notice_hash", "template_version", "submitted_at", "consent_confirmed", "values", "attachments"}
+    if task_mode(task) != "open":
+        payload_fields.add("invite_token")
+    if set(payload) - payload_fields - {"agent_ocr", "agent_ocr_confirmed"}:
+        raise ValueError("解密载荷包含协议外字段")
     for key in ("format_version", "task_id", "invite_id", "schema_hash"):
         if payload.get(key) != envelope[key]:
             raise ValueError(f"解密载荷 {key} 与外层不一致")
@@ -830,9 +976,25 @@ def normalize_value(field_type: str, value: str) -> str:
     return value
 
 
+def validate_scalar_values(values: Any, allowed_ids: set[str]) -> None:
+    if not isinstance(values, dict) or len(values) > MAX_FIELDS:
+        raise ValueError("values 必须是字段数量受限的对象")
+    if set(values) - allowed_ids:
+        raise ValueError("PAYLOAD_FIELDS_INVALID: 提交含模板外字段")
+    for field_id, value in values.items():
+        limit = MAX_NAME_CHARS if field_id == "name" else MAX_VALUE_CHARS
+        if not isinstance(value, str) or len(value) > limit or ILLEGAL_XML_RE.search(value):
+            raise ValueError(f"字段必须是长度不超过 {limit} 的文本: {field_id}")
+
+
 def validate_payload(task: dict[str, Any], invite: sqlite3.Row, payload: dict[str, Any]) -> tuple[list[str], list[str], list[dict[str, Any]]]:
     from ocr_matcher import validate_chinese_id
 
+    required = {"notice_hash", "template_version", "submitted_at", "consent_confirmed", "values", "attachments"}
+    if task_mode(task) != "open":
+        required.add("invite_token")
+    if not isinstance(payload, dict) or not required.issubset(payload):
+        raise ValueError("解密载荷字段集合无效")
     missing, conflicts, attachment_items = [], [], []
     if payload.get("notice_hash") != task["notice_hash"]:
         conflicts.append("notice_hash")
@@ -841,29 +1003,40 @@ def validate_payload(task: dict[str, Any], invite: sqlite3.Row, payload: dict[st
     if payload.get("consent_confirmed") is not True:
         conflicts.append("consent")
     token = payload.get("invite_token", "")
-    if not isinstance(token, str) or not secrets.compare_digest(sha256_bytes(token.encode()), invite["token_hash"]):
-        raise ValueError("邀请认证令牌无效")
+    if task_mode(task) != "open":
+        if not isinstance(token, str) or not secrets.compare_digest(sha256_bytes(token.encode()), invite["token_hash"]):
+            raise ValueError("邀请认证令牌无效")
     if normalize_submitted_at(payload.get("submitted_at")) is None:
         conflicts.append("submitted_at")
     values, attachments = payload.get("values", {}), payload.get("attachments", {})
-    if not isinstance(values, dict) or not isinstance(attachments, dict):
+    if not isinstance(attachments, dict) or len(attachments) > MAX_FIELDS:
         raise ValueError("values/attachments 格式无效")
     value_ids = {f['id'] for f in task['fields'] if f['type'] not in ATTACHMENT_TYPES}
     attachment_ids = {f['id'] for f in task['fields'] if f['type'] in ATTACHMENT_TYPES}
-    if set(values) - value_ids or set(attachments) - attachment_ids:
+    validate_scalar_values(values, value_ids)
+    if set(attachments) - attachment_ids:
         raise ValueError('PAYLOAD_FIELDS_INVALID: 提交含模板外字段')
     total_size = 0
+    total_attachments = 0
     for field in task["fields"]:
         field_id, field_type = field["id"], field["type"]
         if field_type in ATTACHMENT_TYPES:
             items = attachments.get(field_id, [])
-            if not isinstance(items, list):
+            if not isinstance(items, list) or len(items) > 20:
                 raise ValueError(f"附件字段格式无效: {field_id}")
+            total_attachments += len(items)
+            if total_attachments > MAX_ATTACHMENTS:
+                raise ValueError(f"附件总数超过 {MAX_ATTACHMENTS} 个")
             if field.get("required") and not items:
                 missing.append(field_id)
             if not field.get("multiple") and len(items) > 1:
                 conflicts.append(field_id)
             for item in items:
+                if not isinstance(item, dict):
+                    raise ValueError(f"附件项目格式无效: {field_id}")
+                name = item.get("name", "")
+                if not isinstance(name, str) or len(name) > 255:
+                    raise ValueError(f"附件文件名无效: {field_id}")
                 raw = base64.b64decode(item.get("data_b64", ""), validate=True)
                 mime = item.get("type", "")
                 if len(raw) != int(item.get("size", -1)) or len(raw) > MAX_FILE_BYTES or sha256_bytes(raw) != item.get("sha256"):
@@ -886,7 +1059,7 @@ def validate_payload(task: dict[str, Any], invite: sqlite3.Row, payload: dict[st
                 elif not raw.startswith(b"%PDF-"):
                     raise ValueError("PDF 文件头无效")
                 total_size += len(raw)
-                attachment_items.append({"field_id": field_id, "name": item.get("name", ""), "type": mime, "data": raw})
+                attachment_items.append({"field_id": field_id, "name": name, "type": mime, "data": raw})
         else:
             value = normalize_value(field_type, values.get(field_id, ""))
             if field.get("required") and not value:
@@ -901,7 +1074,7 @@ def validate_payload(task: dict[str, Any], invite: sqlite3.Row, payload: dict[st
                 conflicts.append(field_id)
     if total_size > MAX_TOTAL_BYTES:
         raise ValueError("附件总大小超过 15MB")
-    if normalize_value("text", values.get("name", "")) != invite["name"]:
+    if task_mode(task) != "open" and normalize_value("text", values.get("name", "")) != invite["name"]:
         conflicts.append("name_roster_mismatch")
     if task_mode(task) == "group" and normalize_value("text", values.get("employee_id", "")) != invite["employee_id"]:
         conflicts.append("employee_id_roster_mismatch")
@@ -1069,6 +1242,8 @@ def review_task(task_dir, password, retry_needs_review=False, invite_id=None):
                 (normalize_submitted_at(payload.get("submitted_at")), now_iso(), state, json.dumps(missing), json.dumps(conflicts), len(attachments), int(payload.get("consent_confirmed") is True), row["id"]))
             if state != "invalid":
                 db.execute("UPDATE invites SET current_submission_id=? WHERE invite_id=? AND (current_submission_id IS NULL OR current_submission_id<=?)", (row["id"], row["invite_id"], row["id"]))
+                if task_mode(task) == "open":
+                    db.execute("UPDATE invites SET name=? WHERE invite_id=?", (normalize_value("text", payload.get("values", {}).get("name", "")), row["invite_id"]))
             db.execute("UPDATE invites SET status=? WHERE invite_id=? AND ?=(SELECT MAX(id) FROM submissions WHERE invite_id=?)", (state, row["invite_id"], row["id"], row["invite_id"]))
             audit(db, "ocr_route", row["id"], json.dumps(provenance, separators=(",", ":")), "recognition_route")
             audit(db, "review", row["id"], state, ",".join(missing + conflicts))
@@ -1334,7 +1509,13 @@ def collect_clear_rows(root: Path, task: dict[str, Any], private_key, field_ids:
             raise ValueError("EXPORT_VALIDATION_FAILED: 已通过记录的业务校验失败，停止导出")
         values = payload.get("values", {})
         record = {}
-        for column, raw in (("employee_id", row["employee_id"]), ("name", row["name"])):
+        identities = ("employee_id", "name")
+        for column in identities:
+            if task_mode(task) == "open":
+                definition = field_defs.get(column)
+                raw = normalize_value(definition["type"], values.get(column, "")) if definition else ""
+            else:
+                raw = row[column]
             rule = masks.get(column)
             record[column] = mask_value(rule, raw) if rule and raw else raw
         for field_id in field_ids:
@@ -1343,6 +1524,94 @@ def collect_clear_rows(root: Path, task: dict[str, Any], private_key, field_ids:
             record[field_id] = mask_value(rule, value) if rule and value else value
         output.append(record)
     return output
+
+
+def collect_open_rows(root: Path, task: dict[str, Any], private_key, attachment_stage: Path | None, attachment_dir_name: str) -> tuple[list[dict[str, str]], int]:
+    field_defs = {field["id"]: field for field in task["fields"]}
+    with closing(connect_db(root)) as db:
+        db_rows = db.execute(
+            "SELECT s.*,i.employee_id,i.name,i.token_hash FROM submissions s JOIN invites i ON i.invite_id=s.invite_id WHERE s.id=(SELECT MAX(n.id) FROM submissions n WHERE n.invite_id=s.invite_id) AND s.status IN ('verified','verified_manual')"
+        ).fetchall()
+    output, attachment_count = [], 0
+    for row in db_rows:
+        payload = stored_payload(root, task, row, private_key)
+        missing, conflicts, attachments = validate_payload(task, row, payload)
+        if missing or conflicts:
+            raise ValueError("EXPORT_VALIDATION_FAILED: 已通过记录的业务校验失败，停止导出")
+        values = payload["values"]
+        record = {
+            field_id: normalize_value(field_defs[field_id]["type"], values.get(field_id, ""))
+            for field_id in field_defs
+            if field_defs[field_id]["type"] not in ATTACHMENT_TYPES
+        }
+        by_field: dict[str, list[dict[str, Any]]] = {}
+        for item in attachments:
+            by_field.setdefault(item["field_id"], []).append(item)
+        person_dir = f"{safe_filename_component(record.get('name'), 'reply')}-{row['invite_id'][-16:]}"
+        for field_id, field in field_defs.items():
+            if field["type"] not in ATTACHMENT_TYPES:
+                continue
+            paths = []
+            for index, item in enumerate(by_field.get(field_id, []), 1):
+                suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf"}[item["type"]]
+                filename = f"{safe_filename_component(field['label'], field_id)}-{field_id}-{index}{suffix}"
+                if attachment_stage is None:
+                    raise RuntimeError("ATTACHMENT_EXPORT_UNAVAILABLE: 附件暂存目录未创建")
+                secure_io.atomic_write(attachment_stage / person_dir / filename, item["data"], overwrite=False)
+                paths.append(f"{attachment_dir_name}/{person_dir}/{filename}")
+                attachment_count += 1
+            record[field_id] = "; ".join(paths)
+        output.append(record)
+    output.sort(key=lambda row: (row.get("name", ""), row.get("employee_id", "")))
+    return output, attachment_count
+
+
+def collect_open(task_dir: str | Path, submissions_dir: str | Path, out: str | Path) -> dict[str, Any]:
+    root, task = load_task(task_dir)
+    if task_mode(task) != "open":
+        raise ValueError("collect 仅用于无需名单的开放模板任务；旧任务继续使用 ingest/review/export-clear")
+    ingested = ingest_task(root, submissions_dir)
+    reviewed = review_task(root, None)
+    field_ids = [field["id"] for field in task["fields"] if field["id"] not in {"employee_id", "name"}]
+    out_path = secure_io.checked_path(out).with_suffix(".xlsx")
+    attachment_fields = [field for field in task["fields"] if field["type"] in ATTACHMENT_TYPES]
+    attachment_target = out_path.with_name(out_path.stem + "-attachments")
+    if attachment_fields and attachment_target.exists():
+        raise FileExistsError("OUTPUT_EXISTS: 附件导出目录已存在，请选择新文件名")
+    attachment_stage = None
+    written: dict[str, str] = {}
+    try:
+        if attachment_fields:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            attachment_stage = Path(tempfile.mkdtemp(prefix=".yintian-attachments-", dir=out_path.parent))
+        with task_lock(root):
+            private_key = unlock_private_key(root, None)
+            rows, attachment_count = collect_open_rows(root, task, private_key, attachment_stage, attachment_target.name)
+            excluded = len(report_rows(root)) - len(rows)
+            written = write_clear_export(root, task, rows, field_ids, {}, out_path, ["xlsx"], task["purpose"], task["contact"])
+            if attachment_stage is not None:
+                if attachment_count:
+                    attachment_stage.rename(attachment_target)
+                    written["attachments_dir"] = str(attachment_target)
+                    attachment_stage = None
+                else:
+                    shutil.rmtree(attachment_stage)
+                    attachment_stage = None
+            with closing(connect_db(root)) as db, db:
+                audit(db, "collect_open", reason="agent_requested")
+    except BaseException:
+        if attachment_stage is not None:
+            shutil.rmtree(attachment_stage, ignore_errors=True)
+        if written.get("xlsx"):
+            Path(written["xlsx"]).unlink(missing_ok=True)
+        if written.get("attachments_dir"):
+            shutil.rmtree(written["attachments_dir"], ignore_errors=True)
+        raise
+    return {"task_id": task["task_id"], "rows": len(rows), "excluded": excluded, "attachments": attachment_count, "ingest": ingested, "review": reviewed, **written}
+
+
+def cmd_collect_open(args) -> dict[str, Any]:
+    return collect_open(args.task_dir, args.submissions_dir, args.out)
 
 
 def write_clear_export(root: Path, task: dict[str, Any], rows: list[dict[str, str]], field_ids: list[str], masks: dict[str, str],
@@ -1359,7 +1628,8 @@ def write_clear_export(root: Path, task: dict[str, Any], rows: list[dict[str, st
         target = secure_io.checked_path(out_path.with_suffix('.' + fmt))
         if target.exists():
             raise FileExistsError("OUTPUT_EXISTS: 导出文件已存在，请选择新文件名")
-    columns = ["employee_id", "name"] + field_ids
+    identity_columns = ["employee_id", "name"] if task_mode(task) != "open" else [key for key in ("employee_id", "name") if any(field["id"] == key for field in task["fields"])]
+    columns = identity_columns + field_ids
     written = {}
     buffers = {}
     if "json" in formats:
@@ -1374,9 +1644,11 @@ def write_clear_export(root: Path, task: dict[str, Any], rows: list[dict[str, st
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "明文导出"
-        sheet.append(columns)
+        labels = {field["id"]: field["label"] for field in task["fields"]}
+        sheet.append([labels.get(key, key) if task_mode(task) == "open" else key for key in columns])
         for cell in sheet[1]:
             cell.font = Font(bold=True)
+            cell.data_type = "s"
         for row_index, record in enumerate(rows, start=2):
             for column_index, key in enumerate(columns, start=1):
                 cell = sheet.cell(row_index, column_index, str(record.get(key, "")))
@@ -1452,10 +1724,12 @@ def cmd_export_clear(args) -> dict[str, Any]:
     return {"task_id": task["task_id"], "rows": len(rows), "excluded": excluded, **written}
 
 
-def build_task_package(task_dir):
+def build_task_package(task_dir, *, include_open_secret: bool = False):
     root, task = load_task(task_dir)
     if task_expired(task):
         raise RuntimeError("TASK_EXPIRED: 任务已超过保存期限")
+    if task_mode(task) == "open" and not include_open_secret:
+        raise RuntimeError("OPEN_PACKAGE_ENCRYPTION_REQUIRED: 开放任务只能通过 export_task 生成加密交接包")
     with task_lock(root):
         for path in root.rglob("*"):
             secure_io.checked_path(path, root)
@@ -1469,7 +1743,7 @@ def build_task_package(task_dir):
             candidates.append(root / "FORM.yintian-form")
         candidates += list((root / "submissions").glob("*/*.yintian"))
         candidates += [p for p in (root / "reports").glob("progress.*") if p.suffix in {".json", ".xlsx"}]
-        if len(candidates) > MAX_PACKAGE_FILES:
+        if len(candidates) + (task_mode(task) == "open") > MAX_PACKAGE_FILES:
             raise ValueError("任务内容超过交接包安全上限")
         data, total = {}, 0
         for path in sorted(candidates):
@@ -1483,6 +1757,12 @@ def build_task_package(task_dir):
             if len(raw) > MAX_PACKAGE_MEMBER_BYTES or total > MAX_PACKAGE_BYTES:
                 raise ValueError("任务内容超过交接包安全上限")
             data[path.relative_to(root).as_posix()] = raw
+        if task_mode(task) == "open":
+            raw = load_local_task_secret(root, task["task_id"]).encode("ascii")
+            total += len(raw)
+            if total > MAX_PACKAGE_BYTES:
+                raise ValueError("任务内容超过交接包安全上限")
+            data["local-open-key"] = raw
         metadata = {"package_version": TASK_PACKAGE_VERSION, "task_id": task["task_id"], "created_at": now_iso(),
                     "manifest": {name: sha256_bytes(raw) for name, raw in data.items()}}
         buffer = io.BytesIO()
@@ -1499,7 +1779,7 @@ def task_package_aad(task_id: str) -> bytes:
 
 def export_task(task_dir: str | Path, out: str | Path, handoff_password: str | None = None) -> dict[str, Any]:
     root, task = load_task(task_dir)
-    zip_bytes, info = build_task_package(root)
+    zip_bytes, info = build_task_package(root, include_open_secret=True)
     password = handoff_password if handoff_password is not None else generate_password()
     envelope = aes_gcm_seal(ENCRYPTED_TASK_PACKAGE_VERSION, zip_bytes, password, aad=task_package_aad(task["task_id"]))
     envelope["task_id"] = task["task_id"]
@@ -1595,7 +1875,7 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
             parts = rel_path.parts
             allowed = (
                 rel in required
-                or rel == "FORM.yintian-form"
+                or rel in {"FORM.yintian-form", "local-open-key"}
                 or (len(parts) == 2 and parts[0] == "invites" and parts[1].endswith(".yintian-form") and INVITE_ID_RE.fullmatch(parts[1][:-13]))
                 or (len(parts) == 2 and parts[0] == "credentials" and parts[1].endswith(".yintian-credential") and valid_invite_identifier(parts[1][:-19]))
                 or (len(parts) == 2 and parts[0] == "invites" and parts[1].endswith(".html") and INVITE_ID_RE.fullmatch(parts[1][:-5]))
@@ -1627,6 +1907,8 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
         if any(info.file_size > MAX_PACKAGE_MEMBER_BYTES for info in infos) or sum(info.file_size for info in infos) > MAX_PACKAGE_BYTES:
             raise ValueError("任务包解压后超过安全上限")
         target.mkdir(parents=True, mode=0o700)
+        imported_secret_path = None
+        open_secret = None
         try:
             total_size = 0
             for rel, expected_hash in manifest.items():
@@ -1637,22 +1919,41 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
                 total_size += len(data)
                 if sha256_bytes(data) != expected_hash:
                     raise ValueError(f"任务包哈希不匹配: {rel}")
-                atomic_write(destination, data)
+                if rel == "local-open-key":
+                    open_secret = data
+                else:
+                    atomic_write(destination, data)
             _, imported_task = load_task(target)
             if imported_task["task_id"] != task_id:
                 raise ValueError("任务包内外 task_id 不一致")
+            if task_mode(imported_task) == "open":
+                if not encrypted or open_secret is None:
+                    raise ValueError("OPEN_KEY_PACKAGE_INVALID: 开放任务必须通过加密交接包携带本地密钥")
+                try:
+                    secret = open_secret.decode("ascii")
+                except UnicodeDecodeError as exc:
+                    raise ValueError("OPEN_KEY_PACKAGE_INVALID: 本地密钥格式无效") from exc
+                if not re.fullmatch(r"[A-Za-z0-9_.~-]{28,128}", secret):
+                    raise ValueError("OPEN_KEY_PACKAGE_INVALID: 本地密钥格式无效")
+                imported_secret_path = save_local_task_secret(target, task_id, secret)
+            elif open_secret is not None:
+                raise ValueError("任务包包含意外的开放任务密钥")
             from cryptography.hazmat.primitives import serialization
 
             public_key = serialization.load_pem_public_key((target / "public.pem").read_bytes())
             public_der = public_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
             if hashlib.sha256(public_der).hexdigest()[:24] != imported_task["key_id"] or not valid_private_key_blob((target / "private.pem.enc").read_bytes()):
                 raise ValueError("任务包密钥材料无效")
-            roster = read_roster(target / "roster.csv")
+            if task_mode(imported_task) == "open":
+                private_der = unlock_private_key(target, None).public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+                if not secrets.compare_digest(private_der, public_der):
+                    raise ValueError("任务包公私钥不匹配")
+            roster = read_roster(target / "roster.csv", allow_empty=task_mode(imported_task) == "open")
             with (target / "invite-index.csv").open("r", encoding="utf-8-sig", newline="") as stream:
                 index = list(csv.DictReader(stream))
-            if len(index) != len(roster) or not index or any(not valid_invite_identifier(row.get("invite_id", "")) for row in index):
+            if len(index) != len(roster) or (task_mode(imported_task) != "open" and not index) or any(not valid_invite_identifier(row.get("invite_id", "")) for row in index):
                 raise ValueError("任务包名单或邀请索引无效")
-            if status_task(target)["total"] != len(roster):
+            if task_mode(imported_task) != "open" and status_task(target)["total"] != len(roster):
                 raise ValueError("任务包状态数据库与名单不一致")
             if imported_task["format_version"] in {FORMAT_VERSION, GROUP_FORMAT_VERSION}:
                 with closing(connect_db(target)) as db, db:
@@ -1661,6 +1962,8 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
                     raise ValueError("v2 任务缺少邀请认证数据")
         except Exception:
             shutil.rmtree(target, ignore_errors=True)
+            if imported_secret_path is not None:
+                imported_secret_path.unlink(missing_ok=True)
             raise
     if os.name != "nt":
         for directory in [target, *(path for path in target.rglob("*") if path.is_dir())]:
@@ -1687,6 +1990,7 @@ def cmd_purge(args) -> dict[str, Any]:
     if typed != task["task_id"]:
         raise RuntimeError("任务 ID 不匹配，已取消")
     parent = root.parent
+    local_secret = local_task_secret_path(root, task["task_id"]) if task_mode(task) == "open" else None
     with task_lock(root):
         status = status_task(root)
         summary = {"task_id": task["task_id"], "purged_at": now_iso(), "aggregate_counts": status["counts"], "total": status["total"]}
@@ -1707,6 +2011,8 @@ def cmd_purge(args) -> dict[str, Any]:
         root.rmdir()
     summary_path = parent / f"{task['task_id']}.purged.json"
     dump_json(summary_path, summary)
+    if local_secret is not None:
+        local_secret.unlink(missing_ok=True)
     return {"summary": str(summary_path)}
 
 
@@ -1714,13 +2020,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SafeFill：端到端加密的私密信息收集管理")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("init-config", help="生成基础身份信息收集配置")
-    p.add_argument("--out", required=True); p.add_argument("--force", action="store_true"); p.add_argument('--mode', choices=['directed', 'group'], default='directed'); p.set_defaults(func=cmd_init_config)
+    p.add_argument("--out", required=True); p.add_argument("--force", action="store_true"); p.add_argument('--mode', choices=['directed', 'group', 'open'], default='open'); p.set_defaults(func=cmd_init_config)
+    p = sub.add_parser("create-open", help="无需名单或人工密码，生成可公开发放的统一加密模板")
+    p.add_argument("--config", required=True); p.add_argument("--out", required=True); p.set_defaults(func=cmd_create_open)
     p = sub.add_parser("create", help="创建任务并批量生成离线邀请")
     p.add_argument("--roster", required=True); p.add_argument("--config", required=True); p.add_argument("--out", required=True)
     p.add_argument("--mode", choices=["directed", "group"], default="directed", help="directed 个人邀请；group 公共模板加私下发放的个人凭据")
     p.set_defaults(func=cmd_create)
     p = sub.add_parser("ingest", help="接收 .yintian 密文提交")
     p.add_argument("task_dir"); p.add_argument("submissions_dir"); p.set_defaults(func=cmd_ingest)
+    p = sub.add_parser("collect", help="开放模板一键收件、校验、解密并导出 Excel")
+    p.add_argument("task_dir"); p.add_argument("submissions_dir"); p.add_argument("--out", required=True); p.set_defaults(func=cmd_collect_open)
     p = sub.add_parser("review", help="本地解密、校验和 OpenVINO OCR 复核")
     p.add_argument("task_dir"); p.add_argument("--retry-needs-review", action="store_true"); p.add_argument("--invite"); p.set_defaults(func=cmd_review)
     p = sub.add_parser("decide", help="本人终端逐项核对 OCR 证据或退回重填")

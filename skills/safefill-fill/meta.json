@@ -1,13 +1,13 @@
 {
   "display_name": "SafeFill · 填写者",
-  "display_description": "本人解锁保险柜、按模板取值确认、生成可安全交回的加密文件",
-  "detail_describe": "本人解锁保险柜、按模板取值确认、生成可安全交回的加密文件",
+  "display_description": "对话补齐本人资料并生成加密回执，无需终端",
+  "detail_describe": "员工提供模板所需资料，Agent 校验后自动生成可交回 HR 的加密文件",
   "name": "safefill-fill",
   "icon": "",
   "use_cases": [
-    "从加密个人保险柜匹配本次字段",
-    "本人确认用途、取值和附件后加密提交"
+    "根据模板一次问齐缺失字段",
+    "无需个人凭据或终端即可生成加密回执"
   ],
   "author": "vc999999999",
-  "version": "3.5.0"
+  "version": "4.1.0"
 }

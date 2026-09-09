@@ -1,7 +1,7 @@
 """SafeFill · 填写端：员工本机填写需求格式文件并产出 .yintian 密文。
 
 只在员工自己的电脑上运行：纯本地、不联网；只读显式指定的文件；
-定向提交兼容 yintian-submission/2；群发使用带个人认证的 /3。
+默认开放模板使用 yintian-submission/4；定向 /2 与带个人认证的群发 /3 仅作兼容。
 """
 from __future__ import annotations
 
@@ -17,12 +17,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 FORM_FORMAT = "yintian-form/1"
+OPEN_FORM_FORMAT = "yintian-form/3"
 GROUP_INVITE_PREFIX = "GRP-"
 IMAGE_MIME_BY_SUFFIX = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
 PDF_SUFFIX = ".pdf"
 PDF_MIME = "application/pdf"
 NOTICE_KEYS = ("title", "purpose", "deadline", "retention_until", "contact", "correction")
-REQUIRED_FORM_KEYS = ("task_id", "fields", "public_key_pem", "key_id", "schema_hash", "notice_hash") + NOTICE_KEYS
+REQUIRED_FORM_KEYS = ("task_id", "format_version", "template_version", "fields", "public_key_pem", "key_id", "schema_hash", "notice_hash") + NOTICE_KEYS
 VERIFY_HINT = "填写前请与发放人核对任务编号与公钥指纹（key_id）；不一致请勿填写。"
 
 
@@ -56,7 +57,7 @@ def _public_key_fingerprint(public_key_pem: str) -> str:
 
 
 def load_form(form_path: str | Path) -> dict[str, Any]:
-    """读取并校验定向 /1 或群发 /2 模板；不修改文件。"""
+    """读取并校验定向 /1、群发 /2 或开放 /3 模板；不修改文件。"""
     path = secure_io.checked_path(form_path)
     if not path.is_file():
         raise FillError(f"需求格式文件不存在: {form_path}")
@@ -64,31 +65,36 @@ def load_form(form_path: str | Path) -> dict[str, Any]:
         form = json.loads(secure_io.read_bytes(path, 1024 * 1024))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise FillError("需求格式文件不是有效 JSON") from exc
-    if not isinstance(form, dict) or form.get("format") not in {FORM_FORMAT, "yintian-form/2"}:
+    if not isinstance(form, dict) or form.get("format") not in {FORM_FORMAT, "yintian-form/2", OPEN_FORM_FORMAT}:
         raise FillError(f"不是 {FORM_FORMAT} 需求格式文件")
     mode = form.get("mode")
-    if mode not in ("group", "directed"):
-        raise FillError("需求格式文件 mode 无效（应为 group 或 directed）")
+    if mode not in ("group", "directed", "open"):
+        raise FillError("需求格式文件 mode 无效（应为 group、directed 或 open）")
+    expected_form = {"directed": FORM_FORMAT, "group": "yintian-form/2", "open": OPEN_FORM_FORMAT}[mode]
+    if form.get("format") != expected_form:
+        raise FillError("FORM_MODE_MISMATCH: 模板格式与 mode 不匹配")
     if mode == "group" and (form.get("format") != "yintian-form/2" or form.get("submission_auth") != collection.AUTH_VERSION or form.get("format_version") != collection.GROUP_FORMAT_VERSION):
         raise FillError("GROUP_AUTH_REQUIRED: 旧群发模板没有个人认证，请向 HR 索取新版模板及个人凭据")
+    if mode == "open" and (form.get("format") != OPEN_FORM_FORMAT or form.get("format_version") != collection.OPEN_FORMAT_VERSION):
+        raise FillError("OPEN_FORM_INVALID: 开放模板格式无效")
     missing = [key for key in REQUIRED_FORM_KEYS if not form.get(key)]
     if missing:
         raise FillError(f"需求格式文件缺少必要字段: {', '.join(missing)}")
+    for key in (*NOTICE_KEYS, "template_version"):
+        if not isinstance(form[key], str) or len(form[key]) > collection.MAX_VALUE_CHARS:
+            raise FillError(f"FORM_INVALID: {key} 必须是长度受限的文本")
     if not collection.TASK_ID_RE.fullmatch(str(form["task_id"])):
         raise FillError("需求格式文件 task_id 无效")
+    if not isinstance(form["public_key_pem"], str):
+        raise FillError("FORM_INVALID: public_key_pem 必须是文本")
+    if not re.fullmatch(r"[0-9a-f]{24}", str(form["key_id"])) or any(not re.fullmatch(r"[0-9a-f]{64}", str(form[key])) for key in ("schema_hash", "notice_hash")):
+        raise FillError("FORM_INVALID: 公钥或摘要标识格式无效")
     fields = form["fields"]
-    if not isinstance(fields, list) or not fields or len(fields) > 100:
-        raise FillError("需求格式文件 fields 无效")
-    seen = set()
-    for field in fields:
-        if not isinstance(field, dict) or not collection.FIELD_ID_RE.fullmatch(str(field.get("id", ""))) or field["id"] in seen:
-            raise FillError("需求格式文件字段 id 无效或重复")
-        if field.get("type") not in collection.ALLOWED_TYPES or not isinstance(field.get("label"), str) or not field['label'] or len(field['label']) > 200:
-            raise FillError(f"需求格式文件字段类型不受支持: {field.get('id')}")
-        if field['type'] == 'single_choice' and (not isinstance(field.get('options'), list) or not field['options'] or len(field['options']) > 100 or any(not isinstance(v, str) or len(v) > 200 for v in field['options'])):
-            raise FillError('FORM_INVALID: 单选字段选项无效')
-        seen.add(field["id"])
-    evidence_routing.validate_fields(fields)
+    try:
+        if collection.validate_field_definitions(fields, mode) != fields:
+            raise ValueError("字段定义未规范化")
+    except ValueError as exc:
+        raise FillError(f"FORM_INVALID: {exc}") from exc
     if collection.sha256_bytes(collection.canonical(fields)) != form["schema_hash"]:
         raise FillError("字段清单与 schema_hash 不匹配，文件可能被篡改，请向发放人重新索取")
     notice = {key: form[key] for key in NOTICE_KEYS}
@@ -97,11 +103,14 @@ def load_form(form_path: str | Path) -> dict[str, Any]:
     if "notice" in form and isinstance(form["notice"], dict):
         if collection.sha256_bytes(collection.canonical(form["notice"])) != form["notice_hash"]:
             raise FillError("notice 摘要与 notice_hash 不匹配，文件可能被篡改，请向发放人重新索取")
-    fingerprint = _public_key_fingerprint(str(form["public_key_pem"]))
+    try:
+        fingerprint = _public_key_fingerprint(form["public_key_pem"])
+    except Exception as exc:
+        raise FillError("FORM_INVALID: 公钥格式无效") from exc
     form["_key_fingerprint"] = fingerprint
     form["_path"] = str(path)
-    form.setdefault('template_version', '1.0')
-    if form.get("format_version") and form["format_version"] != (collection.GROUP_FORMAT_VERSION if mode == "group" else collection.FORMAT_VERSION):
+    expected_format = collection.GROUP_FORMAT_VERSION if mode == "group" else collection.OPEN_FORMAT_VERSION if mode == "open" else collection.FORMAT_VERSION
+    if form["format_version"] != expected_format:
         raise FillError(f"需求格式文件要求的提交版本不受支持: {form['format_version']}")
     if mode == "directed":
         if not collection.INVITE_ID_RE.fullmatch(str(form.get("invite_id", ""))):
@@ -110,9 +119,11 @@ def load_form(form_path: str | Path) -> dict[str, Any]:
         if not isinstance(token, str) or not token:
             raise FillError("directed 模式需求格式文件缺少 invite_token")
         form["_token"] = token
-    else:
-        if form.get("invite_id") or form.get("invite_token") or form.get("token"):
-            raise FillError("group 模式需求格式文件不应包含 invite_id 或 invite_token")
+    elif mode == "group":
+        if any(key in form for key in ("invite_id", "invite_token", "token", "name", "employee_id")):
+            raise FillError("group 模式公共模板不应包含个人身份或邀请信息")
+    elif any(key in form for key in ("invite_id", "invite_token", "token", "name", "employee_id")):
+        raise FillError("open 模式需求格式文件不应包含个人身份或邀请信息")
     return form
 
 
@@ -120,6 +131,10 @@ def bind_credential(form, credential_path=None):
     if form['mode'] == 'directed':
         if credential_path:
             raise FillError('CREDENTIAL_UNEXPECTED: 定向邀请不需要额外凭据')
+        return form
+    if form['mode'] == 'open':
+        if credential_path:
+            raise FillError('CREDENTIAL_UNEXPECTED: 开放模板不需要个人凭据')
         return form
     if not credential_path:
         raise FillError('CREDENTIAL_REQUIRED: 群发填写需要 HR 私下发给本人的 .yintian-credential')
@@ -166,6 +181,7 @@ def inspect_info(form: dict[str, Any]) -> dict[str, Any]:
         ],
         "warning": VERIFY_HINT,
         "credential_required": form["mode"] == "group",
+        "identity_assurance": "self_declared" if form["mode"] == "open" else "credential_bound",
         "expired": collection.task_expired(form),
     }
     if form["mode"] == "directed":
@@ -179,7 +195,7 @@ def print_inspect(info: dict[str, Any]) -> None:
     info = {key: collection.terminal_text(value) if isinstance(value, str) else value for key, value in info.items()}
     info['fields'] = [{**field, 'label': collection.terminal_text(field['label']),
                        **({'options': [collection.terminal_text(value) for value in field['options']]} if 'options' in field else {})} for field in info['fields']]
-    mode_label = "directed 定向邀请" if info["mode"] == "directed" else "group 群组模式（需要个人凭据）"
+    mode_label = {"directed": "directed 定向邀请", "group": "group 群组模式（需要个人凭据）", "open": "open 开放模板（姓名由本人填写）"}[info["mode"]]
     print(f"需求格式文件：{info['format']} · {mode_label}")
     print(f"标题：{info['title']}")
     print(f"用途：{info['purpose']}")
@@ -271,10 +287,16 @@ def _check_values(form: dict[str, Any], values: Any) -> tuple[dict[str, str], li
     problems: list[str] = []
     if not isinstance(values, dict):
         raise FillError("values.json 的 values 必须是 {字段id: 值} 对象")
+    if len(values) > collection.MAX_FIELDS:
+        raise FillError("values 字段数量超过安全上限")
     labels = {field["id"]: field["label"] for field in form["fields"]}
-    for key in values:
-        if key not in labels and not (form["mode"] == "group" and key == "employee_id"):
-            problems.append(f"未知字段: {key}（需求格式文件中不存在）")
+    allowed_ids = {field["id"] for field in form["fields"] if field["type"] not in collection.ATTACHMENT_TYPES}
+    unknown_ids = set(values) - allowed_ids
+    problems.extend(f"未知字段: {key}（需求格式文件中不存在）" for key in sorted(unknown_ids))
+    try:
+        collection.validate_scalar_values({key: value for key, value in values.items() if key in allowed_ids}, allowed_ids)
+    except ValueError as exc:
+        raise FillError(str(exc)) from exc
     normalized: dict[str, str] = {}
     for field in form["fields"]:
         field_id, field_type = field["id"], field["type"]
@@ -311,6 +333,7 @@ def _build_attachments(form: dict[str, Any], specs: Any) -> tuple[dict[str, list
             problems.append(f"未知或非附件字段: {key}")
     payload: dict[str, list] = {}
     total_size = 0
+    total_count = 0
     for field_id, field in attachment_fields.items():
         raw_spec = specs.get(field_id, [])
         raws = [raw_spec] if isinstance(raw_spec, str) else list(raw_spec) if isinstance(raw_spec, list) else None
@@ -323,6 +346,9 @@ def _build_attachments(form: dict[str, Any], specs: Any) -> tuple[dict[str, list
             problems.append(f"该附件字段不允许多个文件: {label}（{field_id}）")
         if len(raws) > 20:
             raise FillError('ATTACHMENT_LIMIT: 单字段最多 20 个附件')
+        total_count += len(raws)
+        if total_count > collection.MAX_ATTACHMENTS:
+            raise FillError(f'ATTACHMENT_LIMIT: 附件总数最多 {collection.MAX_ATTACHMENTS} 个')
         items = []
         for raw_path in raws:
             path = _resolve_attachment(raw_path)
@@ -367,6 +393,16 @@ def _warn_values_permissions(values_path: Path) -> None:
         print(f"警告: {values_path} 含明文且权限宽于 0600，建议执行 chmod 600，并在用后删除。", file=sys.stderr)
 
 
+def _require_private_answers(values_path: Path) -> None:
+    if os.name != "nt" and stat.S_IMODE(values_path.stat().st_mode) & 0o077:
+        raise FillError("ANSWERS_PERMISSIONS: 临时明文必须使用 0600 权限")
+
+
+def reply_filename(name: str) -> str:
+    cleaned = collection.safe_filename_component(name, "reply")
+    return f"{cleaned}-{collection.random_id('', 6)}.yintian"
+
+
 def seal_form(form_path, values_path, out_path, *, confirmed=False, credential_path=None):
     if confirmed is not True:
         raise FillError('CONSENT_REQUIRED: 未确认时不读取填写资料')
@@ -382,7 +418,7 @@ def seal_form(form_path, values_path, out_path, *, confirmed=False, credential_p
     return seal_data(form, data.get("values", {}), attachments, out_path, confirmed=confirmed)
 
 
-def seal_data(form, values, attachments, out_path, *, confirmed=False, agent_ocr=None, agent_confirmed=False):
+def seal_data(form, values, attachments, out_path, *, confirmed=False, agent_ocr=None, agent_confirmed=False, invite_id=None):
     """No files/passwords/terminal I/O: consume the exact in-memory data approved by the caller."""
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -394,18 +430,19 @@ def seal_data(form, values, attachments, out_path, *, confirmed=False, agent_ocr
         raise FillError("TASK_EXPIRED: 已超过保存期限，请向 HR 索取新模板")
     if form["_key_fingerprint"] != form["key_id"]:
         raise FillError("KEY_MISMATCH: 公钥指纹不一致")
-    if not form.get("_token"):
+    if form["mode"] != "open" and not form.get("_token"):
         raise FillError("CREDENTIAL_REQUIRED: 缺少个人认证凭据")
     normalized, problems = _check_values(form, values)
     if problems:
         raise FillError("VALUES_INVALID: " + "; ".join(problems))
-    invite_id = form["invite_id"]
+    invite_id = invite_id or (collection.random_id(collection.OPEN_INVITE_PREFIX, 16) if form["mode"] == "open" else form["invite_id"])
+    if form["mode"] == "open" and not collection.OPEN_INVITE_ID_RE.fullmatch(invite_id):
+        raise FillError("PREVIOUS_INVALID: 更正回执编号无效")
 
     payload = {
         "format_version": form.get("format_version", collection.FORMAT_VERSION),
         "task_id": form["task_id"],
         "invite_id": invite_id,
-        "invite_token": form["_token"],
         "schema_hash": form["schema_hash"],
         "notice_hash": form["notice_hash"],
         "template_version": str(form.get("template_version", "1.0")),
@@ -414,6 +451,8 @@ def seal_data(form, values, attachments, out_path, *, confirmed=False, agent_ocr
         "values": normalized,
         "attachments": attachments,
     }
+    if form["mode"] != "open":
+        payload["invite_token"] = form["_token"]
     if agent_ocr is not None:
         if agent_confirmed is not True:
             raise FillError('AGENT_CONSENT_REQUIRED: 本人尚未确认使用宿主 Agent 识别候选')
@@ -426,8 +465,9 @@ def seal_data(form, values, attachments, out_path, *, confirmed=False, agent_ocr
         "key_id": form["key_id"],
         "algorithms": {"content": "AES-256-GCM", "key_wrap": "RSA-OAEP-3072-SHA256"},
     }
+    token = form.get("_token", "")
     invite = {"name": form.get("name", normalized.get("name", "")), "employee_id": form.get("_employee_id", ""),
-              "token_hash": collection.sha256_bytes(form["_token"].encode())}
+              "token_hash": collection.sha256_bytes(token.encode()) if token else ""}
     missing, conflicts, _ = collection.validate_payload(form, invite, payload)
     if missing or conflicts:
         raise FillError("PAYLOAD_INVALID: " + ",".join(missing + conflicts))
@@ -546,6 +586,36 @@ def cmd_seal(args):
     return summary
 
 
+def cmd_submit(args):
+    form = bind_credential(load_form(args.form), getattr(args, "credential", None))
+    path = secure_io.checked_path(args.answers)
+    try:
+        _require_private_answers(path)
+        data = json.loads(secure_io.read_bytes(path, collection.MAX_ENVELOPE_BYTES))
+        if not isinstance(data, dict) or data.get("consent_confirmed") is not True:
+            raise FillError("CONSENT_REQUIRED: 员工必须确认本次字段及附件后才能生成密文")
+        attachments, attachment_problems = _build_attachments(form, data.get("attachments", {}))
+        values, value_problems = _check_values(form, data.get("values", {}))
+        if attachment_problems or value_problems:
+            raise FillError("VALUES_INVALID: " + "; ".join(attachment_problems + value_problems))
+        out = args.out
+        if not out:
+            out = secure_io.checked_path(args.out_dir) / reply_filename(values.get("name", ""))
+        invite_id = None
+        previous = getattr(args, "previous", None)
+        if previous:
+            if form["mode"] != "open":
+                raise FillError("PREVIOUS_UNEXPECTED: 仅开放模板可沿用旧回执进行更正")
+            try:
+                envelope = json.loads(secure_io.read_bytes(previous, collection.MAX_ENVELOPE_BYTES))
+                invite_id = collection.validate_envelope_header(envelope, form)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise FillError("PREVIOUS_INVALID: 旧回执不属于本模板或已损坏") from exc
+        return seal_data(form, values, attachments, out, confirmed=True, invite_id=invite_id)
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def cmd_vault(args):
     collection.require_tty(args.command)
     import vault
@@ -576,6 +646,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True, help="输出 .yintian 路径")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_seal)
+    p = sub.add_parser("submit", help="供 Agent 在字段齐全并获本人确认后直接生成加密提交；不需要员工操作终端")
+    p.add_argument("form", metavar="FORM.yintian-form")
+    p.add_argument("--answers", required=True, help="仅供本次加密使用的 0600 临时 JSON")
+    output = p.add_mutually_exclusive_group(required=True)
+    output.add_argument("--out", help="兼容入口：显式指定输出 .yintian 路径")
+    output.add_argument("--out-dir", help="推荐入口：在目录中自动生成 姓名-短码.yintian")
+    p.add_argument("--previous", help="更正时指定本人上一次开放模板回执，以替换同一条记录")
+    p.add_argument("--credential", help="旧 group 模式的个人凭据；open 模式不需要")
+    p.set_defaults(func=cmd_submit)
     for command in ('vault-init', 'vault-edit'):
         p = sub.add_parser(command, help='本人终端创建或更新加密个人保险柜')
         p.add_argument('form')
