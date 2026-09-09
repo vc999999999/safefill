@@ -1,4 +1,4 @@
-"""Deterministic allowlisted delivery: two sibling Skills and one rich-text article."""
+"""Deterministic allowlisted delivery of the two sibling Skills."""
 import argparse
 import io
 from pathlib import Path
@@ -6,12 +6,11 @@ import zipfile
 import secure_io
 
 ROOT = Path(__file__).resolve().parents[2]
-ARTICLE = '隐填-论坛富文本.html'
 SHARED = ('collection.py', 'ocr_matcher.py', 'secure_io.py', 'evidence_routing.py')
 
 
 def build_package(out):
-    files = {ARTICLE: ROOT / ARTICLE}
+    files = {}
     for name in SHARED:
         if secure_io.read_bytes(ROOT / 'yintian-skill/scripts' / name) != secure_io.read_bytes(ROOT / 'yintian-fill/scripts' / name):
             raise ValueError('SHARED_MODULE_DRIFT: 请同步两个 Skill 的公共模块')
@@ -41,6 +40,6 @@ def build_package(out):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='打包两个独立 Skill 和富文本文档')
+    parser = argparse.ArgumentParser(description='打包两个独立 Skill')
     parser.add_argument('--out', required=True)
     print(build_package(parser.parse_args().out))

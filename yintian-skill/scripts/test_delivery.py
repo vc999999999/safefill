@@ -26,7 +26,7 @@ class DeliveryTests(unittest.TestCase):
             extracted = root / 'unpacked'
             with zipfile.ZipFile(one) as archive:
                 names = archive.namelist()
-                self.assertEqual({name.split('/')[0] for name in names}, {'yintian-skill', 'yintian-fill', package_skill.ARTICLE})
+                self.assertEqual({name.split('/')[0] for name in names}, {'yintian-skill', 'yintian-fill'})
                 self.assertFalse(any('__pycache__' in name or '/test_' in name or
                                      name.endswith(('.yintian-vault', '.yintian-credential', '.yintian', '.sqlite3'))
                                      for name in names))
