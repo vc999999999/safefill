@@ -212,8 +212,10 @@ def mask_value(field: str, value: str) -> str:
 
 
 def _ocr_texts(image_path: Path) -> list[str]:
+    from openvino_runtime import install_rapidocr_device_patch
     from rapidocr_openvino import RapidOCR
 
+    install_rapidocr_device_patch()
     engine = RapidOCR()
     result, _stages = engine(str(image_path))
     return [text for _box, text, _score, *_ in (result or [])]
@@ -226,7 +228,7 @@ def scan_idcard(image: str | Path) -> dict[str, Any]:
         raise FillError(f"图片不存在: {image}")
     try:
         texts = _ocr_texts(path)
-    except ImportError as exc:
+    except (ImportError, RuntimeError) as exc:
         raise FillError(
             "LOCAL_OCR_UNAVAILABLE: rapidocr-openvino 为可选依赖，可执行 pip install -r requirements-ocr.txt；也可使用本人授权的宿主 Agent 识别或手工填写，无需 API Key"
         ) from exc
@@ -487,6 +489,12 @@ def cmd_scan_idcard(args) -> dict[str, Any] | None:
     return None
 
 
+def cmd_openvino_status(_args) -> dict[str, Any]:
+    from openvino_runtime import runtime_info
+
+    return runtime_info()
+
+
 def prepare_agent_result(form, attachments, path):
     if path is None:
         return None
@@ -554,6 +562,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("form", metavar="FORM.yintian-form")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_inspect)
+    p = sub.add_parser("openvino-status", help="查看 OpenVINO 版本、可用设备和当前设备选择")
+    p.set_defaults(func=cmd_openvino_status)
     p = sub.add_parser("scan-idcard", help="本地 OCR 扫描一张证件图，遮罩输出候选（可选依赖）")
     p.add_argument("image", metavar="IMAGE")
     p.add_argument("--json", action="store_true")

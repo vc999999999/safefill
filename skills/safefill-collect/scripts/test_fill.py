@@ -336,6 +336,37 @@ def test_scan_idcard_masked_output(tmp_path: Path) -> None:
     assert result["ambiguous"] == []
 
 
+def test_scan_idcard_applies_openvino_device_patch() -> None:
+    calls = []
+    runtime = types.ModuleType("openvino_runtime")
+    runtime.install_rapidocr_device_patch = lambda: calls.append("patch")
+    rapidocr = types.ModuleType("rapidocr_openvino")
+
+    class FakeRapidOCR:
+        def __init__(self):
+            assert calls == ["patch"]
+            calls.append("engine")
+
+        def __call__(self, _path):
+            return [([], "姓名 张三", 0.99)], []
+
+    rapidocr.RapidOCR = FakeRapidOCR
+    sentinel = object()
+    previous_runtime = sys.modules.get("openvino_runtime", sentinel)
+    previous_rapidocr = sys.modules.get("rapidocr_openvino", sentinel)
+    sys.modules["openvino_runtime"] = runtime
+    sys.modules["rapidocr_openvino"] = rapidocr
+    try:
+        assert fill._ocr_texts(Path("id.png")) == ["姓名 张三"]
+    finally:
+        for name, previous in (("openvino_runtime", previous_runtime), ("rapidocr_openvino", previous_rapidocr)):
+            if previous is sentinel:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+    assert calls == ["patch", "engine"]
+
+
 def test_fill_extract_text_samples() -> None:
     text = f"姓名 张三\n性别 男\n公民身份号码 {VALID_ID}\n联系电话 13800138000\n住址 北京市朝阳区建国路 1 号\n"
     result = fill_extract.extract_fields(text)

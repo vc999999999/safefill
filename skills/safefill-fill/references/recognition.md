@@ -1,6 +1,6 @@
 # 可选识别：本地优先，宿主 Agent 补位
 
-3.5.0 不需要单独的模型 API、API Key 或云服务配置。默认安装仅含核心依赖；RapidOCR/OpenVINO 是可选的本地识别后端。Python 不调用网络模型。
+3.5.0 不需要单独的模型 API、API Key 或云服务配置。默认安装仅含核心依赖；RapidOCR/OpenVINO 是可选的本地识别后端。收集端和填写端都可用 `YINTIAN_OCR_DEVICE=CPU|GPU|NPU|AUTO` 选择设备，用 `YINTIAN_MODEL_DIR` 指向准备好的 INT8 模型目录。Python 不调用网络模型。
 
 ## Prompt 与 Python 的分工
 

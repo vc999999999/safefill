@@ -6,7 +6,7 @@ import zipfile
 import secure_io
 
 ROOT = Path(__file__).resolve().parents[2]
-SHARED = ('collection.py', 'ocr_matcher.py', 'secure_io.py', 'evidence_routing.py')
+SHARED = ('collection.py', 'ocr_matcher.py', 'secure_io.py', 'evidence_routing.py', 'config.py', 'openvino_runtime.py')
 
 
 def build_package(out):

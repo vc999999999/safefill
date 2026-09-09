@@ -21,6 +21,7 @@ Agent 可运行：
 
 ```bash
 "$PYTHON" "$SKILL_ROOT/scripts/fill.py" inspect FORM.yintian-form --json
+"$PYTHON" "$SKILL_ROOT/scripts/fill.py" openvino-status
 "$PYTHON" "$SKILL_ROOT/scripts/fill.py" scan-idcard EXPLICIT_IMAGE --json
 ```
 
@@ -33,7 +34,7 @@ Agent 可运行：
 
 定向邀请不传 `--credential`。收集方公钥必须经独立渠道核对。
 
-- Agent 不运行、旁观或捕获 `vault-init/vault-edit/fill/seal`，不索取密码或填写值，不打开保险柜、凭据或填写值 JSON；仅可读写上述已授权附件的候选 JSON；密码不能进入命令参数、环境变量或聊天。
+- Agent 的 `inspect` 只读取模板元数据和字段定义，不读取任何填写值。Agent 不运行、旁观或捕获 `vault-init/vault-edit/fill/seal`，不索取密码或填写值，不打开保险柜、凭据或填写值 JSON；仅可读写本人明确授权附件的候选 JSON；密码不能进入命令参数、环境变量或聊天。
 - 只处理显式指定的文件，不扫描磁盘找证件。遮罩 OCR 候选不能证明识别准确，也不能替本人确认。
 - 不编造、不补全身份信息。取消、缺字段、过期或身份不符必须无输出。
 - 保险柜取值、白名单、验证和加密由 Python 执行。手工 `seal` 仅作兼容入口；`values.json` 不得外发，由本人清理。

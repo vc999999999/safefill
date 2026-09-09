@@ -43,7 +43,7 @@ SafeFill 不是把 `safefill-collect` 固定在云端、把 `safefill-fill` 固�
 
 > `safefill-fill` 的敏感填写闭环可完全离线执行；`safefill-collect` 采用 Agent 协调、本地 Python 与 OpenVINO 处理敏感数据的混合架构。当前本地模型用于 OCR，而不是本地大语言模型。
 
-当前填写端的 `scan-idcard` 已使用本地 RapidOCR/OpenVINO，但尚未复用收集端的异构设备选择和 INT8 模型路径。模型分工、授权回退和已验证范围见[识别说明](skills/safefill-collect/references/recognition.md)、[隐私边界](skills/safefill-collect/references/privacy-extraction-workflow.md)与[验证记录](skills/safefill-collect/references/validation.md)。
+收集端和填写端的本地 OCR 均支持用 `YINTIAN_OCR_DEVICE` 选择 `CPU/GPU/NPU/AUTO`，并用 `YINTIAN_MODEL_DIR` 指向准备好的 INT8 模型目录；填写端可运行 `openvino-status` 查看实际可用设备。模型分工、授权回退和已验证范围见[识别说明](skills/safefill-collect/references/recognition.md)、[隐私边界](skills/safefill-collect/references/privacy-extraction-workflow.md)与[验证记录](skills/safefill-collect/references/validation.md)。
 
 ## 工作流程
 
@@ -99,7 +99,7 @@ Windows 中将 `.venv/bin/python` 换为 `.venv\Scripts\python.exe`。核心流�
 | `*.yintian` | 本次加密提交 | 按授权渠道交回收集者 |
 | `result.xlsx` | 通过复核后的白名单导出 | 只留在获授权的 HR / 接收方 |
 
-- Agent 不获取密码、私钥、保险柜内容、表单明文或明文 Excel；只有填写者明确授权时，宿主才可处理其指定的原始附件并生成 OCR 候选。
+- Agent 只读取模板/任务元数据、字段定义和授权范围内的名单级状态，不读取提交字段值；密码、私钥、保险柜、解密明文和明文 Excel 只由本人在独立终端通过 Python 处理。只有填写者明确授权时，宿主才可处理其指定的原始附件并生成 OCR 候选。
 - 密码不得放入聊天、命令参数或环境变量。
 - OCR 结果只是候选，不代替填写者确认和 HR 复核。
 - 仓库不保存真实名单、凭据、明文资料、附件、提交文件、保险柜、导出表格或项目外文稿。
