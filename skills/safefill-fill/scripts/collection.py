@@ -1126,11 +1126,6 @@ def ocr_attachment(item: dict[str, Any]) -> tuple[str, list[str]]:
     return "", []
 
 
-def is_identity_attachment_field(field_id: str) -> bool:
-    """附件字段按下划线分词后含整词 front/back 才视为证件正反面（避免误伤 backdrop、feedback_scan 等）。"""
-    return any(part in {"front", "back"} for part in field_id.split("_"))
-
-
 def compare_ocr(payload, attachments, field_defs, *, provenance=None):
     """Check each explicitly bound piece of evidence; no empty-set/any-match approval."""
     from ocr_matcher import extract_from_text
@@ -1270,7 +1265,10 @@ def cmd_decide(args):
             if row['status'] != 'needs_review' or missing or hard_conflicts or not issues or any(not item.startswith('ocr:') for item in issues):
                 raise RuntimeError("MANUAL_NOT_ALLOWED: 人工只能裁定 OCR 问题；输入、认证和运行错误不能放行")
     if args.action == 'confirm':
-        from review_evidence import confirm_evidence
+        try:
+            from review_evidence import confirm_evidence
+        except ImportError as exc:
+            raise RuntimeError("MANUAL_REVIEW_UNAVAILABLE: 人工确认模块不可用，无法执行逐项确认") from exc
         candidate_args = {'agent_candidates': payload['agent_ocr']['items']} if payload.get('agent_ocr') else {}
         if not confirm_evidence(payload['values'], attachments, issues, **candidate_args):
             raise RuntimeError("CANCELLED: 未完成逐项确认")

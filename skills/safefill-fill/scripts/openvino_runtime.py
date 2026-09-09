@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import config
 
@@ -32,31 +31,6 @@ def _core_type():
                 "纯文本材料无需 OCR 依赖。"
             ) from exc
     return Core
-
-
-def runtime_info() -> dict[str, Any]:
-    """返回 OpenVINO 版本、可用设备和选定设备，不加载 OCR 模型。"""
-    Core = _core_type()
-    try:
-        import openvino
-
-        version = getattr(openvino, "__version__", "unknown")
-    except ImportError:
-        version = "unknown"
-    core = Core()
-    devices = list(core.available_devices)
-    details = []
-    for device in devices:
-        try:
-            name = str(core.get_property(device, "FULL_DEVICE_NAME"))
-        except Exception:
-            name = device
-        details.append({"id": device, "name": name})
-    return {
-        "openvino_version": version,
-        "requested_device": config.OCR_DEVICE,
-        "available_devices": details,
-    }
 
 
 def install_rapidocr_device_patch() -> None:

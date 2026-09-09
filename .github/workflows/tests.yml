@@ -20,6 +20,8 @@ jobs:
             python: "3.13"
           - os: macos-latest
             python: "3.12"
+          - os: windows-latest
+            python: "3.12"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -30,3 +32,10 @@ jobs:
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m compileall -q skills
       - run: python -m pytest -q
+      - run: ruff check .
+      # collect/fill 的 scripts 含同名同步副本，需分目录检查；--no-incremental 避免跨次缓存串扰。
+      - run: python -m mypy --no-incremental skills/safefill-collect/scripts
+      - run: python -m mypy --no-incremental skills/safefill-fill/scripts
+      - run: python -m mypy --no-incremental tests
+      - run: bandit -r skills -c pyproject.toml
+      - run: python tests/check_skill_sync.py

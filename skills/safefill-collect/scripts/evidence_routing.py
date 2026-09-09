@@ -1,10 +1,6 @@
 """Host-Agent evidence is untrusted data. This module never calls a model or network."""
 from __future__ import annotations
 
-import json
-
-import secure_io
-
 FORMAT = 'yintian-agent-ocr/1'
 BINDING_KEYS = ('task_id', 'schema_hash', 'notice_hash')
 BACKENDS = {'auto', 'local', 'agent', 'manual'}
@@ -27,13 +23,6 @@ def validate_fields(fields):
         keys = bindings(field, fields)
         if not isinstance(keys, list) or any(not isinstance(k, str) or k not in scalars for k in keys) or len(set(keys)) != len(keys):
             raise ValueError('OCR_BINDING_INVALID: 识别字段必须来自本次模板')
-
-
-def load_result(path):
-    try:
-        return json.loads(secure_io.read_bytes(path, MAX_RESULT_BYTES))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise ValueError('AGENT_OCR_INVALID: 候选文件不是有效 JSON') from None
 
 
 def validate_result(task, attachments, result):

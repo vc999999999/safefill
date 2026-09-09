@@ -35,6 +35,11 @@ SafeFill 是一个 AI→AI 的私密资料收集协议。HR Agent 把需求编�
 
 `skills/` 下的两个目录都是独立 Skill。收集者和填写者可以在不同设备上只安装自己需要的一端。
 
+## 共享模块同步
+
+两个 Skill 的 `scripts/` 下有 6 个逐字节相同的共享模块：`collection.py`、`config.py`、`evidence_routing.py`、`ocr_matcher.py`、`openvino_runtime.py`、`secure_io.py`。
+修改其中任何一个必须双侧同步提交；`tests/check_skill_sync.py` 会逐字节比对两侧副本，发现漂移即失败（CI 与本地均可直接运行）。
+
 ## 默认使用方式：AI 请求包 + 本机保险柜
 
 新任务默认采用 `open` 模式：HR 不准备员工名单、个人凭据、任务密码、配置文件或网页表单，也不需要运行终端。Agent 只补问尚未说明的用途、字段、必填性、截止时间和联系人，然后生成 `REQUEST.yintian-request`。

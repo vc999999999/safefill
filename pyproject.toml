@@ -1,0 +1,58 @@
+[tool.ruff]
+target-version = "py311"
+# 存量代码长行普遍 100+（最长 315），取 120 符合现状；未启用 E501，此值仅供后续 formatter 使用。
+line-length = 120
+# safefill/ 是嵌套的独立 git 仓库，不属于本仓库扫描范围。
+extend-exclude = ["safefill"]
+
+[tool.ruff.lint]
+# 务实基线：E4/E7/E9 语法级错误 + F pyflakes。不开 I（存量导入顺序乱，含刻意靠后的 sys.path 引导导入）。
+select = ["E4", "E7", "E9", "F"]
+ignore = [
+    # 存量代码 64 处分号多语句，风格问题，不值得批量改写。
+    "E702",
+    # 存量代码 lambda 赋值，风格问题。
+    "E731",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 存量未使用导入（hashes/sys/Path），已报告待清理；清理后应移除此节。
+"skills/safefill-collect/scripts/collection.py" = ["F401"]
+"skills/safefill-fill/scripts/collection.py" = ["F401"]
+"skills/safefill-fill/scripts/fill_extract.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.11"
+# 扁平 scripts/ 布局：模块间用 `import secure_io` 这类同目录导入，mypy_path 提供解析路径。
+# CI 中按目录分别调用 mypy 并加 --no-incremental，避免两份同名副本（collect/fill 的 collection.py 等）缓存串扰。
+mypy_path = ["skills/safefill-collect/scripts", "skills/safefill-fill/scripts"]
+ignore_missing_imports = true
+follow_imports = "silent"
+exclude = "(^safefill/|__pycache__)"
+
+[[tool.mypy.overrides]]
+# openvino_runtime 运行时动态拿 infer_engine.OpenVINOInferSession 作基类，mypy 无法把变量当类型，属设计使然。
+module = ["openvino_runtime"]
+disable_error_code = ["valid-type", "misc"]
+
+[[tool.mypy.overrides]]
+# collection 的两处告警来源：summary 异构 dict 被推断为 object（operator/attr-defined），
+# 以及 mode 分支保证非 None 但 mypy 无法收窄（arg-type/union-attr）。已作为潜在问题报告给主代理。
+module = ["collection"]
+disable_error_code = ["arg-type", "operator", "attr-defined", "union-attr"]
+
+[[tool.mypy.overrides]]
+# fill 的告警来自 {"format": ..., "entries": {...}} 字面量被推断成 dict[str, Collection[str]] 的联合类型噪声。
+module = ["fill"]
+disable_error_code = ["dict-item", "union-attr"]
+
+[tool.bandit]
+# 逐条评估后的跳过（均为中低危，理由如下）：
+# B108 hardcoded_tmp_directory: secure_io.py:17 命中的是 ('/tmp','/var','/etc') macOS 别名安全校验字面量，并非临时目录使用，误报。
+# B110 try_except_pass: ocr_engine.py:101 图像预处理失败时回退原图，是刻意的容错路径（Low）。
+# B608 hardcoded_sql_expressions: collection.py:1204 的 f-string SQL 拼接内容只来自两个硬编码状态常量，无用户输入，误报。
+# B615 huggingface_unsafe_download: vlm_extract.py:144 在提供 revision 时会显式传入，且下载后有 verify_model 清单校验兜底。
+skips = ["B108", "B110", "B608", "B615"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
