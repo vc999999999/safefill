@@ -3,7 +3,7 @@
 只在员工自己的电脑上运行：业务操作纯本地、不联网；仅显式 vlm-setup 安装模型时联网；只读显式指定的文件；
 默认 AI 请求包使用 yintian-request/1，提交使用 yintian-submission/4；旧表单协议仅作兼容。
 保险柜静态加密存于系统用户数据目录，本机密钥存于独立用户密钥目录；
-无保险柜或缺字段时回退到对话收集（submit）。
+无保险柜或缺字段时由 Agent 对话补齐，再经保险柜确认流程提交。
 """
 from __future__ import annotations
 
@@ -197,42 +197,6 @@ def inspect_info(form: dict[str, Any]) -> dict[str, Any]:
     return info
 
 
-def print_inspect(info: dict[str, Any]) -> None:
-    info = {key: collection.terminal_text(value) if isinstance(value, str) else value for key, value in info.items()}
-    info['fields'] = [{**field, 'label': collection.terminal_text(field['label']),
-                       **({'options': [collection.terminal_text(value) for value in field['options']]} if 'options' in field else {})} for field in info['fields']]
-    mode_label = {"directed": "directed 定向邀请", "group": "group 群组模式（需要个人凭据）", "open": "open AI 请求包（姓名由本人填写）"}[info["mode"]]
-    print(f"SafeFill 请求包：{info['format']} · {mode_label}")
-    print(f"标题：{info['title']}")
-    print(f"用途：{info['purpose']}")
-    print(f"截止时间：{info['deadline']}")
-    print(f"保存期限：{info['retention_until']}")
-    print(f"联系人：{info['contact']}")
-    print(f"更正方式：{info['correction']}")
-    print(f"任务编号：{info['task_id']}")
-    if info["mode"] == "directed":
-        print(f"邀请编号：{info['invite_id']}")
-        if info.get("name"):
-            print(f"预填姓名：{info['name']}")
-    match_label = "与内嵌公钥一致" if info["key_id_match"] else "与内嵌公钥不一致！请勿填写，向发放人重新索取"
-    print(f"公钥指纹（key_id）：{info['key_id']}（{match_label}）")
-    print("字段清单：")
-    for field in info["fields"]:
-        marks = "必填" if field["required"] else "选填"
-        extra = f"，选项：{'/'.join(field['options'])}" if field.get("options") else ""
-        extra += "，可多选文件" if field.get("multiple") else ""
-        print(f"  - {field['id']}：{field['label']}（{field['type']}，{marks}{extra}）")
-    print(info["warning"])
-
-
-def mask_value(field: str, value: str) -> str:
-    if field == "id_number" and len(value) >= 8:
-        return value[:3] + "*" * (len(value) - 7) + value[-4:]
-    if field == "phone" and len(value) >= 8:
-        return value[:3] + "****" + value[-4:]
-    return value[:1] + "***"
-
-
 def _ocr_texts(image_path: Path) -> list[str]:
     from openvino_runtime import install_rapidocr_device_patch
     from rapidocr_openvino import RapidOCR
@@ -252,19 +216,6 @@ def extract_ocr_fields(path: Path) -> dict[str, Any]:
             "LOCAL_OCR_UNAVAILABLE: rapidocr-openvino 为可选依赖，可执行 pip install -r requirements-ocr.txt；也可使用本人授权的宿主 Agent 识别或手工填写，无需 API Key"
         ) from exc
     return fill_extract.extract_fields("\n".join(texts), source=path.name)
-
-
-def scan_idcard(image: str | Path) -> dict[str, Any]:
-    """对显式指定的这一张证件图做本地 OCR 并提取候选；输出一律遮罩。"""
-    path = secure_io.checked_path(image)
-    if not path.is_file():
-        raise FillError(f"图片不存在: {image}")
-    extracted = extract_ocr_fields(path)
-    candidates = {
-        field: [{"value": mask_value(field, item["value"]), "confidence": item["confidence"]} for item in items]
-        for field, items in extracted["candidates"].items()
-    }
-    return {"image": path.name, "candidates": candidates, "ambiguous": extracted["ambiguous"]}
 
 
 def _resolve_attachment(raw: Any) -> Path:
@@ -492,56 +443,8 @@ def seal_data(form, values, attachments, out_path, *, confirmed=False, invite_id
     }
 
 
-def cmd_inspect(args) -> dict[str, Any] | None:
-    info = inspect_info(load_form(args.form))
-    if args.json:
-        return info
-    print_inspect(info)
-    return None
-
-
-def cmd_scan_idcard(args) -> dict[str, Any] | None:
-    result = scan_idcard(args.image)
-    if args.json:
-        return result
-    print(f"证件扫描候选（已遮罩）：{result['image']}")
-    if not result["candidates"]:
-        print("未识别到姓名、身份证号或手机号候选；请检查图片清晰度或改为手动填写。")
-    for field, items in result["candidates"].items():
-        for item in items:
-            print(f"  - {field}: {item['value']}（{item['confidence']}）")
-    if result["ambiguous"]:
-        print(f"存在歧义字段: {', '.join(result['ambiguous'])}；请人工核对后在 values.json 中填写正确取值。")
-    print("以上仅为候选；请将确认后的真实取值自行写入 values.json，工具不会代写。")
-    return None
-
-
-def cmd_openvino_status(_args) -> dict[str, Any]:
-    from openvino_runtime import runtime_info
-
-    return runtime_info()
-
-
-def cmd_submit(args):
-    form = bind_credential(load_form(args.form), getattr(args, "credential", None))
-    path = secure_io.checked_path(args.answers)
-    try:
-        _require_private_answers(path)
-        data = json.loads(secure_io.read_bytes(path, collection.MAX_ENVELOPE_BYTES))
-        if not isinstance(data, dict) or data.get("consent_confirmed") is not True:
-            raise FillError("CONSENT_REQUIRED: 员工必须确认本次字段及附件后才能生成密文")
-        attachments, attachment_problems = _build_attachments(form, data.get("attachments", {}))
-        values, value_problems = _check_values(form, data.get("values", {}))
-        if attachment_problems or value_problems:
-            raise FillError("VALUES_INVALID: " + "; ".join(attachment_problems + value_problems))
-        out = args.out
-        if not out:
-            out = secure_io.checked_path(args.out_dir) / reply_filename(values.get("name", ""))
-        invite_id = _previous_invite_id(form, getattr(args, "previous", None))
-        return seal_data(form, values, attachments, out, confirmed=True, invite_id=invite_id)
-    finally:
-        if path.is_file():
-            path.unlink()
+def cmd_inspect(args) -> dict[str, Any]:
+    return inspect_info(load_form(args.form))
 
 
 def _previous_invite_id(form, previous):
@@ -573,7 +476,7 @@ def _storage_paths(args) -> tuple[Path, Path, dict[str, Any] | None]:
 
 
 def _read_temp_answers(path_str) -> dict[str, Any]:
-    """读取 0700 目录中的 0600 临时 JSON；无论成败都删除，与 submit 同一纪律。"""
+    """读取 0700 目录中的 0600 临时 JSON；无论成败都删除。"""
     path = secure_io.checked_path(path_str)
     try:
         _require_private_answers(path)
@@ -1044,23 +947,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("inspect", help="查看需求格式文件的告知内容、字段清单与公钥指纹（不修改文件）")
     p.add_argument("form", metavar="REQUEST.yintian-request")
-    p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_inspect)
-    p = sub.add_parser("openvino-status", help="查看 OpenVINO 版本、可用设备和当前设备选择")
-    p.set_defaults(func=cmd_openvino_status)
-    p = sub.add_parser("scan-idcard", help="本地 OCR 扫描一张证件图，遮罩输出候选（可选依赖）")
-    p.add_argument("image", metavar="IMAGE")
-    p.add_argument("--json", action="store_true")
-    p.set_defaults(func=cmd_scan_idcard)
-    p = sub.add_parser("submit", help="读取机器请求包，并在字段齐全且本人确认后生成加密提交")
-    p.add_argument("form", metavar="REQUEST.yintian-request")
-    p.add_argument("--answers", required=True, help="仅供本次加密使用的 0600 临时 JSON")
-    output = p.add_mutually_exclusive_group(required=True)
-    output.add_argument("--out", help="兼容入口：显式指定输出 .yintian 路径")
-    output.add_argument("--out-dir", help="推荐入口：在目录中自动生成 姓名-短码.yintian")
-    p.add_argument("--previous", help="更正时指定本人上一次开放请求回执，以替换同一条记录")
-    p.add_argument("--credential", help="旧 group 模式的个人凭据；open 模式不需要")
-    p.set_defaults(func=cmd_submit)
     p = sub.add_parser("vault-status", help="查看本机保险柜摘要及与请求包的字段匹配预览（不输出条目值）")
     p.add_argument("--request", metavar="REQUEST.yintian-request", help="可选：按该请求包字段预览 match/missing")
     _add_storage_args(p)

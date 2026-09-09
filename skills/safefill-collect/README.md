@@ -9,4 +9,4 @@ python scripts/collection.py create-request --config collection.json --out tasks
 python scripts/collection.py collect TASK_DIR INCOMING_DIR --out result.xlsx
 ```
 
-HR 不需要准备姓名名单、个人凭据、任务密码、网页表单或运行终端。必须原样发送请求包。回执文件名显示员工填写的姓名，收集端仍以解密后的姓名为准；开放请求使用自报身份，需要提交者认证时才使用兼容的 `group` 模式。
+HR 不需要准备姓名名单、个人凭据、任务密码、网页表单或运行终端。必须原样发送请求包。回执文件名显示员工填写的姓名，收集端仍以解密后的姓名为准；需要强身份认证时应采用独立认证渠道。

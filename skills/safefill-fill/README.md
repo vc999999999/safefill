@@ -5,7 +5,7 @@
 Agent 内部流程：
 
 ```bash
-python scripts/fill.py inspect REQUEST.yintian-request --json
+python scripts/fill.py inspect REQUEST.yintian-request
 python scripts/fill.py vault-status --request REQUEST.yintian-request
 python scripts/fill.py vault-stage --answers TEMP.json --confirmation-out CHANGE.yintian-confirmation
 python scripts/fill.py vault-apply --confirmation CHANGE.yintian-confirmation

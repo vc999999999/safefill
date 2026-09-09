@@ -2,6 +2,5 @@
   "venv_name": "safefill-fill",
   "python_version": "3.11",
   "mem_need_gb": 1.5,
-  "server_alive_timeout": 300,
-  "models": []
+  "server_alive_timeout": 300
 }
