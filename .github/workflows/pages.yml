@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - yintian-skill/assets/flowchart.html
+      - skills/yintian-skill/assets/flowchart.html
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -33,8 +33,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/yintian-pages"
-          cp yintian-skill/assets/flowchart.html "$RUNNER_TEMP/yintian-pages/flowchart.html"
-          cp yintian-skill/assets/flowchart.html "$RUNNER_TEMP/yintian-pages/index.html"
+          cp skills/yintian-skill/assets/flowchart.html "$RUNNER_TEMP/yintian-pages/flowchart.html"
+          cp skills/yintian-skill/assets/flowchart.html "$RUNNER_TEMP/yintian-pages/index.html"
           touch "$RUNNER_TEMP/yintian-pages/.nojekyll"
       - uses: actions/upload-pages-artifact@v4
         with:
