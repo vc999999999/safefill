@@ -635,8 +635,10 @@ def save_local_task_secret(root: Path, task_id: str, secret: str) -> Path:
 
 def load_local_task_secret(root: Path, task_id: str) -> str:
     path = local_task_secret_path(root, task_id)
-    if not path.is_file() or (os.name != "nt" and path.stat().st_mode & 0o077):
-        raise RuntimeError("LOCAL_KEY_UNAVAILABLE: 开放任务的本地密钥缺失或权限不安全")
+    if not path.is_file():
+        raise RuntimeError("LOCAL_KEY_UNAVAILABLE: 开放任务的本地密钥缺失；若是跨设备/跨目录迁移，请在源机器运行 export-task 并在本机 import-task")
+    if os.name != "nt" and path.stat().st_mode & 0o077:
+        raise RuntimeError(f"LOCAL_KEY_UNAVAILABLE: 开放任务的本地密钥权限不安全，请将 {path} 权限修为 600")
     try:
         secret = secure_io.read_bytes(path, 256).decode("ascii")
     except (OSError, UnicodeDecodeError) as exc:
@@ -824,12 +826,15 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path) -> dict[str, 
     if not source.is_dir():
         raise NotADirectoryError(source)
     paths = []
+    skipped_directories = 0
     for path in source.iterdir():
         if path.suffix == ".yintian":
             paths.append(path)
             if len(paths) > MAX_PACKAGE_FILES:
                 raise ValueError(f"INBOX_LIMIT: 单次收件最多处理 {MAX_PACKAGE_FILES} 个回执")
-    summary = {"accepted": 0, "duplicates": 0, "rejected": 0, "errors": []}
+        elif path.is_dir():
+            skipped_directories += 1
+    summary = {"accepted": 0, "duplicates": 0, "rejected": 0, "errors": [], "skipped_directories": skipped_directories}
     with task_lock(root), closing(connect_db(root)) as db, db:
         stored_bytes = 0
         for stored in db.execute("SELECT path FROM submissions"):
@@ -897,6 +902,8 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path) -> dict[str, 
                 summary["errors"].append({"file_ref": digest[:12] if digest else f"entry-{index}", "error": type(exc).__name__,
                                           "code": "INGEST_IO" if isinstance(exc, OSError) else "SUBMISSION_REJECTED",
                                           "retryable": isinstance(exc, OSError), "next_action": "retry" if isinstance(exc, OSError) else "check_invitation"})
+    if skipped_directories and not (summary["accepted"] or summary["duplicates"] or summary["rejected"]):
+        summary["hint"] = f"收件目录顶层无 .yintian 文件，不递归子目录；发现 {skipped_directories} 个子目录，请将回执文件移到顶层后重试"
     return summary
 
 
@@ -922,6 +929,13 @@ def unlock_private_key(root: Path, password: str | None):
     if not blob.startswith(LEGACY_KEY_PEM_PREFIX):
         raise ValueError("私钥文件既不是 yintian-key/1 信封，也不是加密的 PKCS#8 PEM，拒绝解锁")
     return serialization.load_pem_private_key(data, password=password.encode())
+
+
+def task_password(task_dir: str | Path) -> str | None:
+    task = load_task(task_dir)[1]
+    if task_mode(task) == "open":
+        return None
+    return getpass.getpass("任务密码: ")
 
 
 def aad_for(envelope: dict[str, Any]) -> bytes:
@@ -1240,7 +1254,7 @@ def review_task(task_dir, password, retry_needs_review=False, invite_id=None):
 
 def cmd_review(args):
     require_tty("review")
-    return review_task(args.task_dir, getpass.getpass("任务密码: "),
+    return review_task(args.task_dir, task_password(args.task_dir),
                        getattr(args, "retry_needs_review", False), getattr(args, "invite", None))
 
 
@@ -1252,7 +1266,7 @@ def cmd_decide(args):
         raise RuntimeError("TASK_EXPIRED: 任务已到期")
     if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", args.operator):
         raise ValueError("OPERATOR_INVALID: 操作者标识限字母、数字、_.@-")
-    private_key = unlock_private_key(root, getpass.getpass("任务密码: "))
+    private_key = unlock_private_key(root, task_password(args.task_dir))
     with task_lock(root), closing(connect_db(root)) as db:
         row = db.execute("SELECT s.*,i.name,i.employee_id,i.token_hash FROM submissions s JOIN invites i ON i.invite_id=s.invite_id WHERE s.invite_id=? ORDER BY s.version DESC LIMIT 1", (args.invite_id,)).fetchone()
         if row is None or row['version'] != args.version or row['status'] in {'verified_manual', 'returned'}:
@@ -1418,7 +1432,7 @@ def cmd_reveal(args) -> dict[str, Any] | None:
     require_current_format(task, "查看明文")
     if task_expired(task):
         raise RuntimeError("任务已超过保存期限，禁止查看明文")
-    password = getpass.getpass("任务密码: ")
+    password = task_password(args.task_dir)
     try:
         private_key = unlock_private_key(root, password)
     except Exception as exc:
@@ -1556,18 +1570,24 @@ def collect_open_rows(root: Path, task: dict[str, Any], private_key, attachment_
     return output, attachment_count
 
 
-def collect_open(task_dir: str | Path, submissions_dir: str | Path, out: str | Path) -> dict[str, Any]:
+def suggested_output_name(out_path: Path) -> str:
+    return f"{out_path.stem}-{datetime.now().strftime('%Y%m%d-%H%M')}{out_path.suffix}"
+
+
+def collect_open(task_dir: str | Path, submissions_dir: str | Path, out: str | Path, retry_needs_review: bool = True) -> dict[str, Any]:
     root, task = load_task(task_dir)
     if task_mode(task) != "open":
         raise ValueError("collect 仅用于无需名单的开放请求任务；旧任务继续使用 ingest/review/export-clear")
-    ingested = ingest_task(root, submissions_dir)
-    reviewed = review_task(root, None)
-    field_ids = [field["id"] for field in task["fields"] if field["id"] not in {"employee_id", "name"}]
     out_path = secure_io.checked_path(out).with_suffix(".xlsx")
     attachment_fields = [field for field in task["fields"] if field["type"] in ATTACHMENT_TYPES]
     attachment_target = out_path.with_name(out_path.stem + "-attachments")
+    if out_path.exists():
+        raise FileExistsError(f"OUTPUT_EXISTS: 导出文件已存在，请选择新文件名（例如 {suggested_output_name(out_path)}）")
     if attachment_fields and attachment_target.exists():
         raise FileExistsError("OUTPUT_EXISTS: 附件导出目录已存在，请选择新文件名")
+    ingested = ingest_task(root, submissions_dir)
+    reviewed = review_task(root, None, retry_needs_review=retry_needs_review)
+    field_ids = [field["id"] for field in task["fields"] if field["id"] not in {"employee_id", "name"}]
     attachment_stage = None
     written: dict[str, str] = {}
     try:
@@ -1601,7 +1621,7 @@ def collect_open(task_dir: str | Path, submissions_dir: str | Path, out: str | P
 
 
 def cmd_collect_open(args) -> dict[str, Any]:
-    return collect_open(args.task_dir, args.submissions_dir, args.out)
+    return collect_open(args.task_dir, args.submissions_dir, args.out, retry_needs_review=not getattr(args, "no_retry_needs_review", False))
 
 
 def write_clear_export(root: Path, task: dict[str, Any], rows: list[dict[str, str]], field_ids: list[str], masks: dict[str, str],
@@ -2019,7 +2039,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ingest", help="接收 .yintian 密文提交")
     p.add_argument("task_dir"); p.add_argument("submissions_dir"); p.set_defaults(func=cmd_ingest)
     p = sub.add_parser("collect", help="开放请求一键收件、校验、解密并导出 Excel")
-    p.add_argument("task_dir"); p.add_argument("submissions_dir"); p.add_argument("--out", required=True); p.set_defaults(func=cmd_collect_open)
+    p.add_argument("task_dir"); p.add_argument("submissions_dir"); p.add_argument("--out", required=True)
+    p.add_argument("--no-retry-needs-review", action="store_true", help="默认重审历史 needs_review 回执；此旗标关闭重审"); p.set_defaults(func=cmd_collect_open)
     p = sub.add_parser("review", help="本地解密、校验和 OpenVINO OCR 复核")
     p.add_argument("task_dir"); p.add_argument("--retry-needs-review", action="store_true"); p.add_argument("--invite"); p.set_defaults(func=cmd_review)
     p = sub.add_parser("decide", help="本人终端逐项核对 OCR 证据或退回重填")

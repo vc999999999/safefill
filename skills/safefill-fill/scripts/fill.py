@@ -489,6 +489,20 @@ def _read_temp_answers(path_str) -> dict[str, Any]:
             path.unlink()
 
 
+def _read_stdin_answers() -> dict[str, Any]:
+    """从标准输入读取临时 JSON；明文不落盘。"""
+    raw = sys.stdin.buffer.read(collection.MAX_ENVELOPE_BYTES + 1)
+    if len(raw) > collection.MAX_ENVELOPE_BYTES:
+        raise FillError("VAULT_ANSWERS_INVALID: 标准输入超过大小上限")
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise FillError("VAULT_ANSWERS_INVALID: 标准输入不是有效 JSON") from exc
+    if not isinstance(data, dict):
+        raise FillError("VAULT_ANSWERS_INVALID: 临时 JSON 必须是对象")
+    return data
+
+
 def _build_vault_attachments(entry_id: str, entry_type: str, paths: list) -> list:
     pseudo = {"fields": [{"id": entry_id, "label": entry_id, "type": entry_type, "required": False, "multiple": True}]}
     built, errors = _build_attachments(pseudo, {entry_id: paths})
@@ -567,21 +581,22 @@ def _entry_preview(entry: dict[str, Any] | None) -> Any:
 
 
 def cmd_vault_stage(args) -> dict[str, Any]:
-    answers_path = secure_io.checked_path(args.answers)
+    answers_path = None if args.answers == "-" else secure_io.checked_path(args.answers)
     try:
         vault_path, key_path, _migration = _storage_paths(args)
         confirmation_path = secure_io.checked_path(args.confirmation_out)
     except Exception:
-        if answers_path.is_file():
+        if answers_path is not None and answers_path.is_file():
             answers_path.unlink()
         raise
-    if answers_path in {vault_path, key_path}:
+    if answers_path is not None and answers_path in {vault_path, key_path}:
         raise FillError("VAULT_PATH_COLLISION: 临时文件、确认文件、保险柜和密钥路径必须分开")
     if confirmation_path in {vault_path, key_path}:
-        if answers_path.is_file():
+        if answers_path is not None and answers_path.is_file():
             answers_path.unlink()
         raise FillError("VAULT_PATH_COLLISION: 临时文件、确认文件、保险柜和密钥路径必须分开")
-    entries = _build_entries(_entry_specs(_read_temp_answers(str(answers_path))))
+    answers = _read_stdin_answers() if answers_path is None else _read_temp_answers(str(answers_path))
+    entries = _build_entries(_entry_specs(answers))
     try:
         vault.ensure_private_dir(vault_path.parent)
         vault.ensure_private_dir(key_path.parent)
@@ -607,7 +622,10 @@ def cmd_vault_stage(args) -> dict[str, Any]:
                 {"vault_path": str(vault_path), "key_path": str(key_path),
                  "base_vault_sha256": vault.file_digest(vault_path) if vault_path.is_file() else None,
                  "entries": entries})
-        except (FileExistsError, RuntimeError, ValueError) as exc:
+        except FileExistsError as exc:
+            raise FillError(f"CONFIRMATION_EXISTS: 确认文件已存在: {confirmation_path}；"
+                            "若上次操作已放弃，请删除该文件后重试，或更换 --confirmation-out 路径") from exc
+        except (RuntimeError, ValueError) as exc:
             raise FillError(str(exc)) from exc
     changes = [
         {"id": entry_id, "type": entry["type"], "action": "update" if entry_id in profile["entries"] else "add",
@@ -840,7 +858,10 @@ def cmd_vault_preview(args) -> dict[str, Any]:
                  "previous_sha256": _optional_digest(getattr(args, "previous", None), collection.MAX_ENVELOPE_BYTES),
                  "credential_sha256": _optional_digest(getattr(args, "credential", None), 16 * 1024),
                  "invite_id": invite_id})
-        except (FileExistsError, RuntimeError, ValueError) as exc:
+        except FileExistsError as exc:
+            raise FillError(f"CONFIRMATION_EXISTS: 确认文件已存在: {confirmation_path}；"
+                            "若上次操作已放弃，请删除该文件后重试，或更换 --confirmation-out 路径") from exc
+        except (RuntimeError, ValueError) as exc:
             raise FillError(str(exc)) from exc
         preview = []
         for field in form["fields"]:
@@ -1081,7 +1102,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_storage_args(p)
     p.set_defaults(func=cmd_vault_status)
     p = sub.add_parser("vault-stage", help="暂存新增或更新条目并输出完整新旧值；不立即修改保险柜")
-    p.add_argument("--answers", required=True, help='0700 目录内的 0600 临时 JSON：{"entries": {"phone": {"type": "phone_cn", "value": "..."}}}')
+    p.add_argument("--answers", required=True,
+                   help='推荐 "-"：从标准输入读取 JSON，明文不落盘；或 0700 目录内的 0600 临时 JSON：{"entries": {"phone": {"type": "phone_cn", "value": "..."}}}')
     p.add_argument("--confirmation-out", required=True, help="写入 0600 加密确认文件；路径必须位于 0700 目录")
     _add_storage_args(p)
     p.set_defaults(func=cmd_vault_stage)

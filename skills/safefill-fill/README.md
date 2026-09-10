@@ -7,13 +7,13 @@ Agent 内部流程：
 ```bash
 python scripts/fill.py inspect REQUEST.yintian-request
 python scripts/fill.py vault-status --request REQUEST.yintian-request
-python scripts/fill.py vault-stage --answers TEMP.json --confirmation-out CHANGE.yintian-confirmation
+printf '%s' "$JSON" | python scripts/fill.py vault-stage --answers - --confirmation-out CHANGE.yintian-confirmation
 python scripts/fill.py vault-apply --confirmation CHANGE.yintian-confirmation
 python scripts/fill.py vault-preview REQUEST.yintian-request --mapping MAP.json --confirmation-out SUBMIT.yintian-confirmation
 python scripts/fill.py vault-fill REQUEST.yintian-request --confirmation SUBMIT.yintian-confirmation --out-dir OUTPUT_DIR
 ```
 
-`vault-stage` 会删除 `0600` 明文临时 JSON，并生成加密确认文件；`vault-apply` 只应用员工看过的变更。`vault-preview` 生成的确认文件有效 30 分钟，绑定请求包、保险柜、映射、完整取值、凭据和旧回执；任何内容变化后 `vault-fill` 都会拒绝提交。
+`vault-stage` 推荐经标准输入传入 answers JSON（明文不落盘）；也接受 `0700` 目录中的 `0600` 明文临时 JSON，读后即删。两种方式的输出都是加密确认文件；`vault-apply` 只应用员工看过的变更。`vault-preview` 生成的确认文件有效 30 分钟，绑定请求包、保险柜、映射、完整取值、凭据和旧回执；任何内容变化后 `vault-fill` 都会拒绝提交。
 
 默认保险柜存放在系统用户数据目录，密钥存放在独立的系统用户密钥目录。旧版 Skill `data/` 中的 v2 保险柜会无损复制并校验；v1 通过 `vault-migrate --password-file TEMP` 无终端迁移，旧文件不会删除。
 
