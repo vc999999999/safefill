@@ -283,17 +283,26 @@ def test_vlm_candidates_flag_needs_review_for_unvalidated_fields(tmp_path, monke
     assert candidates["phone"]["valid"] is True and "needs_review" not in candidates["phone"]
 
 
-def test_vault_fill_warns_about_existing_receipts(tmp_path, isolated_vault):
+def test_vault_fill_warns_only_about_same_task_receipts(tmp_path, isolated_vault):
     request, _task_dir = make_request(tmp_path, [
         {"id": "name", "label": "姓名", "type": "text", "required": True, "sensitive": True},
     ])
+    task_id = json.loads(request.read_text(encoding="utf-8"))["task_id"]
     stage(tmp_path, {"name": {"type": "text", "value": "张三"}})
+    incoming = private(tmp_path / "incoming")
+    (incoming / "张三-OTHER1.yintian").write_text(json.dumps({"task_id": "YT-20000101-OTHER0"}), encoding="utf-8")
+    (incoming / "broken.yintian").write_bytes(b"old-receipt")
+
     confirmation = tmp_path / "private" / "submit.yintian-confirmation"
     run(["vault-preview", str(request), "--confirmation-out", str(confirmation)])
-    incoming = private(tmp_path / "incoming")
-    (incoming / "张三-AAAAAA.yintian").write_bytes(b"old-receipt")
-    result = run(["vault-fill", str(request), "--confirmation", str(confirmation), "--out-dir", str(incoming)])
-    assert "--previous" in result["warning"] and "重复" in result["warning"]
+    first = run(["vault-fill", str(request), "--confirmation", str(confirmation), "--out-dir", str(incoming)])
+    assert "warning" not in first
+
+    confirmation2 = tmp_path / "private" / "submit2.yintian-confirmation"
+    run(["vault-preview", str(request), "--confirmation-out", str(confirmation2)])
+    second = run(["vault-fill", str(request), "--confirmation", str(confirmation2), "--out-dir", str(incoming)])
+    assert "--previous" in second["warning"] and Path(first["out"]).name in second["warning"]
+    assert json.loads(Path(first["out"]).read_text(encoding="utf-8"))["task_id"] == task_id
 
 
 def test_vlm_setup_modelscope_source(tmp_path, monkeypatch):

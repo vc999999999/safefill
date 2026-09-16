@@ -421,6 +421,7 @@ def build_entry(entry_id: str, spec: dict, build_attachments) -> dict:
     label = spec.get("label", "")
     if not isinstance(label, str) or len(label) > 100:
         raise ValueError(f"VAULT_ENTRY_INVALID: 条目 {entry_id} 标签无效")
+    label = label.strip() or entry_id  # 空标签回退为条目 id，保证 vault-status 里每条都可读
     source = _validate_source(spec.get("source") or {"kind": "manual"})
     entry = {"type": entry_type, "label": label, "source": source, "updated_at": datetime.now(timezone.utc).isoformat()}
     if entry_type in collection.ATTACHMENT_TYPES:

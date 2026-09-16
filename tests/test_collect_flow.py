@@ -74,7 +74,7 @@ def test_ingest_reports_skipped_directories_and_hint(tmp_path):
     assert "张三" not in serialized and "李四" not in serialized
 
 
-def test_ingest_no_hint_when_top_level_receipts_processed(tmp_path):
+def test_ingest_hint_mentions_subdirectories_even_when_top_level_processed(tmp_path):
     task_dir = make_open_task(tmp_path)
     incoming = private(tmp_path / "incoming")
     (incoming / "broken.yintian").write_bytes(b"not-json")
@@ -84,7 +84,8 @@ def test_ingest_no_hint_when_top_level_receipts_processed(tmp_path):
 
     assert summary["rejected"] == 1
     assert summary["skipped_directories"] == 1
-    assert "hint" not in summary
+    assert summary["hint"] == "收件目录不递归子目录；发现 1 个子目录，若其中还有回执请将回执文件移到顶层后重试"
+    assert "张三" not in json.dumps(summary, ensure_ascii=False)
 
 
 def test_ingest_no_hint_without_skipped_directories(tmp_path):

@@ -8,11 +8,11 @@ SafeFill 是一个 AI→AI 的私密资料收集协议。HR Agent 把需求编�
 
 **1. 本机加密保险柜 · 一次录入，终身复用**
 
-员工资料沉淀在系统用户数据目录的 `yintian-vault/2` 保险柜中：scrypt + AES-256-GCM 静态加密，`0600` 本机密钥放在独立用户密钥目录，不联网、不分发。之后只问保险柜里没有的字段；脚本仅按相同字段 ID 自动匹配，语义映射必须由员工 Agent 明确提出并由本人确认。
+员工资料沉淀在系统用户数据目录的 `yintian-vault/2` 保险柜中：scrypt + AES-256-GCM 静态加密，`0600` 本机密钥放在独立用户密钥目录，不联网、不分发。之后只问保险柜里没有的字段；脚本仅按相同字段 ID 自动匹配，语义映射必须由员工 Agent 明确提出并由本人确认。为了让复用真正发生，HR 端字段 id 使用[标准字段 id 词表](skills/safefill-collect/references/collection-config.md)（`phone`、`id_number`、`address`、`hire_date`、`id_front`…），`vault-scan` 也按同一套 id 输出。
 
 **2. OpenVINO 本地模型提取 · 安装后离线、无 API Key**
 
-`vault-scan` 用 OpenVINO 在本机推理，把员工明确指定的证件图变成结构化字段候选：基线为 rapidocr OCR，也可通过 `--model` 使用用户选择的兼容 VLM，模型 revision 可选。`vlm-setup` 安装阶段需要联网，安装后的推理使用本地模型。识别结果永远只是候选，确定性校验和本人确认后才写入保险柜。
+`vault-scan` 用 OpenVINO 在本机推理，把员工明确指定的证件图变成结构化字段候选（`name/id_number/phone/address`，并由身份证号派生 `birth_date/gender`）：基线为 rapidocr OCR（仅 Python 3.11 可装），也可通过 `--model` 使用用户选择的兼容 VLM，模型 revision 可选。`vlm-setup` 安装阶段需要联网，安装后的推理使用本地模型。识别结果永远只是候选，确定性校验和本人确认后才写入保险柜。
 
 **3. 端到端加密 · 密码学兜底**
 
@@ -42,11 +42,11 @@ SafeFill 是一个 AI→AI 的私密资料收集协议。HR Agent 把需求编�
 
 ## 默认使用方式：AI 请求包 + 本机保险柜
 
-新任务默认采用 `open` 模式：HR 不准备员工名单、个人凭据、任务密码、配置文件或网页表单，也不需要运行终端。Agent 只补问尚未说明的用途、字段、必填性、截止时间和联系人，然后生成 `REQUEST.yintian-request`。
+新任务默认采用 `open` 模式：HR 不准备员工名单、个人凭据、任务密码、配置文件或网页表单，也不需要运行终端。Agent 只补问尚未说明的用途、字段、必填性、截止时间和联系人，然后生成 `REQUEST.yintian-request`。截止与保存时间必须带时区偏移；保存期限（默认截止后 30 天）一到，收件端按告知承诺拒绝解密，HR 需在此之前完成汇总。附件与填写值的自动比对（`ocr_fields`）默认关闭，只在 HR 明确要求并知晓"比对不通过需 HR 本人在终端 `decide` 裁定"后启用；字段名本身不会触发比对。
 
-员工把请求包交给安装了 `safefill-fill` 的 Agent：Agent 读取并说明用途后运行 `vault-status`。首次使用或存在缺项时，通过 `vault-stage` 展示完整新旧值、本人确认后 `vault-apply`；提交前再由 `vault-preview` 展示本次完整取值和来源，确认后 `vault-fill` 生成 `姓名-随机短码.yintian`。员工本人发送回执，HR Agent 收件后统一解密、校验并导出 Excel 和附件。
+员工把请求包交给安装了 `safefill-fill` 的 Agent：Agent 读取并说明用途后运行 `vault-status`。首次使用或存在缺项时，通过 `vault-stage` 展示完整新旧值、本人确认后 `vault-apply`；提交前再由 `vault-preview` 展示本次完整取值和来源，确认后 `vault-fill` 生成 `姓名-随机短码.yintian`。员工本人发送回执，HR Agent 收件后统一解密、校验并导出 Excel 和附件；`collect` 同时返回逐人排除原因、迟交人数与同名多行提醒。
 
-这意味着当前 Agent 会实际处理用户主动提供的明文。保险柜保护静态资料，回执端到端加密保护传输与汇总侧的内容，都不把明文对正在执行填写或汇总的 Agent 隐藏。若部署方不允许 Agent 接触明文，当前自动流程不适用。
+这意味着当前 Agent 会实际处理用户主动提供的明文。保险柜保护静态资料，回执端到端加密保护传输与汇总侧的内容，都不把明文对正在执行填写或汇总的 Agent 隐藏。若部署方不允许 Agent 接触明文，当前自动流程不适用。经标准输入传入的明文也会出现在 Agent 的命令行与宿主工具日志中；宿主持久化命令日志时应改用 `0700` 目录内的 `0600` 临时文件传值。
 
 请求包的身份是提交者自报，不能防止同名、冒名、请求包转发或垃圾提交；需要强身份认证时应采用独立认证渠道。
 
@@ -65,7 +65,7 @@ HR 说明用途、字段、期限和联系人
 1. Agent 从对话提取需求，只合并询问缺项；`name` 自动作为必填字段，不向 HR 索取名单。
 2. HR 原样转发机器请求包；员工不打开、不手工填写，员工 Agent 读取后按保险柜匹配结果只问缺项，取值与映射经本人确认后加密。
 3. 首次回执生成随机记录编号；更正时必须携带本人上一次回执沿用编号，不能按姓名猜测覆盖。
-4. 收集端不信任文件名，以解密后的姓名和字段为准；异常、待复核或非最新记录不进入 Excel。
+4. 收集端不信任文件名，以解密后的姓名和字段为准；异常、待复核或非最新记录不进入 Excel，`collect` 会按人给出原因与下一步。
 5. 附件解密到 Excel 同名目录，单元格保存相对路径；明文输出只留给获授权的 HR。
 
 ## 安装
@@ -132,10 +132,10 @@ safefill/
 # HR 侧：生成请求包
 $PY skills/safefill-collect/scripts/collection.py create-request --config collection.json --out tasks
 # 员工侧：暂存确认 → 精确匹配 → 提交确认 → 生成回执
-$PY skills/safefill-fill/scripts/fill.py vault-stage --answers TEMP.json --confirmation-out CHANGE.yintian-confirmation
-$PY skills/safefill-fill/scripts/fill.py vault-apply --confirmation CHANGE.yintian-confirmation
-$PY skills/safefill-fill/scripts/fill.py vault-preview tasks/<TASK_DIR>/REQUEST.yintian-request --confirmation-out SUBMIT.yintian-confirmation
-$PY skills/safefill-fill/scripts/fill.py vault-fill tasks/<TASK_DIR>/REQUEST.yintian-request --confirmation SUBMIT.yintian-confirmation --out-dir incoming
+printf '%s' "$JSON" | $PY skills/safefill-fill/scripts/fill.py vault-stage --answers - --confirmation-out "$WORK/CHANGE.yintian-confirmation"   # $WORK 为 0700 目录
+$PY skills/safefill-fill/scripts/fill.py vault-apply --confirmation "$WORK/CHANGE.yintian-confirmation"
+$PY skills/safefill-fill/scripts/fill.py vault-preview tasks/<TASK_DIR>/REQUEST.yintian-request --confirmation-out "$WORK/SUBMIT.yintian-confirmation"
+$PY skills/safefill-fill/scripts/fill.py vault-fill tasks/<TASK_DIR>/REQUEST.yintian-request --confirmation "$WORK/SUBMIT.yintian-confirmation" --out-dir incoming
 # HR 侧：解密汇总
 $PY skills/safefill-collect/scripts/collection.py collect tasks/<TASK_DIR> incoming --out result.xlsx
 $PY -m pytest -q

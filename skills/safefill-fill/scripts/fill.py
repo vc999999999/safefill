@@ -188,8 +188,15 @@ def inspect_info(form: dict[str, Any]) -> dict[str, Any]:
         "warning": VERIFY_HINT,
         "credential_required": form["mode"] == "group",
         "identity_assurance": "self_declared" if form["mode"] == "open" else "credential_bound",
+        "past_deadline": collection.task_late(form, collection.now_iso()),
         "expired": collection.task_expired(form),
     }
+    if not info["key_id_match"]:
+        info["stop_reason"] = "KEY_MISMATCH: 请求包内公钥与 key_id 不一致，文件可能被替换，请勿填写并联系发放人"
+    elif info["expired"]:
+        info["stop_reason"] = f"TASK_EXPIRED: 已超过保存期限 {form['retention_until']}，收集方不再接收，请按 contact 索取新请求包"
+    elif info["past_deadline"]:
+        info["deadline_notice"] = f"已过截止时间 {form['deadline']}，仍可提交但会被标记为迟交；建议先与 {form['contact']} 确认是否继续"
     if form["mode"] == "directed":
         info["invite_id"] = form["invite_id"]
         if form.get("name"):
@@ -566,6 +573,10 @@ def cmd_vault_status(args) -> dict[str, Any]:
         raise FillError(str(exc)) from exc
     result = vault.status_view(profile, form)
     result.update(vault_path=str(vault_path), key_path=str(key_path))
+    if form is not None and result.get("missing"):
+        result["same_type_entries"] = _same_type_entries(form, profile, result["missing"])
+        result["hint"] = ("missing 中的字段若在 same_type_entries 里有语义相同的条目，由 Agent 向员工提出显式 mapping 并确认后"
+                          "传给 vault-preview --mapping；类型相同不代表语义相同，不得自动代用。")
     if migration:
         result["storage_migration"] = migration
     return result
@@ -804,7 +815,8 @@ def _mapping(path_str: str | None) -> dict[str, str]:
     return data
 
 
-def _prepare_vault_selection(form, profile, mapping):
+def _prepare_vault_selection(form, profile, mapping, *, strict=True):
+    """strict=False 时不因必填缺失报错，而是把缺项返回给调用方，让 preview 一次给出全貌。"""
     try:
         values, attachments, missing, matches = vault.select_fields(form, profile, mapping)
     except ValueError as exc:
@@ -817,13 +829,29 @@ def _prepare_vault_selection(form, profile, mapping):
         missing = [field_id for field_id in missing if field_id != "employee_id"]
     labels = {field["id"]: field["label"] for field in form["fields"]}
     required_missing = [field["id"] for field in form["fields"] if field.get("required") and field["id"] in missing]
-    if required_missing:
+    if required_missing and strict:
         raise FillError("VAULT_FIELDS_MISSING: 保险柜缺少必填字段，请询问本人后用 vault-stage/vault-apply 补录: "
                         + ", ".join(f"{labels[field_id]}（{field_id}）" for field_id in required_missing))
     attachment_problems = _check_vault_attachments(form, attachments)
-    if attachment_problems:
+    if attachment_problems and (strict or not required_missing):
         raise FillError("ATTACHMENTS_INVALID: " + "; ".join(attachment_problems))
-    return values, attachments, missing, matches
+    return values, attachments, missing, matches, required_missing
+
+
+def _field_preview(form, profile, values, attachments, matches):
+    preview = []
+    for field in form["fields"]:
+        field_id = field["id"]
+        if field_id in attachments:
+            content = [{"name": item["name"], "size": item["size"], "sha256": item["sha256"]}
+                       for item in attachments[field_id]]
+        else:
+            content = values.get(field_id)
+        preview.append({"id": field_id, "label": field["label"], "type": field["type"], "required": bool(field.get("required")),
+                        "value": content, "source_entry": matches.get(field_id),
+                        "source": (profile["entries"][matches[field_id]]["source"]["kind"]
+                                   if field_id in matches else "request_identity" if field_id in values else None)})
+    return preview
 
 
 def _optional_digest(path_str: str | None, limit: int) -> str | None:
@@ -846,7 +874,15 @@ def cmd_vault_preview(args) -> dict[str, Any]:
     with secure_io.file_lock(str(vault_path) + ".lock"):
         try:
             profile = vault.load_vault(vault_path, key)
-            values, attachments, missing, matches = _prepare_vault_selection(form, profile, mapping)
+            values, attachments, missing, matches, required_missing = _prepare_vault_selection(form, profile, mapping, strict=False)
+            if required_missing:
+                labels = {field["id"]: field["label"] for field in form["fields"]}
+                return {"ready": False, "fields": _field_preview(form, profile, values, attachments, matches), "mapping": mapping,
+                        "required_missing": [{"id": field_id, "label": labels[field_id]} for field_id in required_missing],
+                        "optional_missing": [field_id for field_id in missing if field_id not in required_missing],
+                        "same_type_entries": _same_type_entries(form, profile, required_missing),
+                        "instruction": ("未生成确认文件。请把已匹配的完整值和缺失的必填项一并展示给员工：缺项由员工补充后 vault-stage/vault-apply，"
+                                        "或在 same_type_entries 中有语义相同条目时由 Agent 提出 --mapping 并经员工确认；然后重新运行 vault-preview。")}
             invite_id = _previous_invite_id(form, getattr(args, "previous", None))
             vault.ensure_private_dir(confirmation_path.parent)
             confirmation = vault.seal_confirmation(
@@ -863,20 +899,25 @@ def cmd_vault_preview(args) -> dict[str, Any]:
                             "若上次操作已放弃，请删除该文件后重试，或更换 --confirmation-out 路径") from exc
         except (RuntimeError, ValueError) as exc:
             raise FillError(str(exc)) from exc
-        preview = []
-        for field in form["fields"]:
-            field_id = field["id"]
-            if field_id in attachments:
-                content = [{"name": item["name"], "size": item["size"], "sha256": item["sha256"]}
-                           for item in attachments[field_id]]
-            else:
-                content = values.get(field_id)
-            preview.append({"id": field_id, "label": field["label"], "type": field["type"],
-                            "value": content, "source_entry": matches.get(field_id),
-                            "source": (profile["entries"][matches[field_id]]["source"]["kind"]
-                                       if field_id in matches else "request_identity" if field_id in values else None)})
-    return {"fields": preview, "mapping": mapping, "optional_missing": missing, **confirmation,
-            "instruction": "请在员工私有会话中逐项展示以上完整值；员工确认后才运行 vault-fill。"}
+        preview = _field_preview(form, profile, values, attachments, matches)
+    return {"ready": True, "fields": preview, "mapping": mapping, "optional_missing": missing, **confirmation,
+            "instruction": ("请在员工私有会话中逐项展示以上完整值；员工确认后才运行 vault-fill。"
+                            "确认文件 30 分钟内有效，且绑定请求包、保险柜、映射、取值、凭据与旧回执；"
+                            "其中任何一项变化（例如又补录了字段）都需重新 vault-preview 并再次确认。")}
+
+
+def _same_type_entries(form, profile, field_ids):
+    """列出与缺失字段类型相同、但 id 不同的保险柜条目，供 Agent 提出显式 mapping；脚本本身不做语义推断。"""
+    fields = {field["id"]: field for field in form["fields"]}
+    result = {}
+    for field_id in field_ids:
+        field_type = fields[field_id]["type"]
+        candidates = [{"entry": entry_id, "label": entry.get("label", "")}
+                      for entry_id, entry in profile["entries"].items()
+                      if entry_id != field_id and entry["type"] == field_type and (entry.get("value") or entry.get("attachments"))]
+        if candidates:
+            result[field_id] = candidates
+    return result
 
 
 def cmd_vault_fill(args) -> dict[str, Any]:
@@ -899,7 +940,7 @@ def cmd_vault_fill(args) -> dict[str, Any]:
                 if collection.task_expired(form):
                     raise FillError("TASK_EXPIRED: 请求包已过期，请向 HR 索取新请求包")
                 profile = vault.load_vault(vault_path, key)
-                values, attachments, _missing, matches = _prepare_vault_selection(form, profile, mapping)
+                values, attachments, _missing, matches, _required = _prepare_vault_selection(form, profile, mapping)
                 expected = {
                     "request_sha256": vault.file_digest(Path(form["_path"]), 1024 * 1024),
                     "vault_path": str(vault_path),
@@ -947,11 +988,24 @@ def cmd_vault_fill(args) -> dict[str, Any]:
             raise FillError("CONFIRMATION_CONSUME_FAILED: 确认文件无法消费，未保留回执") from exc
         result["matched"] = matches
         out_path = Path(result["out"])
-        earlier = [path for path in out_path.parent.glob("*.yintian") if path != out_path]
-        if earlier:
-            result["warning"] = (f"输出目录已存在 {len(earlier)} 份回执，"
-                                 "如其中已有本任务回执且已提交，请用 --previous 重新生成以免产生重复记录")
+        earlier = _same_task_receipts(out_path, form["task_id"])
+        if earlier and not getattr(args, "previous", None):
+            result["warning"] = (f"输出目录已有 {len(earlier)} 份属于同一任务的回执（{', '.join(earlier[:3])}{'…' if len(earlier) > 3 else ''}），"
+                                 "若其中已发送给 HR，请改用 --previous 指定该回执重新生成，否则 HR 侧会出现重复记录")
     return result
+
+
+def _same_task_receipts(out_path: Path, task_id: str) -> list[str]:
+    """只统计信封头 task_id 相同的旧回执；其他任务的回执不触发提醒。"""
+    def header_task_id(path: Path) -> Any:
+        try:
+            envelope = json.loads(secure_io.read_bytes(path, collection.MAX_ENVELOPE_BYTES))
+        except Exception:
+            return None
+        return envelope.get("task_id") if isinstance(envelope, dict) else None
+
+    return [path.name for path in sorted(out_path.parent.glob("*.yintian"))
+            if path != out_path and header_task_id(path) == task_id]
 
 
 def cmd_vlm_setup(args) -> dict[str, Any]:
@@ -1158,7 +1212,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:
-        print(f"错误: {collection.terminal_text(exc)}", file=sys.stderr)
+        print(json.dumps(collection.error_report(exc), ensure_ascii=False, indent=2), file=sys.stderr)
         return 1
 
 

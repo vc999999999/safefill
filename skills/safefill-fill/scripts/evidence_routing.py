@@ -8,11 +8,8 @@ MAX_RESULT_BYTES = 128 * 1024
 
 
 def bindings(field, fields):
-    if 'ocr_fields' in field:
-        return field['ocr_fields']
-    if 'front' in field['id'].split('_'):
-        return [f['id'] for f in fields if f['id'] == 'name' or f['type'] in {'cn_id', 'address'}]
-    return []
+    """Only an explicit ocr_fields list binds evidence; field names never imply OCR comparison."""
+    return field.get('ocr_fields', [])
 
 
 def validate_fields(fields):

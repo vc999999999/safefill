@@ -18,18 +18,30 @@ def _import_ocr_matcher():
 ocr_matcher = _import_ocr_matcher()
 validate_chinese_id = ocr_matcher.validate_chinese_id
 
-EXTRACT_FIELDS = ("name", "id_number", "phone")
-CONFIDENCE_RANK = {"validated": 4, "label": 3, "pattern": 3, "ocr_low_confidence": 1, "invalid_checksum": 0}
+EXTRACT_FIELDS = ("name", "id_number", "phone", "address", "birth_date", "gender")
+CONFIDENCE_RANK = {"validated": 4, "derived": 4, "label": 3, "pattern": 3, "ocr_low_confidence": 1, "invalid_checksum": 0}
+
+
+def _derive_from_id(raw: dict[str, list], source: str) -> None:
+    """从校验通过的身份证号派生出生日期与性别候选；派生值与号码同源，仍需本人确认。"""
+    for candidate in list(raw.get("id_number", [])):
+        if candidate.valid is not True:
+            continue
+        birth = ocr_matcher._valid_id_date(candidate.value)
+        if birth:
+            ocr_matcher._add_candidate(raw, "birth_date", birth, source, candidate.evidence, "derived", True)
+        ocr_matcher._add_candidate(raw, "gender", "男" if int(candidate.value[16]) % 2 else "女", source, candidate.evidence, "derived", True)
 
 
 def extract_fields(text: str, source: str = "text") -> dict[str, Any]:
-    """从 OCR 文本提取姓名、身份证号、手机号候选。
+    """从 OCR 文本提取姓名、身份证号、手机号、住址候选，并由身份证号派生出生日期与性别。
 
     返回 {"fields": {字段: {"value","confidence"}}, "candidates": {字段: [全部候选]}, "ambiguous": [字段]}；
-    同一字段出现多个不同取值时列入 ambiguous，由人确认，不静默取舍。
+    字段 id 与 collection-config.md 的标准字段 id 一致；同一字段出现多个不同取值时列入 ambiguous，由人确认，不静默取舍。
     """
     raw: dict[str, list] = {}
     ocr_matcher.extract_from_text(text, source, raw)
+    _derive_from_id(raw, source)
     fields: dict[str, Any] = {}
     candidates: dict[str, list] = {}
     ambiguous: list[str] = []

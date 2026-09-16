@@ -116,6 +116,19 @@ def parse_time(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def explicit_timezone(value: Any) -> bool:
+    """True only for ISO 时间且带 Z 或 ±HH:MM 偏移；纯日期或裸时间会被不同时区的两端理解成不同时刻。"""
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) or "T" not in text:
+        return False
+    try:
+        return datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text).tzinfo is not None
+    except ValueError:
+        return False
+
+
 def normalize_submitted_at(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -198,6 +211,11 @@ def require_tty(action: str) -> None:
 
 def task_expired(task: dict[str, Any]) -> bool:
     return datetime.now(timezone.utc) > parse_time(task["retention_until"])
+
+
+def expired_message(task: dict[str, Any], action: str) -> str:
+    return (f"TASK_EXPIRED: 任务已于 {task['retention_until']} 超过告知员工的保存期限，按承诺不再{action}；"
+            "如仍需收集，请新建请求包并重新发给员工，旧任务目录可用 purge 清理")
 
 
 def task_late(task: dict[str, Any], received_at: str) -> bool:
@@ -501,6 +519,10 @@ def validate_config(config: dict[str, Any], mode: str = "directed") -> dict[str,
     for key in ("title", "purpose", "deadline", "retention_until", "contact", "correction", "template_version"):
         if not isinstance(config[key], str) or len(config[key]) > MAX_VALUE_CHARS:
             raise ValueError(f"配置字段必须是长度不超过 {MAX_VALUE_CHARS} 的文本: {key}")
+    for key in ("deadline", "retention_until"):
+        if not explicit_timezone(config[key]):
+            raise ValueError(f"TIME_ZONE_REQUIRED: {key} 必须带时间和时区偏移（例如 2026-10-01T18:00:00+08:00），"
+                             "不接受纯日期或无时区时间，以免员工与 HR 对截止时刻理解不一致")
     deadline, retention = parse_time(config["deadline"]), parse_time(config["retention_until"])
     if deadline <= datetime.now(timezone.utc):
         raise ValueError("deadline 必须晚于当前时间")
@@ -758,7 +780,11 @@ def create_task(roster_path: Path | None, config_path: Path, out_parent: Path, p
         if local_secret is not None:
             saved_secret_path = save_local_task_secret(root, task_id, local_secret)
         artifact = root / ("REQUEST.yintian-request" if mode == "open" else "FORM.yintian-form")
-        return {"task_id": task_id, "task_dir": str(root), "request": str(artifact) if mode == "open" else None, "form": str(artifact) if mode == "group" else None, "invite_count": len(index_rows)}
+        ocr_bound = [field["id"] for field in config["fields"] if evidence_routing.bindings(field, config["fields"])]
+        return {"task_id": task_id, "task_dir": str(root), "request": str(artifact) if mode == "open" else None, "form": str(artifact) if mode == "group" else None, "invite_count": len(index_rows),
+                "deadline": config["deadline"], "retention_until": config["retention_until"], "ocr_bound_fields": ocr_bound,
+                "reminder": (f"收件、汇总与查看必须在保存期限 {config['retention_until']} 之前完成，到期后按告知承诺不再解密任何回执"
+                             + ("；已启用附件自动比对的字段：" + ", ".join(ocr_bound) + "，比对不通过的回执需要 HR 本人在终端运行 decide 逐项裁定" if ocr_bound else ""))}
     except BaseException:
         shutil.rmtree(root, ignore_errors=True)
         if saved_secret_path is not None:
@@ -821,7 +847,7 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path) -> dict[str, 
     root, task = load_task(task_dir)
     require_current_format(task, "接收")
     if task_expired(task):
-        raise RuntimeError("任务已超过保存期限，停止接收新提交")
+        raise RuntimeError(expired_message(task, "接收新提交"))
     source = secure_io.checked_path(submissions_dir)
     if not source.is_dir():
         raise NotADirectoryError(source)
@@ -902,8 +928,10 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path) -> dict[str, 
                 summary["errors"].append({"file_ref": digest[:12] if digest else f"entry-{index}", "error": type(exc).__name__,
                                           "code": "INGEST_IO" if isinstance(exc, OSError) else "SUBMISSION_REJECTED",
                                           "retryable": isinstance(exc, OSError), "next_action": "retry" if isinstance(exc, OSError) else "check_invitation"})
-    if skipped_directories and not (summary["accepted"] or summary["duplicates"] or summary["rejected"]):
-        summary["hint"] = f"收件目录顶层无 .yintian 文件，不递归子目录；发现 {skipped_directories} 个子目录，请将回执文件移到顶层后重试"
+    if skipped_directories:
+        processed = summary["accepted"] or summary["duplicates"] or summary["rejected"]
+        summary["hint"] = (f"收件目录{'顶层无 .yintian 文件，' if not processed else ''}不递归子目录；发现 {skipped_directories} 个子目录，"
+                           f"{'请' if not processed else '若其中还有回执请'}将回执文件移到顶层后重试")
     return summary
 
 
@@ -1207,7 +1235,7 @@ def review_task(task_dir, password, retry_needs_review=False, invite_id=None):
     root, task = load_task(task_dir)
     require_current_format(task, "复核")
     if task_expired(task):
-        raise RuntimeError("TASK_EXPIRED: 任务已超过保存期限")
+        raise RuntimeError(expired_message(task, "解密复核"))
     try:
         private_key = unlock_private_key(root, password)
     except Exception as exc:
@@ -1263,7 +1291,7 @@ def cmd_decide(args):
     root, task = load_task(args.task_dir)
     require_current_format(task, "人工复核")
     if task_expired(task):
-        raise RuntimeError("TASK_EXPIRED: 任务已到期")
+        raise RuntimeError(expired_message(task, "人工裁定"))
     if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", args.operator):
         raise ValueError("OPERATOR_INVALID: 操作者标识限字母、数字、_.@-")
     private_key = unlock_private_key(root, task_password(args.task_dir))
@@ -1363,7 +1391,7 @@ def cmd_status(args):
 def _write_reports(task_dir: str | Path, formats: list[str]) -> dict[str, str]:
     root, task = load_task(task_dir)
     if task_expired(task):
-        raise RuntimeError("任务已超过保存期限，停止生成报告；请执行清理")
+        raise RuntimeError(expired_message(task, "生成报告"))
     unknown = set(formats) - {"xlsx", "json"}
     if unknown:
         raise ValueError(f"不支持的报告格式: {sorted(unknown)}")
@@ -1431,7 +1459,7 @@ def cmd_reveal(args) -> dict[str, Any] | None:
     root, task = load_task(args.task_dir)
     require_current_format(task, "查看明文")
     if task_expired(task):
-        raise RuntimeError("任务已超过保存期限，禁止查看明文")
+        raise RuntimeError(expired_message(task, "查看明文"))
     password = task_password(args.task_dir)
     try:
         private_key = unlock_private_key(root, password)
@@ -1597,7 +1625,14 @@ def collect_open(task_dir: str | Path, submissions_dir: str | Path, out: str | P
         with task_lock(root):
             private_key = unlock_private_key(root, None)
             rows, attachment_count = collect_open_rows(root, task, private_key, attachment_stage, attachment_target.name)
-            excluded = len(report_rows(root)) - len(rows)
+            progress = report_rows(root)
+            excluded = len(progress) - len(rows)
+            exclusions = exclusion_details(progress)
+            late_count = sum(1 for row in progress if row["late"] and row["status"] in {"verified", "verified_manual"})
+            name_counts: dict[str, int] = {}
+            for record in rows:
+                name_counts[record.get("name", "")] = name_counts.get(record.get("name", ""), 0) + 1
+            duplicate_names = sorted(name for name, count in name_counts.items() if count > 1)
             written = write_clear_export(root, task, rows, field_ids, {}, out_path, ["xlsx"], task["purpose"], task["contact"])
             if attachment_stage is not None:
                 if attachment_count:
@@ -1617,7 +1652,39 @@ def collect_open(task_dir: str | Path, submissions_dir: str | Path, out: str | P
         if written.get("attachments_dir"):
             shutil.rmtree(written["attachments_dir"], ignore_errors=True)
         raise
-    return {"task_id": task["task_id"], "rows": len(rows), "excluded": excluded, "attachments": attachment_count, "ingest": ingested, "review": reviewed, **written}
+    result = {"task_id": task["task_id"], "rows": len(rows), "excluded": excluded, "exclusions": exclusions,
+              "late": late_count, "attachments": attachment_count, "ingest": ingested, "review": reviewed, **written}
+    if duplicate_names:
+        result["duplicate_names"] = duplicate_names
+        result["warning"] = ("Excel 中存在同名多行：" + ", ".join(duplicate_names)
+                             + "。可能是同一人未带 --previous 重复提交，也可能是真实同名；请 HR 与本人核对，脚本不会自动合并")
+    return result
+
+
+def exclusion_details(progress: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把未进入 Excel 的记录整理成逐人原因与下一步，供 Agent 直接向 HR 概述，无需再跑 status/report。"""
+    details = []
+    for row in progress:
+        if row["status"] in {"verified", "verified_manual"}:
+            continue
+        reasons = list(row["missing_fields"]) + list(row["conflict_fields"])
+        if row["status"] == "invalid":
+            action = "回执损坏、被改动或不属于本任务，请员工用同一请求包重新生成并发送"
+        elif any(reason.startswith("runtime:") for reason in reasons):
+            action = "收件机器缺少 OCR 依赖或读取失败；安装 requirements-ocr.txt 后重跑 collect 即会重审"
+        elif any(reason.startswith("ocr:") for reason in reasons):
+            action = "附件与填写值自动比对未通过；需 HR 本人在终端运行 decide 逐项核对原件，或让员工更正后带 --previous 重交"
+        elif row["missing_fields"]:
+            action = "必填项缺失；请员工补齐后带 --previous 重交"
+        elif row["status"] in {"submitted", "needs_review"}:
+            action = "校验未通过；请员工按提示更正后带 --previous 重交"
+        elif row["status"] == "returned":
+            action = "已退回等待员工重交"
+        else:
+            action = "尚未收到有效回执"
+        details.append({"name": row["name"], "record": row.get("employee_id", "")[-6:], "status": row["status"],
+                        "late": bool(row["late"]), "reasons": reasons, "next_action": action})
+    return details
 
 
 def cmd_collect_open(args) -> dict[str, Any]:
@@ -1692,7 +1759,7 @@ def cmd_export_clear(args) -> dict[str, Any]:
     root, task = load_task(args.task_dir)
     require_current_format(task, "明文导出")
     if task_expired(task):
-        raise RuntimeError("任务已超过保存期限，禁止明文导出；请执行清理")
+        raise RuntimeError(expired_message(task, "明文导出"))
     purpose, recipient = (getattr(args, "purpose", "") or "").strip(), (getattr(args, "recipient", "") or "").strip()
     if not purpose or not recipient:
         raise ValueError("EXPORT_PURPOSE_REQUIRED: 请填写 --purpose 和 --recipient")
@@ -2078,6 +2145,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def error_report(exc: BaseException) -> dict[str, Any]:
+    """错误与成功输出同为 JSON：code 取消息中的大写错误码，便于 Agent 直接分支处理。"""
+    message = terminal_text(exc)
+    match = re.match(r"([A-Z][A-Z0-9_]+):\s*(.*)", message, re.S)
+    code = match.group(1) if match else type(exc).__name__
+    detail = match.group(2).strip() if match else message
+    return {"ok": False, "error": code, "message": detail}
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -2086,7 +2162,7 @@ def main() -> None:
         if result is not None:
             print(json.dumps(result, ensure_ascii=False, indent=2))
     except Exception as exc:
-        print(f"错误: {terminal_text(exc)}", file=sys.stderr)
+        print(json.dumps(error_report(exc), ensure_ascii=False, indent=2), file=sys.stderr)
         raise SystemExit(1)
 
 

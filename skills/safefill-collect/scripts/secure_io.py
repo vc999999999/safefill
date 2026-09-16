@@ -25,7 +25,8 @@ def checked_path(value, root=None):
         except FileNotFoundError:
             continue
         if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
-            raise ValueError('PATH_UNSAFE: 拒绝符号链接或重解析点')
+            raise ValueError(f'PATH_UNSAFE: 路径中的 {part} 是符号链接或重解析点，请改用其真实路径'
+                             '（可用 YINTIAN_VAULT_DIR / YINTIAN_VAULT_KEY_DIR 指向真实目录）')
     if root is not None:
         base = checked_path(root)
         if path != base and base not in path.parents:
