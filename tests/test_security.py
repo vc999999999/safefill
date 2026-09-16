@@ -1,6 +1,5 @@
-"""安全敏感代码的边界/负例测试：secure_io、vault、collection、ocr_matcher、privacy。"""
+"""安全敏感代码的边界/负例测试：secure_io、vault、collection、ocr_matcher。"""
 import base64
-import importlib.util
 import io
 import json
 import os
@@ -16,22 +15,15 @@ from cryptography.exceptions import InvalidTag
 from hypothesis import given, settings, strategies as st
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "safefill-fill" / "scripts"
+COLLECT_SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "safefill-collect" / "scripts"
+sys.path.insert(0, str(COLLECT_SCRIPTS))
 sys.path.insert(0, str(SCRIPTS))
 
 import collection  # noqa: E402
+import collector  # noqa: E402
 import ocr_matcher  # noqa: E402
 import secure_io  # noqa: E402
 import vault  # noqa: E402
-
-# collect 侧 privacy.py 与 fill 侧模块无重名，但其内部 `import config` 依赖共享的
-# config.py（两侧逐字节相同，经 sys.path 解析）；按路径加载以避免目录级 sys.path 冲突。
-_privacy_spec = importlib.util.spec_from_file_location(
-    "safefill_collect_privacy",
-    Path(__file__).resolve().parents[1] / "skills" / "safefill-collect" / "scripts" / "privacy.py",
-)
-assert _privacy_spec is not None and _privacy_spec.loader is not None
-privacy = importlib.util.module_from_spec(_privacy_spec)
-_privacy_spec.loader.exec_module(privacy)
 
 
 def private(path: Path) -> Path:
@@ -48,7 +40,7 @@ def make_entry(value="张三", **overrides):
 
 
 def make_profile(**entries):
-    return {"format": vault.FORMAT_V2, "entries": entries}
+    return {"format": vault.FORMAT, "entries": entries}
 
 
 # ---------------------------------------------------------------- secure_io
@@ -252,9 +244,9 @@ def test_load_key_missing(tmp_path):
 def test_validate_profile_rejects_over_max_entries():
     entries = {f"field_{i:03d}": make_entry() for i in range(vault.MAX_ENTRIES + 1)}
     with pytest.raises(ValueError, match="VAULT_INVALID"):
-        vault.validate_profile({"format": vault.FORMAT_V2, "entries": entries})
+        vault.validate_profile({"format": vault.FORMAT, "entries": entries})
     ok = {f"field_{i:03d}": make_entry() for i in range(vault.MAX_ENTRIES)}  # 边界：恰好 100 条放行
-    assert len(vault.validate_profile({"format": vault.FORMAT_V2, "entries": ok})["entries"]) == vault.MAX_ENTRIES
+    assert len(vault.validate_profile({"format": vault.FORMAT, "entries": ok})["entries"]) == vault.MAX_ENTRIES
 
 
 def test_validate_entry_rejects_long_label():
@@ -305,41 +297,6 @@ def test_select_fields_mapping_invalid_branches():
     assert values == {"name": "张三"} and missing == ["photo"] and matches == {"name": "name"}
 
 
-def _write_v1_source(source_dir: Path, password="password") -> Path:
-    old = {"version": 1, "types": {"name": "text"}, "values": {"name": "张三"}, "attachments": {}}
-    source = source_dir / "vault.yintian-vault"
-    source.write_bytes(collection.canonical(collection.aes_gcm_seal(
-        vault.FORMAT_V1, collection.canonical(old), password, vault.FORMAT_V1.encode())))
-    if os.name != "nt":
-        source.chmod(0o600)
-    return source
-
-
-def test_migrate_v1_conflict_existing_target(tmp_path):
-    source = _write_v1_source(private(tmp_path / "old"))
-    target_dir, key_dir = private(tmp_path / "new"), private(tmp_path / "keys")
-    target = target_dir / vault.VAULT_FILENAME
-    target.write_bytes(b"existing")
-    with pytest.raises(RuntimeError, match="VAULT_MIGRATION_CONFLICT"):
-        vault.migrate_v1(source, "password", target, key_dir / vault.KEY_FILENAME)
-
-
-def test_migrate_v1_conflict_existing_key_only(tmp_path):
-    source = _write_v1_source(private(tmp_path / "old"))
-    target_dir, key_dir = private(tmp_path / "new"), private(tmp_path / "keys")
-    (key_dir / vault.KEY_FILENAME).write_bytes(b"existing-key")
-    with pytest.raises(RuntimeError, match="VAULT_MIGRATION_CONFLICT"):
-        vault.migrate_v1(source, "password", target_dir / vault.VAULT_FILENAME, key_dir / vault.KEY_FILENAME)
-
-
-def test_migrate_v1_rejects_v2_source(tmp_path):
-    source_dir = private(tmp_path / "src")
-    source = source_dir / vault.VAULT_FILENAME
-    vault.save_vault(source, "k" * 40, make_profile(), create=True)
-    with pytest.raises(ValueError, match="VAULT_MIGRATION_NOT_REQUIRED"):
-        vault.migrate_v1(source, "password", tmp_path / "t" / vault.VAULT_FILENAME, tmp_path / "k" / vault.KEY_FILENAME)
-
-
 # --------------------------------------------------------------- collection
 
 
@@ -357,7 +314,7 @@ def _kdf(**overrides):
     _kdf(salt="!!!"),                                      # salt 非法 base64
     _kdf(salt=base64.b64encode(b"s" * 8).decode("ascii")),  # salt 长度非 16
     _kdf(n=2**9),                                          # N 低于下限
-    _kdf(n=2**17),                                         # N 高于上限
+    _kdf(n=2**18),                                         # N 高于上限
     _kdf(n=2**10 + 2**11),                                 # N 非 2 的幂
     _kdf(r=0), _kdf(r=9),                                  # r 越界
     _kdf(p=0), _kdf(p=3),                                  # p 越界
@@ -372,38 +329,6 @@ def test_validate_kdf_params_accepts_boundary():
     salt, n, r, p = collection.validate_kdf_params(_kdf())
     assert salt == b"s" * 16 and (n, r, p) == (collection.SCRYPT_N, collection.SCRYPT_R, collection.SCRYPT_P)
     assert collection.validate_kdf_params(_kdf(n=2**10, r=1, p=2))[1:] == (2**10, 1, 2)
-
-
-def test_verify_submission_auth():
-    token = "t" * 43
-    invite = {"token_hash": collection.sha256_bytes(token.encode())}
-    task = {"submission_auth": collection.AUTH_VERSION}
-    envelope = {"format_version": "v", "task_id": "t", "invite_id": "i"}
-    tag = collection.submission_auth_tag(envelope, invite["token_hash"])
-    collection.verify_submission_auth(task, {**envelope, "auth_tag": tag}, invite)  # 正确 HMAC 通过
-    with pytest.raises(ValueError, match="SUBMISSION_AUTH_FAILED"):
-        collection.verify_submission_auth(task, {**envelope, "auth_tag": "0" * 64}, invite)
-    with pytest.raises(ValueError, match="SUBMISSION_AUTH_FAILED"):
-        collection.verify_submission_auth(task, envelope, invite)  # 缺少 auth_tag
-    collection.verify_submission_auth({}, envelope, invite)  # 未启用认证的任务不校验
-
-
-@pytest.mark.parametrize("rule,value,expected", [
-    ("last4", "13812345678", "*******5678"),
-    ("last4", "1234", "****"),       # 长度恰好 4 的边界
-    ("last4", "abc", "***"),         # 短输入整体打码
-    ("last4", "", ""),
-    ("mid4", "13812345678", "138****5678"),
-    ("mid4", "1234567", "*******"),  # 长度恰好 7 的边界
-    ("mid4", "123456", "******"),
-])
-def test_mask_value(rule, value, expected):
-    assert collection.mask_value(rule, value) == expected
-
-
-def test_mask_value_rejects_unknown_rule():
-    with pytest.raises(ValueError, match="不支持的脱敏规则"):
-        collection.mask_value("all", "13812345678")
 
 
 @pytest.mark.parametrize("value", ["../etc/passwd", "..\\..\\win", "a/b\\c:d*e?f\"g<h>i|j"])
@@ -443,53 +368,56 @@ def _zip_bytes(members: dict[str, bytes]) -> io.BytesIO:
 def test_read_package_member_enforces_limits(monkeypatch):
     with zipfile.ZipFile(_zip_bytes({"big.bin": b"x" * 2048})) as archive:
         with pytest.raises(ValueError, match="超过安全上限"):
-            collection.read_package_member(archive, "big.bin", 1024)  # 超过剩余额度
-        assert collection.read_package_member(archive, "big.bin", 2048) == b"x" * 2048
-        monkeypatch.setattr(collection, "MAX_PACKAGE_MEMBER_BYTES", 100)
+            collector.read_package_member(archive, "big.bin", 1024)  # 超过剩余额度
+        assert collector.read_package_member(archive, "big.bin", 2048) == b"x" * 2048
+        monkeypatch.setattr(collector, "MAX_PACKAGE_MEMBER_BYTES", 100)
         with pytest.raises(ValueError, match="超过安全上限"):
-            collection.read_package_member(archive, "big.bin", 10**9)  # 超过单项上限
+            collector.read_package_member(archive, "big.bin", 10**9)  # 超过单项上限
 
 
 def test_open_task_package_rejects_bad_envelope_and_password(tmp_path):
     bad = tmp_path / "bad.yintian-package"
     bad.write_bytes(b"{not-json")
     with pytest.raises(ValueError, match="交接包信封无效"):
-        collection.open_task_package(bad)
+        collector.open_task_package(bad)
     wrong_format = tmp_path / "fmt.yintian-package"
     wrong_format.write_bytes(json.dumps({"format": "yintian-task/9"}).encode())
     with pytest.raises(ValueError, match="交接包格式不受支持"):
-        collection.open_task_package(wrong_format)
+        collector.open_task_package(wrong_format)
 
     task_id = "YT-20260101-ABCDEF"
-    envelope = collection.aes_gcm_seal(collection.ENCRYPTED_TASK_PACKAGE_VERSION,
+    envelope = collection.aes_gcm_seal(collector.ENCRYPTED_TASK_PACKAGE_VERSION,
                                        _zip_bytes({"package.json": b"{}"}).getvalue(),
-                                       "right-password", collection.task_package_aad(task_id))
+                                       "right-password", collector.task_package_aad(task_id))
     envelope["task_id"] = task_id
     package = tmp_path / "enc.yintian-package"
     package.write_bytes(collection.canonical(envelope))
     with pytest.raises(ValueError, match="交接密码错误或交接包已被篡改"):
-        collection.open_task_package(package, "wrong-password")
-    archive, encrypted = collection.open_task_package(package, "right-password")
-    assert encrypted and archive.namelist() == ["package.json"]
+        collector.open_task_package(package, "wrong-password")
+    archive = collector.open_task_package(package, "right-password")
+    assert archive.namelist() == ["package.json"]
     archive.close()
 
 
-def test_open_task_package_plaintext_zip(tmp_path, capsys):
+def test_open_task_package_rejects_plaintext_zip(tmp_path):
     package = tmp_path / "plain.zip"
     package.write_bytes(_zip_bytes({"package.json": b"{}"}).getvalue())
-    archive, encrypted = collection.open_task_package(package)
-    assert not encrypted and archive.namelist() == ["package.json"]
-    archive.close()
-    assert "明文交接包" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="交接包信封无效"):
+        collector.open_task_package(package)
 
 
 def test_import_task_rejects_manifest_over_max_files(tmp_path):
-    metadata = {"task_id": "YT-20260101-ABCDEF", "package_version": collection.TASK_PACKAGE_VERSION,
+    metadata = {"task_id": "YT-20260101-ABCDEF", "package_version": collector.TASK_PACKAGE_VERSION,
                 "manifest": {f"e{i}": "x" for i in range(collection.MAX_PACKAGE_FILES + 1)}}
-    package = tmp_path / "huge.zip"
-    package.write_bytes(_zip_bytes({"package.json": json.dumps(metadata).encode()}).getvalue())
+    task_id = metadata["task_id"]
+    envelope = collection.aes_gcm_seal(collector.ENCRYPTED_TASK_PACKAGE_VERSION,
+                                     _zip_bytes({"package.json": json.dumps(metadata).encode()}).getvalue(),
+                                     "pw", collector.task_package_aad(task_id))
+    envelope["task_id"] = task_id
+    package = tmp_path / "huge.yintian-package"
+    package.write_bytes(collection.canonical(envelope))
     with pytest.raises(ValueError, match="清单无效或文件过多"):
-        collection.import_task(package, tmp_path / "out")
+        collector.import_task(package, tmp_path / "out", handoff_password="pw")
 
 
 def test_aes_gcm_roundtrip_and_tamper_failures():
@@ -548,30 +476,6 @@ def test_validate_chinese_id_unicode_digit_raises_valueerror():
     # ² 的 isdigit() 为 True 但 int("²") 抛 ValueError：现有实现不捕获，记录该行为。
     with pytest.raises(ValueError):
         ocr_matcher.validate_chinese_id("110105194912310²2X")
-
-
-# ------------------------------------------------------------------ privacy
-
-
-def test_assert_in_vault_allows_inside_path(tmp_path):
-    vault_dir = tmp_path / "vault"
-    vault_dir.mkdir()
-    inside = vault_dir / "sub" / "file.txt"
-    assert privacy.assert_in_vault(str(inside), str(vault_dir)) == str(inside)
-    assert privacy.assert_in_vault(str(vault_dir), str(vault_dir)) == str(vault_dir)
-
-
-def test_assert_in_vault_rejects_outside_path(tmp_path):
-    vault_dir = tmp_path / "vault"
-    vault_dir.mkdir()
-    with pytest.raises(privacy.PrivacyViolation):
-        privacy.assert_in_vault(str(tmp_path / "outside.txt"), str(vault_dir))
-    with pytest.raises(privacy.PrivacyViolation):
-        privacy.assert_in_vault(str(tmp_path / "vault_evil" / "x"), str(vault_dir))  # 同前缀兄弟目录
-
-
-def test_assert_in_vault_no_vault_dir_passes_through():
-    assert privacy.assert_in_vault("/anywhere/file", "") == "/anywhere/file"
 
 
 # ---------------------------------------------------------- hypothesis 属性

@@ -6,7 +6,6 @@ import os
 OCR_DEVICE = os.getenv("YINTIAN_OCR_DEVICE", "AUTO").upper()
 MAX_SIDE = int(os.getenv("YINTIAN_MAX_SIDE", "1600"))
 MIN_SCORE = float(os.getenv("YINTIAN_MIN_SCORE", "0.5"))
-VAULT_DIR = os.getenv("YINTIAN_VAULT_DIR", "")
 MODEL_DIR = os.getenv("YINTIAN_MODEL_DIR", "")
 
 if OCR_DEVICE not in {"CPU", "GPU", "NPU", "AUTO"}:

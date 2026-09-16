@@ -1,4 +1,4 @@
-"""SafeFill employee vault: encrypted local profile, migration and confirmations."""
+"""SafeFill employee vault: encrypted local profile and confirmations."""
 from __future__ import annotations
 
 import base64
@@ -14,8 +14,7 @@ from pathlib import Path
 import collection
 import secure_io
 
-FORMAT_V2 = "yintian-vault/2"
-FORMAT_V1 = "yintian-vault/1"
+FORMAT = "yintian-vault/2"
 CONFIRMATION_FORMAT = "yintian-confirmation/1"
 CONFIRMATION_TTL_SECONDS = 30 * 60
 MAX_BYTES = 32 * 1024 * 1024
@@ -23,7 +22,6 @@ MAX_CONFIRMATION_BYTES = 40 * 1024 * 1024
 MAX_ENTRIES = 100
 VAULT_FILENAME = "vault.yintian-vault"
 KEY_FILENAME = "vault.key"
-MIGRATION_MARKER = ".legacy-import.json"
 SOURCE_KINDS = {"manual", "openvino-ocr", "openvino-vlm"}
 
 
@@ -69,18 +67,6 @@ def default_key_path() -> Path:
     return default_key_dir() / KEY_FILENAME
 
 
-def legacy_data_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "data"
-
-
-def legacy_vault_path() -> Path:
-    return legacy_data_dir() / VAULT_FILENAME
-
-
-def legacy_key_path() -> Path:
-    return legacy_data_dir() / KEY_FILENAME
-
-
 def _check_private_file(path: Path, what: str) -> None:
     if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) & 0o077:
         raise RuntimeError(f"VAULT_PERMISSIONS: {what}权限宽于 0600: {path}")
@@ -121,119 +107,16 @@ def load_or_create_key(key_path: Path, *, create: bool = False) -> str:
     return secret
 
 
-def vault_format(vault_path: Path) -> str:
+def check_vault_file(vault_path: Path) -> None:
+    """不解密即可做的前置校验：目录/文件权限与格式。"""
     _check_private_dir(vault_path.parent)
     _check_private_file(vault_path, "保险柜")
     try:
         envelope = json.loads(secure_io.read_bytes(vault_path, MAX_BYTES))
     except Exception:
         raise ValueError("VAULT_INVALID: 保险柜文件损坏或不是 JSON") from None
-    fmt = envelope.get("format") if isinstance(envelope, dict) else None
-    if fmt not in {FORMAT_V1, FORMAT_V2}:
+    if not isinstance(envelope, dict) or envelope.get("format") != FORMAT:
         raise ValueError("VAULT_INVALID: 不支持的保险柜格式")
-    return fmt
-
-
-def _migration_marker_path(vault_path: Path) -> Path:
-    return vault_path.parent / MIGRATION_MARKER
-
-
-def _legacy_v2_marker(source_vault: Path, source_key: Path) -> dict:
-    return {
-        "format": "safefill-legacy-import/1",
-        "source_format": FORMAT_V2,
-        "source": str(source_vault),
-        "source_vault_sha256": file_digest(source_vault),
-        "source_key_sha256": file_digest(source_key, 256),
-    }
-
-
-def _legacy_v1_marker(source_vault: Path) -> dict:
-    return {
-        "format": "safefill-legacy-import/1",
-        "source_format": FORMAT_V1,
-        "source": str(source_vault),
-        "source_vault_sha256": file_digest(source_vault),
-    }
-
-
-def _validate_marker(marker: Path, expected: dict, target_vault: Path, target_key: Path) -> None:
-    try:
-        _check_private_file(marker, "迁移标记")
-        if json.loads(secure_io.read_bytes(marker, 4096)) != expected:
-            raise ValueError
-        load_vault(target_vault, load_or_create_key(target_key))
-    except Exception:
-        raise RuntimeError("VAULT_MIGRATION_CONFLICT: 迁移标记损坏、来源已变化或目标无法解密") from None
-
-
-def migrate_legacy_v2_install() -> dict | None:
-    """Copy an old in-skill v2 vault to per-user storage without deleting the source."""
-    source_vault, source_key = legacy_vault_path(), legacy_key_path()
-    if not source_vault.is_file() or vault_format(source_vault) != FORMAT_V2:
-        return None
-    target_vault, target_key = default_vault_path(), default_key_path()
-    marker = _migration_marker_path(target_vault)
-    if not source_key.is_file():
-        raise RuntimeError("VAULT_KEY_MISSING: 旧版 v2 保险柜缺少配套密钥，未迁移")
-    _check_private_file(source_vault, "旧保险柜")
-    _check_private_file(source_key, "旧保险柜密钥")
-    expected_marker = _legacy_v2_marker(source_vault, source_key)
-    ensure_private_dir(target_vault.parent)
-    ensure_private_dir(target_key.parent)
-    with secure_io.file_lock(str(target_vault) + ".migration.lock"):
-        target_state = (target_vault.exists(), target_key.exists())
-        if marker.is_file():
-            if target_state != (True, True):
-                raise RuntimeError("VAULT_MIGRATION_CONFLICT: 迁移标记存在但目标保险柜或密钥缺失")
-            _validate_marker(marker, expected_marker, target_vault, target_key)
-            return {"migrated": False, "source": str(source_vault), "target": str(target_vault)}
-        if target_state != (False, False):
-            if target_state == (True, True):
-                same = (secure_io.read_bytes(target_vault, MAX_BYTES) == secure_io.read_bytes(source_vault, MAX_BYTES)
-                        and secure_io.read_bytes(target_key, 256) == secure_io.read_bytes(source_key, 256))
-                if same:
-                    secure_io.atomic_write(marker, collection.canonical(expected_marker), overwrite=False)
-                    return {"migrated": True, "source": str(source_vault), "target": str(target_vault)}
-            raise RuntimeError("VAULT_MIGRATION_CONFLICT: 新存储位置已有不同或不完整数据，未覆盖")
-        key = load_or_create_key(source_key)
-        profile = load_vault(source_vault, key)
-        secure_io.atomic_write(target_key, secure_io.read_bytes(source_key, 256), overwrite=False)
-        try:
-            secure_io.atomic_write(target_vault, secure_io.read_bytes(source_vault, MAX_BYTES), overwrite=False)
-            if collection.canonical(load_vault(target_vault, load_or_create_key(target_key))) != collection.canonical(profile):
-                raise RuntimeError("VAULT_MIGRATION_VERIFY_FAILED: 迁移后解密校验不一致")
-            secure_io.atomic_write(marker, collection.canonical(expected_marker), overwrite=False)
-        except Exception:
-            target_vault.unlink(missing_ok=True)
-            target_key.unlink(missing_ok=True)
-            raise
-    return {"migrated": True, "source": str(source_vault), "target": str(target_vault)}
-
-
-def resolve_default_storage() -> tuple[Path, Path, dict | None]:
-    target_vault, target_key = default_vault_path(), default_key_path()
-    source = legacy_vault_path()
-    if target_vault.is_file() or target_key.is_file():
-        if target_vault.is_file() and not target_key.is_file():
-            raise RuntimeError("VAULT_STORAGE_INCOMPLETE: 新存储位置的保险柜与密钥不完整")
-        if not target_vault.is_file() and source.is_file():
-            raise RuntimeError("VAULT_MIGRATION_CONFLICT: 新密钥已存在但旧保险柜尚未迁移")
-        if target_vault.is_file() and target_key.is_file() and source.is_file():
-            if vault_format(source) == FORMAT_V2:
-                migrated = migrate_legacy_v2_install()
-                return target_vault, target_key, migrated if migrated and migrated["migrated"] else None
-            marker = _migration_marker_path(target_vault)
-            if not marker.is_file():
-                raise RuntimeError("VAULT_MIGRATION_CONFLICT: 新存储位置和旧版 v1 保险柜同时存在，未覆盖")
-            _validate_marker(marker, _legacy_v1_marker(source), target_vault, target_key)
-        return target_vault, target_key, None
-    if source.is_file():
-        if vault_format(source) == FORMAT_V1:
-            return source, target_key, {"migration_required": True, "source": str(source), "target": str(target_vault)}
-        migrated = migrate_legacy_v2_install()
-        return target_vault, target_key, migrated
-    return target_vault, target_key, None
 
 
 def _validate_source(source) -> dict:
@@ -290,7 +173,7 @@ def validate_entry(entry) -> dict:
 
 
 def validate_profile(profile) -> dict:
-    if not isinstance(profile, dict) or profile.get("format") != FORMAT_V2:
+    if not isinstance(profile, dict) or profile.get("format") != FORMAT:
         raise ValueError("VAULT_INVALID: 不支持的保险柜内容")
     entries = profile.get("entries")
     if not isinstance(entries, dict) or len(entries) > MAX_ENTRIES:
@@ -306,70 +189,17 @@ def load_vault(vault_path: Path, key: str) -> dict:
         _check_private_dir(vault_path.parent)
         _check_private_file(vault_path, "保险柜")
         envelope = json.loads(secure_io.read_bytes(vault_path, MAX_BYTES))
-        if envelope.get("format") == FORMAT_V1:
-            raise RuntimeError("VAULT_MIGRATION_REQUIRED: 旧版保险柜必须先运行 vault-migrate")
-        if envelope.get("format") != FORMAT_V2:
+        if envelope.get("format") != FORMAT:
             raise ValueError("format")
-        raw = collection.aes_gcm_open(envelope, key, FORMAT_V2.encode())
+        raw = collection.aes_gcm_open(envelope, key, FORMAT.encode())
         return validate_profile(json.loads(raw))
-    except RuntimeError:
-        raise
     except Exception:
         raise ValueError("VAULT_UNLOCK_FAILED: 密钥不符或保险柜已损坏") from None
 
 
-def _decode_v1(envelope: dict, password: str) -> dict:
-    try:
-        old = json.loads(collection.aes_gcm_open(envelope, password, FORMAT_V1.encode()))
-        if (not isinstance(old, dict) or old.get("version") != 1
-                or not isinstance(old.get("types"), dict)
-                or not isinstance(old.get("values", {}), dict)
-                or not isinstance(old.get("attachments", {}), dict)):
-            raise ValueError
-    except Exception:
-        raise ValueError("VAULT_UNLOCK_FAILED: 旧保险柜密码错误或已损坏") from None
-    entries = {}
-    for entry_id, entry_type in old.get("types", {}).items():
-        entry = {"type": entry_type, "label": "", "source": {"kind": "manual"}}
-        if entry_type in collection.ATTACHMENT_TYPES:
-            entry["attachments"] = old.get("attachments", {}).get(entry_id, [])
-        else:
-            entry["value"] = old.get("values", {}).get(entry_id, "")
-        entries[entry_id] = entry
-    return validate_profile({"format": FORMAT_V2, "entries": entries})
-
-
-def migrate_v1(source_vault: Path, password: str, target_vault: Path, target_key: Path) -> dict:
-    if vault_format(source_vault) != FORMAT_V1:
-        raise ValueError("VAULT_MIGRATION_NOT_REQUIRED: 源保险柜不是 v1")
-    _check_private_file(source_vault, "旧保险柜")
-    profile = _decode_v1(json.loads(secure_io.read_bytes(source_vault, MAX_BYTES)), password)
-    ensure_private_dir(target_vault.parent)
-    ensure_private_dir(target_key.parent)
-    marker = (_migration_marker_path(target_vault)
-              if source_vault == legacy_vault_path() and target_vault == default_vault_path() else None)
-    with secure_io.file_lock(str(target_vault) + ".migration.lock"):
-        if target_vault.exists() or target_key.exists() or (marker is not None and marker.exists()):
-            raise RuntimeError("VAULT_MIGRATION_CONFLICT: 目标保险柜或密钥已存在，未覆盖")
-        key = load_or_create_key(target_key, create=True)
-        try:
-            save_vault(target_vault, key, profile, create=True)
-            if collection.canonical(load_vault(target_vault, key)) != collection.canonical(profile):
-                raise RuntimeError("VAULT_MIGRATION_VERIFY_FAILED: 迁移后解密校验不一致")
-            if marker is not None:
-                secure_io.atomic_write(marker, collection.canonical(_legacy_v1_marker(source_vault)), overwrite=False)
-        except Exception:
-            target_vault.unlink(missing_ok=True)
-            target_key.unlink(missing_ok=True)
-            if marker is not None:
-                marker.unlink(missing_ok=True)
-            raise
-    return {"migrated": True, "source": str(source_vault), "target": str(target_vault), "entry_count": len(profile["entries"])}
-
-
 def save_vault(vault_path: Path, key: str, profile: dict, *, create: bool = False) -> None:
     validate_profile(profile)
-    blob = collection.canonical(collection.aes_gcm_seal(FORMAT_V2, collection.canonical(profile), key, FORMAT_V2.encode()))
+    blob = collection.canonical(collection.aes_gcm_seal(FORMAT, collection.canonical(profile), key, FORMAT.encode()))
     if len(blob) > MAX_BYTES:
         raise ValueError("VAULT_LIMIT: 保险柜超过大小上限")
     secure_io.atomic_write(vault_path, blob, overwrite=not create)
@@ -487,7 +317,7 @@ def select_fields(form, profile, mapping=None):
 def status_view(profile: dict, form=None) -> dict:
     result = {
         "vault": True,
-        "format": FORMAT_V2,
+        "format": FORMAT,
         "entry_count": len(profile["entries"]),
         "entries": {
             entry_id: {"type": entry["type"], "label": entry.get("label", ""),

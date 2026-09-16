@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any
 
-import privacy
 from config import MAX_SIDE, MIN_SCORE, OCR_DEVICE
 
 _engine = None
@@ -68,14 +66,6 @@ def _scan_content(content: Any) -> dict[str, Any]:
         "blocks": blocks,
         "full_text": "\n".join(block["text"] for block in blocks),
     }
-
-
-def scan(image_path: str) -> dict[str, Any]:
-    path = Path(image_path).expanduser().resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"图片不存在: {image_path}")
-    privacy.assert_in_vault(str(path))
-    return _scan_content(str(path))
 
 
 def _preprocess_image_bytes(image_bytes: bytes) -> bytes:

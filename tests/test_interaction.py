@@ -7,10 +7,12 @@ from pathlib import Path
 import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "safefill-fill" / "scripts"
+COLLECT_SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "safefill-collect" / "scripts"
+sys.path.insert(0, str(COLLECT_SCRIPTS))
 sys.path.insert(0, str(SCRIPTS))
 
 import collection  # noqa: E402
-import evidence_routing  # noqa: E402
+import collector  # noqa: E402
 import fill  # noqa: E402
 import fill_extract  # noqa: E402
 import vault  # noqa: E402
@@ -53,8 +55,8 @@ def base_config(fields, **overrides):
 
 def make_request(tmp_path: Path, fields, **overrides):
     config_path = tmp_path / "collection.json"
-    collection.dump_json(config_path, base_config(fields, **overrides))
-    args = collection.build_parser().parse_args(
+    collector.dump_json(config_path, base_config(fields, **overrides))
+    args = collector.build_parser().parse_args(
         ["create-request", "--config", str(config_path), "--out", str(tmp_path / "tasks")])
     created = args.func(args)
     return created, Path(created["request"]), Path(created["task_dir"])
@@ -73,12 +75,18 @@ def stage(tmp_path: Path, entries: dict, name="change"):
 NAME = {"id": "name", "label": "姓名", "type": "text", "required": True, "sensitive": True}
 
 
-def test_front_in_field_id_no_longer_implies_ocr_binding():
+def test_ocr_fields_binding_is_explicit_only(monkeypatch):
+    """字段名含 front 不隐式触发比对；只有显式 ocr_fields 才走 OCR。"""
     fields = [NAME, {"id": "id_number", "label": "身份证号", "type": "cn_id"},
               {"id": "id_front", "label": "身份证正面", "type": "image_attachment"},
               {"id": "id_card_front", "label": "证件正面", "type": "image_attachment", "ocr_fields": ["name"]}]
-    assert evidence_routing.bindings(fields[2], fields) == []
-    assert evidence_routing.bindings(fields[3], fields) == ["name"]
+    payload = {"values": {"name": "张三"}}
+    items = [{"field_id": "id_front"}, {"field_id": "id_card_front"}]
+    calls = []
+    monkeypatch.setattr(collector, "ocr_attachment",
+                        lambda item: calls.append(item["field_id"]) or ("姓名: 张三", []))
+    assert collector.compare_ocr(payload, items, fields) == []
+    assert calls == ["id_card_front"]
 
 
 def test_create_request_reports_retention_and_ocr_bound_fields(tmp_path):
@@ -101,7 +109,7 @@ def test_create_request_reports_retention_and_ocr_bound_fields(tmp_path):
 @pytest.mark.parametrize("value", ["2098-12-31", "2098-12-31T23:59:59", "2098-12-31 23:59:59"])
 def test_deadline_without_timezone_is_rejected(tmp_path, value):
     with pytest.raises(ValueError, match="TIME_ZONE_REQUIRED"):
-        collection.validate_config(base_config([NAME], deadline=value), mode="open")
+        collector.validate_config(base_config([NAME], deadline=value))
     assert not collection.explicit_timezone(value)
     assert collection.explicit_timezone("2098-12-31T23:59:59+08:00") and collection.explicit_timezone("2098-12-31T23:59:59Z")
 
@@ -138,17 +146,17 @@ def test_vault_preview_returns_full_picture_instead_of_error_when_required_missi
     assert preview["same_type_entries"] == {"phone": [{"entry": "mobile", "label": "手机"}]}
 
     status = run(["vault-status", "--request", str(request)])
-    assert status["same_type_entries"]["phone"][0]["entry"] == "mobile" and "hint" in status
+    assert status["same_type_entries"]["phone"][0]["entry"] == "mobile"
     assert status["entries"]["name"]["label"] == "name"  # 空标签回退为条目 id
 
     mapping = private_json(tmp_path / "private" / "map.json", {"phone": "mobile"})
     stage(tmp_path, {"hire_date": {"type": "date", "value": "2026-09-01"}}, name="fix")
     ready = run(["vault-preview", str(request), "--mapping", str(mapping), "--confirmation-out", str(confirmation)])
-    assert ready["ready"] is True and confirmation.exists() and "30 分钟" in ready["instruction"]
+    assert ready["ready"] is True and confirmation.exists() and ready["confirmation"] == str(confirmation)
 
     # vault-fill 仍然严格：缺必填不能生成回执
     with pytest.raises(fill.FillError, match="VAULT_FIELDS_MISSING"):
-        fill._prepare_vault_selection(fill.load_form(request), {"format": vault.FORMAT_V2, "entries": {}}, {})
+        fill._prepare_vault_selection(fill.load_form(request), {"format": vault.FORMAT, "entries": {}}, {})
 
 
 def test_collect_reports_exclusions_late_and_duplicate_names(tmp_path, isolated_vault):
@@ -160,13 +168,13 @@ def test_collect_reports_exclusions_late_and_duplicate_names(tmp_path, isolated_
         run(["vault-preview", str(request), "--confirmation-out", str(confirmation)])
         run(["vault-fill", str(request), "--confirmation", str(confirmation), "--out-dir", str(incoming)])
     (incoming / "坏掉-XXXXXX.yintian").write_text(json.dumps({
-        "format_version": collection.OPEN_FORMAT_VERSION, "task_id": json.loads(request.read_text())["task_id"],
+        "format_version": collection.SUBMISSION_FORMAT_VERSION, "task_id": json.loads(request.read_text())["task_id"],
         "invite_id": "OPEN-AAAAAAAAAAAAAAAA", "schema_hash": json.loads(request.read_text())["schema_hash"],
         "key_id": json.loads(request.read_text())["key_id"],
         "algorithms": {"content": "AES-256-GCM", "key_wrap": "RSA-OAEP-3072-SHA256"},
         "encrypted_key_b64": "AAAA", "iv_b64": "AAAA", "ciphertext_b64": "AAAA"}), encoding="utf-8")
 
-    result = collection.collect_open(task_dir, incoming, tmp_path / "result.xlsx")
+    result = collector.collect_task(task_dir, incoming, tmp_path / "result.xlsx")
 
     assert result["rows"] == 2 and result["excluded"] == 1 and result["late"] == 0
     assert result["duplicate_names"] == ["张三"] and "--previous" in result["warning"]
@@ -175,12 +183,12 @@ def test_collect_reports_exclusions_late_and_duplicate_names(tmp_path, isolated_
 
 def test_exclusion_details_next_actions():
     rows = [
-        {"name": "甲", "employee_id": "OPEN-1", "status": "verified", "late": 1, "missing_fields": [], "conflict_fields": []},
-        {"name": "乙", "employee_id": "OPEN-2", "status": "needs_review", "late": 0, "missing_fields": [], "conflict_fields": ["ocr:conflict:id_number"]},
-        {"name": "丙", "employee_id": "OPEN-3", "status": "needs_review", "late": 0, "missing_fields": [], "conflict_fields": ["runtime:ocr:id_front"]},
-        {"name": "丁", "employee_id": "OPEN-4", "status": "needs_review", "late": 1, "missing_fields": ["phone"], "conflict_fields": []},
+        {"name": "甲", "invite_id": "OPEN-1", "status": "verified", "late": True, "missing_fields": [], "conflict_fields": []},
+        {"name": "乙", "invite_id": "OPEN-2", "status": "needs_review", "late": False, "missing_fields": [], "conflict_fields": ["ocr:conflict:id_number"]},
+        {"name": "丙", "invite_id": "OPEN-3", "status": "needs_review", "late": False, "missing_fields": [], "conflict_fields": ["runtime:ocr:id_front"]},
+        {"name": "丁", "invite_id": "OPEN-4", "status": "needs_review", "late": True, "missing_fields": ["phone"], "conflict_fields": []},
     ]
-    details = {item["name"]: item for item in collection.exclusion_details(rows)}
+    details = {item["name"]: item for item in collector.exclusion_details(rows)}
     assert set(details) == {"乙", "丙", "丁"}
     assert "decide" in details["乙"]["next_action"]
     assert "requirements-ocr" in details["丙"]["next_action"]

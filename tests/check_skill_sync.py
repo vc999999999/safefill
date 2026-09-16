@@ -1,12 +1,9 @@
 """校验 skills/safefill-collect 与 skills/safefill-fill 的共享模块逐字节一致。
 
-这 6 个模块（collection.py、config.py、evidence_routing.py、ocr_matcher.py、
-openvino_runtime.py、secure_io.py）是两个 skill 的同步副本：任何修改必须双侧
-同步（见 README「共享模块同步」）。本脚本既可直接运行，也可作为 pytest 用例
-由 CI 执行；发现漂移时打印不一致的文件名并以非零码退出。
-
-注意：collection.py 中 review_evidence 的导入在两侧都带 try/except 降级，
-因此两侧代码逐字节相同，可以整体纳入比对。
+这 5 个模块（collection.py、config.py、ocr_matcher.py、openvino_runtime.py、
+secure_io.py）是两个 skill 的同步副本：任何修改必须双侧同步（见
+README「共享模块同步」）。本脚本既可直接运行，也可作为 pytest 用例由 CI 执行；
+发现漂移时打印不一致的文件名并以非零码退出。
 """
 from __future__ import annotations
 
@@ -18,7 +15,6 @@ SIDES = ("safefill-collect", "safefill-fill")
 SHARED_MODULES = (
     "collection.py",
     "config.py",
-    "evidence_routing.py",
     "ocr_matcher.py",
     "openvino_runtime.py",
     "secure_io.py",

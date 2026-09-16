@@ -37,12 +37,17 @@ SafeFill 是一个 AI→AI 的私密资料收集协议。HR Agent 把需求编�
 
 ## 共享模块同步
 
-两个 Skill 的 `scripts/` 下有 6 个逐字节相同的共享模块：`collection.py`、`config.py`、`evidence_routing.py`、`ocr_matcher.py`、`openvino_runtime.py`、`secure_io.py`。
+两个 Skill 的 `scripts/` 下有 5 个逐字节相同的共享模块：`collection.py`（协议层）、`config.py`、`ocr_matcher.py`、`openvino_runtime.py`、`secure_io.py`。
+`collection.py` 是纯粹的 AI→AI 协议库（常量、规范 JSON、哈希、AES-GCM 封包、信封与字段校验），两端各存一份相同副本；收集端的任务管理、收件、导出等专有逻辑只在收集端的 `collector.py` 中，填写端不携带这部分代码。
 修改其中任何一个必须双侧同步提交；`tests/check_skill_sync.py` 会逐字节比对两侧副本，发现漂移即失败（CI 与本地均可直接运行）。
+
+## 版本与兼容
+
+当前协议版本：请求包 `yintian-request/1`、保险柜 `yintian-vault/2`、回执 `yintian-submission/4`、确认文件 `yintian-confirmation/1`、交接包 `yintian-task/3`。代码只为当前版本实现，不包含旧版本（`yintian-form/*`、名单/凭据模式、v1 保险柜与交接包）的迁移路径——5.0/6.0 起老产物需用旧版本脚本先行处理或重新生成。协议格式变更时会递增版本号并在本段说明；`schema_hash`/`notice_hash` 保证回执与发出时的请求包严格对应，混用不同版本生成的文件会被明确拒绝而非静默接受。
 
 ## 默认使用方式：AI 请求包 + 本机保险柜
 
-新任务默认采用 `open` 模式：HR 不准备员工名单、个人凭据、任务密码、配置文件或网页表单，也不需要运行终端。Agent 只补问尚未说明的用途、字段、必填性、截止时间和联系人，然后生成 `REQUEST.yintian-request`。截止与保存时间必须带时区偏移；保存期限（默认截止后 30 天）一到，收件端按告知承诺拒绝解密，HR 需在此之前完成汇总。附件与填写值的自动比对（`ocr_fields`）默认关闭，只在 HR 明确要求并知晓"比对不通过需 HR 本人在终端 `decide` 裁定"后启用；字段名本身不会触发比对。
+HR 不准备员工名单、配置文件或网页表单，也不需要运行终端。Agent 只补问尚未说明的用途、字段、必填性、截止时间和联系人，然后生成 `REQUEST.yintian-request`。截止与保存时间必须带时区偏移；保存期限（默认截止后 30 天）一到，收件端按告知承诺拒绝解密，HR 需在此之前完成汇总。附件与填写值的自动比对（`ocr_fields`）默认关闭，只在 HR 明确要求并知晓"比对不通过需 HR 本人在终端 `decide` 裁定"后启用；字段名本身不会触发比对。
 
 员工把请求包交给安装了 `safefill-fill` 的 Agent：Agent 读取并说明用途后运行 `vault-status`。首次使用或存在缺项时，通过 `vault-stage` 展示完整新旧值、本人确认后 `vault-apply`；提交前再由 `vault-preview` 展示本次完整取值和来源，确认后 `vault-fill` 生成 `姓名-随机短码.yintian`。员工本人发送回执，HR Agent 收件后统一解密、校验并导出 Excel 和附件；`collect` 同时返回逐人排除原因、迟交人数与同名多行提醒。
 
@@ -80,7 +85,7 @@ cd safefill
 
 python3 -m venv skills/safefill-collect/.venv
 skills/safefill-collect/.venv/bin/python -m pip install -r skills/safefill-collect/requirements.txt
-skills/safefill-collect/.venv/bin/python skills/safefill-collect/scripts/collection.py doctor
+skills/safefill-collect/.venv/bin/python skills/safefill-collect/scripts/collector.py doctor
 
 python3 -m venv skills/safefill-fill/.venv
 skills/safefill-fill/.venv/bin/python -m pip install -r skills/safefill-fill/requirements.txt
@@ -102,7 +107,7 @@ Windows 中将 `.venv/bin/python` 换为 `.venv\Scripts\python.exe`。核心流�
 - 默认开放流程中，填写 Agent 和 HR Agent 会处理各自获授权的明文；不得扩大字段、扫描磁盘、猜测缺值、把他人明文贴进聊天或自动替员工发送回执。
 - 任务私钥始终加密，本地随机密钥存放在任务目录之外的受限目录。
 - OCR/VLM 结果只是候选，不代替填写者确认和 HR 复核。
-- 仓库不保存真实名单、凭据、明文资料、附件、提交文件、保险柜、导出表格或项目外文稿；`skills/safefill-fill/data/` 已在 `.gitignore` 中排除。
+- 仓库不保存真实明文资料、附件、提交文件、保险柜、导出表格或项目外文稿；`skills/safefill-fill/data/` 已在 `.gitignore` 中排除。
 
 更完整的操作与权限说明见[收集者文档](skills/safefill-collect/README.md)与[填写者文档](skills/safefill-fill/README.md)。
 
@@ -120,7 +125,7 @@ safefill/
 │   └── safefill-fill/        # 填写者 Skill，可独立安装
 │       ├── SKILL.md
 │       ├── agents/
-│       └── scripts/         # 保险柜、确认、迁移、OCR/VLM 与加密
+│       └── scripts/         # 保险柜、确认、OCR/VLM 与加密
 └── .github/
 ```
 
@@ -130,14 +135,14 @@ safefill/
 
 ```bash
 # HR 侧：生成请求包
-$PY skills/safefill-collect/scripts/collection.py create-request --config collection.json --out tasks
+$PY skills/safefill-collect/scripts/collector.py create-request --config collection.json --out tasks
 # 员工侧：暂存确认 → 精确匹配 → 提交确认 → 生成回执
 printf '%s' "$JSON" | $PY skills/safefill-fill/scripts/fill.py vault-stage --answers - --confirmation-out "$WORK/CHANGE.yintian-confirmation"   # $WORK 为 0700 目录
 $PY skills/safefill-fill/scripts/fill.py vault-apply --confirmation "$WORK/CHANGE.yintian-confirmation"
 $PY skills/safefill-fill/scripts/fill.py vault-preview tasks/<TASK_DIR>/REQUEST.yintian-request --confirmation-out "$WORK/SUBMIT.yintian-confirmation"
 $PY skills/safefill-fill/scripts/fill.py vault-fill tasks/<TASK_DIR>/REQUEST.yintian-request --confirmation "$WORK/SUBMIT.yintian-confirmation" --out-dir incoming
 # HR 侧：解密汇总
-$PY skills/safefill-collect/scripts/collection.py collect tasks/<TASK_DIR> incoming --out result.xlsx
+$PY skills/safefill-collect/scripts/collector.py collect tasks/<TASK_DIR> incoming --out result.xlsx
 $PY -m pytest -q
 ```
 

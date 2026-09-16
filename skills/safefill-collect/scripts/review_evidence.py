@@ -2,7 +2,7 @@
 import io
 
 
-def confirm_evidence(values, attachments, issues, *, agent_candidates=None):
+def confirm_evidence(values, attachments, issues):
     try:
         import tkinter as tk
         from tkinter import ttk
@@ -43,11 +43,6 @@ def confirm_evidence(values, attachments, issues, *, agent_candidates=None):
         ttk.Label(root, text='逐页核对原件与填写值，再逐项确认。空闲五分钟自动关闭。').pack()
         text = tk.Text(root, height=5, wrap='word')
         text.insert('1.0', '\n'.join(f'{key}: {value!r}' for key, value in values.items()))
-        if agent_candidates:
-            text.insert('end', '\n宿主 Agent 候选（未经独立验证，请对照原件）：\n')
-            for record in agent_candidates:
-                for key, candidates in record['candidates'].items():
-                    text.insert('end', f"{record['field_id']} → {key}: {candidates!r}\n")
         text.configure(state='disabled')
         text.pack(fill='x')
         title = ttk.Label(root)

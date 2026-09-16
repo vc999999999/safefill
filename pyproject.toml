@@ -15,12 +15,6 @@ ignore = [
     "E731",
 ]
 
-[tool.ruff.lint.per-file-ignores]
-# 存量未使用导入（hashes/sys/Path），已报告待清理；清理后应移除此节。
-"skills/safefill-collect/scripts/collection.py" = ["F401"]
-"skills/safefill-fill/scripts/collection.py" = ["F401"]
-"skills/safefill-fill/scripts/fill_extract.py" = ["F401"]
-
 [tool.mypy]
 python_version = "3.11"
 # 扁平 scripts/ 布局：模块间用 `import secure_io` 这类同目录导入，mypy_path 提供解析路径。
@@ -36,9 +30,8 @@ module = ["openvino_runtime"]
 disable_error_code = ["valid-type", "misc"]
 
 [[tool.mypy.overrides]]
-# collection 的两处告警来源：summary 异构 dict 被推断为 object（operator/attr-defined），
-# 以及 mode 分支保证非 None 但 mypy 无法收窄（arg-type/union-attr）。已作为潜在问题报告给主代理。
-module = ["collection"]
+# collector 的告警来自 ingest/collect 的异构 summary dict 被推断为 object（operator/attr-defined 等）。
+module = ["collector"]
 disable_error_code = ["arg-type", "operator", "attr-defined", "union-attr"]
 
 [[tool.mypy.overrides]]
@@ -48,10 +41,10 @@ disable_error_code = ["dict-item", "union-attr"]
 
 [tool.bandit]
 # 逐条评估后的跳过（均为中低危，理由如下）：
-# B108 hardcoded_tmp_directory: secure_io.py:17 命中的是 ('/tmp','/var','/etc') macOS 别名安全校验字面量，并非临时目录使用，误报。
-# B110 try_except_pass: ocr_engine.py:101 图像预处理失败时回退原图，是刻意的容错路径（Low）。
-# B608 hardcoded_sql_expressions: collection.py:1204 的 f-string SQL 拼接内容只来自两个硬编码状态常量，无用户输入，误报。
-# B615 huggingface_unsafe_download: vlm_extract.py:144 在提供 revision 时会显式传入，且下载后有 verify_model 清单校验兜底。
+# B108 hardcoded_tmp_directory: secure_io.py 中 ('/tmp','/var','/etc') 是 macOS 别名安全校验字面量，并非临时目录使用，误报。
+# B110 try_except_pass: ocr_engine.py 图像预处理失败时回退原图，是刻意的容错路径（Low）。
+# B608 hardcoded_sql_expressions: collector.py review_task 的 f-string SQL 只含两个硬编码状态常量，无用户输入，误报。
+# B615 huggingface_unsafe_download: vlm_extract.py 在提供 revision 时会显式传入，且下载后有 verify_model 清单校验兜底。
 skips = ["B108", "B110", "B608", "B615"]
 
 [tool.pytest.ini_options]

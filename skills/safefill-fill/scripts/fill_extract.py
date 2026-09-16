@@ -5,8 +5,6 @@ scripts/ocr_matcher.py 的同一实现；多候选只标记歧义，绝不静默
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any
 
 

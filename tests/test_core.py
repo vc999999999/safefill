@@ -9,11 +9,12 @@ import pytest
 from openpyxl import load_workbook
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "safefill-fill" / "scripts"
+COLLECT_SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "safefill-collect" / "scripts"
+sys.path.insert(0, str(COLLECT_SCRIPTS))
 sys.path.insert(0, str(SCRIPTS))
 
-import collection  # noqa: E402
+import collector  # noqa: E402
 import fill  # noqa: E402
-import vault  # noqa: E402
 import vlm_extract  # noqa: E402
 
 
@@ -54,8 +55,8 @@ def make_request(tmp_path: Path, fields: list[dict]):
         "fields": fields,
     }
     config_path = tmp_path / "collection.json"
-    collection.dump_json(config_path, config)
-    args = collection.build_parser().parse_args(
+    collector.dump_json(config_path, config)
+    args = collector.build_parser().parse_args(
         ["create-request", "--config", str(config_path), "--out", str(tmp_path / "tasks")])
     created = args.func(args)
     return Path(created["request"]), Path(created["task_dir"])
@@ -99,7 +100,7 @@ def test_open_roundtrip_uses_only_exact_ids_and_explicit_mapping(tmp_path, isola
                       "--out-dir", str(incoming)])["out"])
     assert reply.name.startswith("张三-") and reply.suffix == ".yintian"
 
-    result = collection.collect_open(task_dir, incoming, tmp_path / "result.xlsx")
+    result = collector.collect_task(task_dir, incoming, tmp_path / "result.xlsx")
     book = load_workbook(result["xlsx"], read_only=True)
     rows = list(book.active.values)
     book.close()
@@ -132,25 +133,6 @@ def test_confirmation_rejects_changed_request_tampering_and_reuse(tmp_path, isol
     run(["vault-fill", str(request), "--confirmation", str(valid), "--out-dir", str(work)])
     with pytest.raises(fill.FillError, match="CONFIRMATION_INVALID"):
         run(["vault-fill", str(request), "--confirmation", str(valid), "--out-dir", str(work)])
-
-
-def test_v1_migration_preserves_source_and_deletes_password(tmp_path):
-    source_dir, target_dir, key_dir = private(tmp_path / "old"), private(tmp_path / "new"), private(tmp_path / "keys")
-    source = source_dir / "vault.yintian-vault"
-    old = {"version": 1, "types": {"name": "text"}, "values": {"name": "张三"}, "attachments": {}}
-    source.write_bytes(collection.canonical(collection.aes_gcm_seal(
-        vault.FORMAT_V1, collection.canonical(old), "password", vault.FORMAT_V1.encode())))
-    password = source_dir / "password.txt"
-    password.write_text("password", encoding="utf-8")
-    if os.name != "nt":
-        source.chmod(0o600)
-        password.chmod(0o600)
-    target, key = target_dir / vault.VAULT_FILENAME, key_dir / vault.KEY_FILENAME
-
-    run(["vault-migrate", "--password-file", str(password), "--source-vault", str(source),
-         "--target-vault", str(target), "--target-key", str(key)])
-    profile = vault.load_vault(target, vault.load_or_create_key(key))
-    assert source.exists() and not password.exists() and profile["entries"]["name"]["value"] == "张三"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")

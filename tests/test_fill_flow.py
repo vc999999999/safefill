@@ -8,9 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "safefill-fill" / "scripts"
+COLLECT_SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "safefill-collect" / "scripts"
+sys.path.insert(0, str(COLLECT_SCRIPTS))
 sys.path.insert(0, str(SCRIPTS))
 
-import collection  # noqa: E402
+import collector  # noqa: E402
 import fill  # noqa: E402
 
 
@@ -56,8 +58,8 @@ def make_request(tmp_path: Path, fields: list[dict]):
         "fields": fields,
     }
     config_path = tmp_path / "collection.json"
-    collection.dump_json(config_path, config)
-    args = collection.build_parser().parse_args(
+    collector.dump_json(config_path, config)
+    args = collector.build_parser().parse_args(
         ["create-request", "--config", str(config_path), "--out", str(tmp_path / "tasks")])
     created = args.func(args)
     return Path(created["request"]), Path(created["task_dir"])
