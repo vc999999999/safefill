@@ -165,8 +165,8 @@ def test_collect_reports_exclusions_late_and_duplicate_names(tmp_path, isolated_
     incoming = private(tmp_path / "incoming")
     for index in range(2):
         confirmation = tmp_path / "private" / f"submit{index}.yintian-confirmation"
-        run(["vault-preview", str(request), "--confirmation-out", str(confirmation)])
-        run(["vault-fill", str(request), "--confirmation", str(confirmation), "--out-dir", str(incoming)])
+        run(["vault-preview", str(request), "--fresh", "--confirmation-out", str(confirmation)])
+        run(["vault-fill", str(request), "--fresh", "--confirmation", str(confirmation), "--out-dir", str(incoming)])
     (incoming / "坏掉-XXXXXX.yintian").write_text(json.dumps({
         "format_version": collection.SUBMISSION_FORMAT_VERSION, "task_id": json.loads(request.read_text())["task_id"],
         "invite_id": "OPEN-AAAAAAAAAAAAAAAA", "schema_hash": json.loads(request.read_text())["schema_hash"],
@@ -181,17 +181,20 @@ def test_collect_reports_exclusions_late_and_duplicate_names(tmp_path, isolated_
     assert result["exclusions"][0]["status"] == "invalid" and "重新生成" in result["exclusions"][0]["next_action"]
 
 
-def test_exclusion_details_next_actions():
+def test_exclusion_details_next_actions(tmp_path):
     rows = [
-        {"name": "甲", "invite_id": "OPEN-1", "status": "verified", "late": True, "missing_fields": [], "conflict_fields": []},
-        {"name": "乙", "invite_id": "OPEN-2", "status": "needs_review", "late": False, "missing_fields": [], "conflict_fields": ["ocr:conflict:id_number"]},
-        {"name": "丙", "invite_id": "OPEN-3", "status": "needs_review", "late": False, "missing_fields": [], "conflict_fields": ["runtime:ocr:id_front"]},
-        {"name": "丁", "invite_id": "OPEN-4", "status": "needs_review", "late": True, "missing_fields": ["phone"], "conflict_fields": []},
+        {"name": "甲", "invite_id": "OPEN-1", "status": "verified", "version": 1, "late": True, "missing_fields": [], "conflict_fields": []},
+        {"name": "乙", "invite_id": "OPEN-2", "status": "needs_review", "version": 2, "late": False, "missing_fields": [], "conflict_fields": ["ocr:conflict:id_number"]},
+        {"name": "丙", "invite_id": "OPEN-3", "status": "needs_review", "version": 1, "late": False, "missing_fields": [], "conflict_fields": ["runtime:ocr:id_front"]},
+        {"name": "丁", "invite_id": "OPEN-4", "status": "needs_review", "version": 3, "late": True, "missing_fields": ["phone"], "conflict_fields": []},
     ]
-    details = {item["name"]: item for item in collector.exclusion_details(rows)}
+    details = {item["name"]: item for item in collector.exclusion_details(tmp_path, rows)}
     assert set(details) == {"乙", "丙", "丁"}
     assert "decide" in details["乙"]["next_action"]
-    assert "requirements-ocr" in details["丙"]["next_action"]
+    assert details["乙"]["invite_id"] == "OPEN-2" and details["乙"]["version"] == 2
+    assert "OPEN-2" in details["乙"]["decide_command"] and "--version 2" in details["乙"]["decide_command"]
+    assert "decide_command" not in details["丙"]
+    assert "doctor" in details["丙"]["next_action"]
     assert "--previous" in details["丁"]["next_action"] and details["丁"]["late"] is True
 
 

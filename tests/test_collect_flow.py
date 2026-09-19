@@ -63,7 +63,7 @@ def test_ingest_reports_skipped_directories_and_hint(tmp_path):
     assert summary["accepted"] == 0 and summary["duplicates"] == 0 and summary["rejected"] == 0
     assert summary["errors"] == []
     assert summary["skipped_directories"] == 2
-    assert summary["hint"] == "收件目录顶层无 .yintian 文件，不递归子目录；发现 2 个子目录，请将回执文件移到顶层后重试"
+    assert summary["hint"] == "收件目录顶层无 .yintian 文件，默认不递归子目录；发现 2 个子目录，请将回执文件移到顶层后重试，或加 --recursive 递归收件"
     serialized = json.dumps(summary, ensure_ascii=False)
     assert "张三" not in serialized and "李四" not in serialized
 
@@ -78,7 +78,7 @@ def test_ingest_hint_mentions_subdirectories_even_when_top_level_processed(tmp_p
 
     assert summary["rejected"] == 1
     assert summary["skipped_directories"] == 1
-    assert summary["hint"] == "收件目录不递归子目录；发现 1 个子目录，若其中还有回执请将回执文件移到顶层后重试"
+    assert summary["hint"] == "收件目录默认不递归子目录；发现 1 个子目录，若其中还有回执请将回执文件移到顶层后重试，或加 --recursive 递归收件"
     assert "张三" not in json.dumps(summary, ensure_ascii=False)
 
 
@@ -104,7 +104,7 @@ def test_collect_fails_fast_with_suggested_name_when_xlsx_exists(tmp_path, monke
         collector.collect_task(task_dir, incoming, out)
 
     assert ingest_calls == []
-    suggested = re.search(r"result-\d{8}-\d{4}\.xlsx", str(excinfo.value))
+    suggested = re.search(r"result-\d{8}-\d{6}\.xlsx", str(excinfo.value))
     assert suggested is not None
     assert not (tmp_path / suggested.group(0)).exists()
 
@@ -145,7 +145,8 @@ def test_cli_only_exposes_open_workflow_commands():
     sub = next(action for action in collector.build_parser()._actions
                if isinstance(action, argparse._SubParsersAction))
     assert set(sub.choices) == {"create-request", "collect", "ingest", "review", "decide",
-                                "doctor", "export-task", "import-task", "purge"}
+                                "doctor", "export-task", "import-task", "purge",
+                                "status", "list-tasks", "notice", "audit-log"}
 
 
 def test_export_import_roundtrip_unlocks_task(tmp_path):
@@ -189,3 +190,76 @@ def test_human_commands_require_tty():
         args = collector.build_parser().parse_args(argv)
         with pytest.raises(RuntimeError, match="交互终端"):
             args.func(args)
+
+
+def test_status_lists_rows_with_full_identifiers(tmp_path):
+    task_dir = make_open_task(tmp_path)
+    incoming = private(tmp_path / "incoming")
+    collector.ingest_task(task_dir, incoming)
+    result = run_collect(["status", str(task_dir)])
+    assert result["task_id"].startswith("YT-") and result["expired"] is False
+    assert result["retention_days_left"] > 0 and result["counts"] == {}
+    assert result["rows"] == []
+
+
+def test_list_tasks_discovers_task_dirs(tmp_path):
+    task_dir = make_open_task(tmp_path)
+    other = private(tmp_path / "other")
+    (other / "YT-notatask").mkdir()
+    result = run_collect(["list-tasks", str(tmp_path / "tasks")])
+    assert [item["task_dir"] for item in result["tasks"]] == [str(task_dir)]
+    assert result["tasks"][0]["task_id"] == task_dir.name
+    assert result["tasks"][0]["status_counts"] == {}
+
+
+def test_request_filename_contains_task_id(tmp_path):
+    task_dir = make_open_task(tmp_path)
+    task_id = task_dir.name
+    request = task_dir / f"REQUEST-{task_id}.yintian-request"
+    assert request.is_file()
+    assert not (task_dir / "REQUEST.yintian-request").exists()
+
+
+def test_ingest_recursive_picks_up_nested_receipts(tmp_path):
+    task_dir = make_open_task(tmp_path)
+    incoming = private(tmp_path / "incoming")
+    nested = incoming / "sub"
+    nested.mkdir()
+    (nested / "broken.yintian").write_bytes(b"not-json")
+
+    shallow = collector.ingest_task(task_dir, incoming)
+    assert shallow["rejected"] == 0 and shallow["skipped_directories"] == 1
+
+    deep = collector.ingest_task(task_dir, incoming, recursive=True)
+    assert deep["rejected"] == 1 and deep["skipped_directories"] == 0
+    assert deep["errors"][0]["file_ref"]
+
+
+def test_notice_roundtrip_fields_and_validation(tmp_path):
+    task_dir = make_open_task(tmp_path)
+    with pytest.raises(ValueError, match="回执编号格式无效"):
+        run_collect(["notice", str(task_dir), "BAD-ID", "--out", str(tmp_path / "n.yintian-notice")])
+    with pytest.raises(ValueError, match="不存在回执编号"):
+        run_collect(["notice", str(task_dir), "OPEN-ABCDEFGHIJKLMNOP", "--out", str(tmp_path / "n.yintian-notice")])
+
+
+def test_export_import_preserves_request_filename(tmp_path):
+    task_dir = make_open_task(tmp_path)
+    package = tmp_path / "handoff.yintian-package"
+    collector.export_task(task_dir, package, handoff_password="pw-123")
+    imported = collector.import_task(package, tmp_path / "imported", handoff_password="pw-123")
+    imported_dir = Path(imported["task_dir"])
+    task_id = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))["task_id"]
+    assert (imported_dir / f"REQUEST-{task_id}.yintian-request").is_file()
+    assert not (imported_dir / "REQUEST.yintian-request").exists()
+
+
+def test_audit_log_lists_ingest_and_collect(tmp_path):
+    task_dir = make_open_task(tmp_path)
+    incoming = private(tmp_path / "incoming")
+    collector.ingest_task(task_dir, incoming)
+    collector.collect_task(task_dir, incoming, tmp_path / "result.xlsx")
+    log = run_collect(["audit-log", str(task_dir)])
+    actions = [entry["action"] for entry in log["entries"]]
+    assert "collect" in actions
+    assert all(entry["result"] for entry in log["entries"])

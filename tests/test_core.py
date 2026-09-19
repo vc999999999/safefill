@@ -104,7 +104,9 @@ def test_open_roundtrip_uses_only_exact_ids_and_explicit_mapping(tmp_path, isola
     book = load_workbook(result["xlsx"], read_only=True)
     rows = list(book.active.values)
     book.close()
-    assert result["rows"] == 1 and rows[1][:2] == ("张三", "2026-09-01")
+    assert result["rows"] == 1
+    assert rows[0][:3] == ("姓名", "回执编号", "入职日期")
+    assert rows[1][0] == "张三" and rows[1][1].startswith("OPEN-") and rows[1][2] == "2026-09-01"
 
 
 def test_confirmation_rejects_changed_request_tampering_and_reuse(tmp_path, isolated_vault):
@@ -281,8 +283,8 @@ def test_vault_fill_warns_only_about_same_task_receipts(tmp_path, isolated_vault
     assert "warning" not in first
 
     confirmation2 = tmp_path / "private" / "submit2.yintian-confirmation"
-    run(["vault-preview", str(request), "--confirmation-out", str(confirmation2)])
-    second = run(["vault-fill", str(request), "--confirmation", str(confirmation2), "--out-dir", str(incoming)])
+    run(["vault-preview", str(request), "--fresh", "--confirmation-out", str(confirmation2)])
+    second = run(["vault-fill", str(request), "--fresh", "--confirmation", str(confirmation2), "--out-dir", str(incoming)])
     assert "--previous" in second["warning"] and Path(first["out"]).name in second["warning"]
     assert json.loads(Path(first["out"]).read_text(encoding="utf-8"))["task_id"] == task_id
 

@@ -336,3 +336,55 @@ def status_view(profile: dict, form=None) -> dict:
         ]
         result["missing"] = missing
     return result
+
+
+REGISTRY_FORMAT = "yintian-submissions/1"
+REGISTRY_FILENAME = "submissions.json"
+MAX_REGISTRY_RECORDS = 200
+
+
+def registry_path(vault_dir: Path) -> Path:
+    return secure_io.checked_path(vault_dir) / REGISTRY_FILENAME
+
+
+def load_registry(vault_dir: Path) -> list[dict]:
+    """读取提交登记（纯本地索引）；缺失或损坏时返回空列表，不阻断流程。"""
+    path = registry_path(vault_dir)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(secure_io.read_bytes(path, 1024 * 1024))
+    except Exception:
+        return []
+    if not isinstance(data, dict) or data.get("format") != REGISTRY_FORMAT or not isinstance(data.get("records"), list):
+        return []
+    records = []
+    for item in data["records"]:
+        if isinstance(item, dict) and all(isinstance(item.get(key), str) for key in ("task_id", "invite_id", "path", "sealed_at")):
+            records.append({"task_id": item["task_id"], "invite_id": item["invite_id"],
+                            "path": item["path"], "sealed_at": item["sealed_at"]})
+    return records
+
+
+def record_submission(vault_dir: Path, record: dict) -> Path:
+    """追加一条提交登记（task_id/invite_id/回执路径/时间），只保留最近 MAX_REGISTRY_RECORDS 条。"""
+    directory = ensure_private_dir(secure_io.checked_path(vault_dir))
+    records = load_registry(directory)
+    records.append({"task_id": str(record["task_id"]), "invite_id": str(record["invite_id"]),
+                    "path": str(record["path"]), "sealed_at": str(record["sealed_at"])})
+    records = records[-MAX_REGISTRY_RECORDS:]
+    path = registry_path(directory)
+    secure_io.atomic_write(path, collection.canonical({"format": REGISTRY_FORMAT, "records": records}), overwrite=True)
+    return path
+
+
+def find_previous(vault_dir: Path, task_id: str) -> dict | None:
+    """该任务最近一次提交且回执文件仍在原路径的登记；供 --previous 自动解析。"""
+    for record in reversed(load_registry(vault_dir)):
+        if record["task_id"] == task_id:
+            try:
+                if secure_io.checked_path(record["path"]).is_file():
+                    return record
+            except ValueError:
+                continue
+    return None

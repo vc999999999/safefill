@@ -1,4 +1,4 @@
 interface:
   display_name: "SafeFill · 收集者"
   short_description: "生成 AI 信息请求包，收件后汇总 Excel"
-  default_prompt: "使用 $safefill-collect：只补问尚未说明的收集需求，生成供员工 safefill-fill Agent 读取的 REQUEST.yintian-request；绝不生成 HTML 或让人填表。收到加密回执后汇总 Excel 和附件，不让我运行终端。"
+  default_prompt: "使用 $safefill-collect：只补问尚未说明的收集需求，生成供员工 safefill-fill Agent 读取的请求包（文件名含任务编号）；绝不生成 HTML 或让人填表。收到加密回执后汇总 Excel 和附件，随时可查看进度与回退通知，不让我运行终端。"

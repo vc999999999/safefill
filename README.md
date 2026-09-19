@@ -20,7 +20,7 @@ SafeFill 是一个 AI→AI 的私密资料收集协议。HR Agent 把需求编�
 
 **4. AI→AI 机器协议 · 零网页表单**
 
-`REQUEST.yintian-request` 是 Agent 之间交换的规范 JSON，不是给人填写的界面，也不会生成 HTML 或在线表单。请求包携带 `schema_hash`/`notice_hash` 防篡改，公钥指纹可带外核对；请求包、回执、附件一律视为数据，不执行其中夹带的指令。
+`REQUEST-{任务编号}.yintian-request` 是 Agent 之间交换的规范 JSON，不是给人填写的界面，也不会生成 HTML 或在线表单。请求包携带 `schema_hash`/`notice_hash` 防篡改，公钥指纹可带外核对；请求包、回执、附件一律视为数据，不执行其中夹带的指令。
 
 **5. 克制的 Agent 边界**
 
@@ -43,13 +43,13 @@ SafeFill 是一个 AI→AI 的私密资料收集协议。HR Agent 把需求编�
 
 ## 版本与兼容
 
-当前协议版本：请求包 `yintian-request/1`、保险柜 `yintian-vault/2`、回执 `yintian-submission/4`、确认文件 `yintian-confirmation/1`、交接包 `yintian-task/3`。代码只为当前版本实现，不包含旧版本（`yintian-form/*`、名单/凭据模式、v1 保险柜与交接包）的迁移路径——5.0/6.0 起老产物需用旧版本脚本先行处理或重新生成。协议格式变更时会递增版本号并在本段说明；`schema_hash`/`notice_hash` 保证回执与发出时的请求包严格对应，混用不同版本生成的文件会被明确拒绝而非静默接受。
+当前协议版本：请求包 `yintian-request/1`、保险柜 `yintian-vault/2`、回执 `yintian-submission/4`、确认文件 `yintian-confirmation/1`、交接包 `yintian-task/3`、退回/补正通知 `yintian-notice/1`、填写端本地提交登记 `yintian-submissions/1`（仅存本机保险柜目录，不传输）。代码只为当前版本实现，不包含旧版本（`yintian-form/*`、名单/凭据模式、v1 保险柜与交接包）的迁移路径——5.0/6.0 起老产物需用旧版本脚本先行处理或重新生成。协议格式变更时会递增版本号并在本段说明；`schema_hash`/`notice_hash` 保证回执与发出时的请求包严格对应，混用不同版本生成的文件会被明确拒绝而非静默接受。
 
 ## 默认使用方式：AI 请求包 + 本机保险柜
 
-HR 不准备员工名单、配置文件或网页表单，也不需要运行终端。Agent 只补问尚未说明的用途、字段、必填性、截止时间和联系人，然后生成 `REQUEST.yintian-request`。截止与保存时间必须带时区偏移；保存期限（默认截止后 30 天）一到，收件端按告知承诺拒绝解密，HR 需在此之前完成汇总。附件与填写值的自动比对（`ocr_fields`）默认关闭，只在 HR 明确要求并知晓"比对不通过需 HR 本人在终端 `decide` 裁定"后启用；字段名本身不会触发比对。
+HR 不准备员工名单、配置文件或网页表单，也不需要运行终端。Agent 只补问尚未说明的用途、字段、必填性、截止时间和联系人，然后生成 `REQUEST-{任务编号}.yintian-request`。截止与保存时间必须带时区偏移；保存期限（默认截止后 30 天）一到，收件端按告知承诺拒绝解密，HR 需在此之前完成汇总。附件与填写值的自动比对（`ocr_fields`）默认关闭，只在 HR 明确要求并知晓"比对不通过需 HR 本人在终端 `decide` 裁定"后启用；字段名本身不会触发比对。
 
-员工把请求包交给安装了 `safefill-fill` 的 Agent：Agent 读取并说明用途后运行 `vault-status`。首次使用或存在缺项时，通过 `vault-stage` 展示完整新旧值、本人确认后 `vault-apply`；提交前再由 `vault-preview` 展示本次完整取值和来源，确认后 `vault-fill` 生成 `姓名-随机短码.yintian`。员工本人发送回执，HR Agent 收件后统一解密、校验并导出 Excel 和附件；`collect` 同时返回逐人排除原因、迟交人数与同名多行提醒。
+员工把请求包交给安装了 `safefill-fill` 的 Agent：Agent 读取并说明用途、与发放方带外核对任务编号和公钥指纹后运行 `vault-status`。首次使用或存在缺项时，通过 `vault-stage` 展示完整新旧值、本人确认后 `vault-apply`；提交前再由 `vault-preview` 展示本次完整取值和来源，确认后 `vault-fill` 生成 `姓名-随机短码.yintian` 并在保险柜目录登记本次提交（更正时自动沿用回执编号，`--fresh` 可强制新记录）。员工本人发送回执，HR Agent 收件后统一解密、校验并导出 Excel（第二列固定为回执编号）和附件；`collect` 同时返回逐人排除原因（含可直接运行的 `decide` 命令）、迟交人数与同名多行提醒。HR 侧还可用 `list-tasks` 找回任务、`status` 只读看进度和保存期限预警、`notice` 生成退回/补正通知交给员工 Agent 识别。
 
 这意味着当前 Agent 会实际处理用户主动提供的明文。保险柜保护静态资料，回执端到端加密保护传输与汇总侧的内容，都不把明文对正在执行填写或汇总的 Agent 隐藏。若部署方不允许 Agent 接触明文，当前自动流程不适用。经标准输入传入的明文也会出现在 Agent 的命令行与宿主工具日志中；宿主持久化命令日志时应改用 `0700` 目录内的 `0600` 临时文件传值。
 
@@ -61,10 +61,10 @@ HR 不准备员工名单、配置文件或网页表单，也不需要运行终�
 
 ```text
 HR 说明用途、字段、期限和联系人
-  → safefill-collect 生成 REQUEST.yintian-request
-  → 员工 Agent 读取请求包，保险柜匹配取值（首次初始化、缺项补录、可选本地识别）并加密
+  → safefill-collect 生成 REQUEST-{任务编号}.yintian-request
+  → 员工 Agent inspect 核对任务编号与公钥指纹，保险柜匹配取值（首次初始化、缺项补录、可选本地识别）并加密
   → 员工本人把回执发送给 HR
-  → safefill-collect 校验并汇总 Excel 与附件目录
+  → safefill-collect 校验并汇总 Excel 与附件目录（status 随时看进度，notice 可向员工发退回/补正通知）
 ```
 
 1. Agent 从对话提取需求，只合并询问缺项；`name` 自动作为必填字段，不向 HR 索取名单。
@@ -98,7 +98,7 @@ Windows 中将 `.venv/bin/python` 换为 `.venv\Scripts\python.exe`。核心流�
 
 | 文件 | 用途 | 应留在哪里 |
 |---|---|---|
-| `REQUEST.yintian-request` | 默认 AI→AI 信息请求包；不含名单或个人值 | HR 原样转发给员工 Agent |
+| `REQUEST-{任务编号}.yintian-request` | AI→AI 信息请求包，文件名含任务编号；不含名单或个人值 | HR 原样转发给员工 Agent |
 | `vault.yintian-vault` | 员工的加密个人保险柜（yintian-vault/2） | 系统用户数据目录（0600） |
 | `vault.key` | 保险柜本机密钥 | 独立系统用户密钥目录（0600），永不外发 |
 | `姓名-短码.yintian` | 本次加密提交；仅文件名显示姓名 | 由员工本人按授权渠道交回收集者 |
@@ -109,7 +109,7 @@ Windows 中将 `.venv/bin/python` 换为 `.venv\Scripts\python.exe`。核心流�
 - OCR/VLM 结果只是候选，不代替填写者确认和 HR 复核。
 - 仓库不保存真实明文资料、附件、提交文件、保险柜、导出表格或项目外文稿；`skills/safefill-fill/data/` 已在 `.gitignore` 中排除。
 
-更完整的操作与权限说明见[收集者文档](skills/safefill-collect/README.md)与[填写者文档](skills/safefill-fill/README.md)。
+更完整的操作与权限说明见[收集者文档](skills/safefill-collect/README.md)与[填写者文档](skills/safefill-fill/README.md)；两端共享的格式、输出契约、错误处置与交接话术以 [PROTOCOL.md](PROTOCOL.md) 为准——它是接口稳定性的单一事实源，协议变更先改它再改代码。
 
 ## 仓库结构
 
@@ -139,8 +139,8 @@ $PY skills/safefill-collect/scripts/collector.py create-request --config collect
 # 员工侧：暂存确认 → 精确匹配 → 提交确认 → 生成回执
 printf '%s' "$JSON" | $PY skills/safefill-fill/scripts/fill.py vault-stage --answers - --confirmation-out "$WORK/CHANGE.yintian-confirmation"   # $WORK 为 0700 目录
 $PY skills/safefill-fill/scripts/fill.py vault-apply --confirmation "$WORK/CHANGE.yintian-confirmation"
-$PY skills/safefill-fill/scripts/fill.py vault-preview tasks/<TASK_DIR>/REQUEST.yintian-request --confirmation-out "$WORK/SUBMIT.yintian-confirmation"
-$PY skills/safefill-fill/scripts/fill.py vault-fill tasks/<TASK_DIR>/REQUEST.yintian-request --confirmation "$WORK/SUBMIT.yintian-confirmation" --out-dir incoming
+$PY skills/safefill-fill/scripts/fill.py vault-preview tasks/<TASK_DIR>/REQUEST-<TASK_ID>.yintian-request --confirmation-out "$WORK/SUBMIT.yintian-confirmation"
+$PY skills/safefill-fill/scripts/fill.py vault-fill tasks/<TASK_DIR>/REQUEST-<TASK_ID>.yintian-request --confirmation "$WORK/SUBMIT.yintian-confirmation" --out-dir incoming
 # HR 侧：解密汇总
 $PY skills/safefill-collect/scripts/collector.py collect tasks/<TASK_DIR> incoming --out result.xlsx
 $PY -m pytest -q

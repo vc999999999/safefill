@@ -69,7 +69,8 @@ def load_form(form_path: str | Path) -> dict[str, Any]:
     if form.get("kind") != "agent_request" or form.get("target_skill") != "safefill-fill":
         raise FillError("OPEN_REQUEST_INVALID: 不是发给 safefill-fill 的 Agent 请求包")
     if form.get("format_version") != collection.SUBMISSION_FORMAT_VERSION:
-        raise FillError("OPEN_REQUEST_INVALID: 请求包要求的提交版本不受支持")
+        raise FillError(f"OPEN_REQUEST_INVALID: 请求包要求的提交版本不受支持（本端支持 {collection.SUBMISSION_FORMAT_VERSION}）；"
+                        "请升级 safefill-fill 或向发放方索取兼容请求包")
     if any(key in form for key in ("invite_id", "invite_token", "token", "name", "employee_id")):
         raise FillError("OPEN_REQUEST_INVALID: 请求包不应包含个人身份或邀请信息")
     missing = [key for key in REQUIRED_REQUEST_KEYS if not form.get(key)]
@@ -126,7 +127,11 @@ def inspect_info(form: dict[str, Any]) -> dict[str, Any]:
         ],
         "past_deadline": collection.task_late(form, collection.now_iso()),
         "expired": collection.task_expired(form),
+        "verify_hint": "请与发放方核对 task_id 尾 6 位与 key_fingerprint 一致后再填写，不一致立即停手并联系 contact",
     }
+    expects = form.get("expects")
+    if isinstance(expects, dict):
+        info["expects"] = expects
     if not info["key_id_match"]:
         info["stop_reason"] = "KEY_MISMATCH: 请求包内公钥与 key_id 不一致，文件可能被替换，请勿填写并联系发放人"
     elif info["expired"]:
@@ -364,8 +369,38 @@ def seal_data(form, values, attachments, out_path, *, invite_id=None):
     }
 
 
+def _load_notice(path: Path) -> dict[str, Any] | None:
+    """识别 yintian-notice/1 退回/补正通知（不可信数据，只做提示解析）；非通知文件返回 None。"""
+    try:
+        data = json.loads(secure_io.read_bytes(path, 1024 * 1024))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("format") != collection.NOTICE_FORMAT_VERSION:
+        return None
+    allowed = {"format", "task_id", "invite_id", "status", "late", "reasons", "next_action", "contact", "generated_at"}
+    if set(data) - allowed:
+        raise FillError("NOTICE_INVALID: 通知包含协议外字段")
+    if any(not isinstance(data.get(key), str) or not data[key] for key in ("task_id", "invite_id", "status", "next_action")):
+        raise FillError("NOTICE_INVALID: 通知缺少必要字段")
+    if not collection.TASK_ID_RE.fullmatch(data["task_id"]) or not collection.OPEN_INVITE_ID_RE.fullmatch(data["invite_id"]):
+        raise FillError("NOTICE_INVALID: 通知中的任务或回执编号格式无效")
+    reasons = data["reasons"]
+    if not isinstance(reasons, list) or len(reasons) > 64 or any(not isinstance(item, str) or len(item) > 256 for item in reasons):
+        raise FillError("NOTICE_INVALID: 通知原因列表无效")
+    for key in ("status", "next_action", "contact", "generated_at"):
+        if key in data and (not isinstance(data[key], str) or len(data[key]) > collection.MAX_VALUE_CHARS):
+            raise FillError("NOTICE_INVALID: 通知字段无效")
+    return {"kind": "notice", "task_id": data["task_id"], "invite_id": data["invite_id"],
+            "status": data["status"], "late": bool(data.get("late")), "reasons": reasons,
+            "next_action": data["next_action"], "contact": data.get("contact", "")}
+
+
 def cmd_inspect(args) -> dict[str, Any]:
-    return inspect_info(load_form(args.form))
+    path = secure_io.checked_path(args.form)
+    notice = _load_notice(path)
+    if notice is not None:
+        return notice
+    return inspect_info(load_form(path))
 
 
 def _previous_invite_id(form, previous):
@@ -376,6 +411,38 @@ def _previous_invite_id(form, previous):
         return collection.validate_envelope_header(envelope, form)
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise FillError("PREVIOUS_INVALID: 旧回执不属于本请求包或已损坏") from exc
+
+
+def _resolve_previous(args, vault_path: Path, task_id: str) -> tuple[Any, str]:
+    """--previous 解析顺序：显式参数 > 提交登记中该任务最新回执 > 无；--fresh 强制不用旧回执。"""
+    if getattr(args, "previous", None):
+        return secure_io.checked_path(args.previous), "explicit"
+    if getattr(args, "fresh", False):
+        return None, "none"
+    record = vault.find_previous(vault_path.parent, task_id)
+    if record is not None:
+        return secure_io.checked_path(record["path"]), "registry"
+    return None, "none"
+
+
+def _clear_stale_confirmation(path: Path, key: str) -> None:
+    """同名确认文件已过期或损坏时清除重写；仍有效的文件保留并照常报 CONFIRMATION_EXISTS。"""
+    if not path.is_file():
+        return
+    valid = False
+    for operation in ("vault-change", "submission"):
+        try:
+            vault.open_confirmation(path, key, operation)
+            valid = True
+            break
+        except Exception:
+            pass
+    if valid:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def _storage_paths(args) -> tuple[Path, Path]:
@@ -523,19 +590,25 @@ def cmd_vault_stage(args) -> dict[str, Any]:
         try:
             if vault_path.is_file():
                 vault.check_vault_file(vault_path)
-            profile = (vault.load_vault(vault_path, key) if vault_path.is_file()
-                       else {"format": vault.FORMAT, "entries": {}})
+            profile: dict[str, Any] = (vault.load_vault(vault_path, key) if vault_path.is_file()
+                                       else {"format": vault.FORMAT, "entries": {}})
         except (RuntimeError, ValueError) as exc:
             raise FillError(str(exc)) from exc
         candidate = {"format": vault.FORMAT, "entries": {**profile["entries"], **entries}}
         if len(candidate["entries"]) > vault.MAX_ENTRIES:
             raise FillError("VAULT_LIMIT: 保险柜条目超过数量上限")
+        prior_digests = {
+            entry_id: (collection.sha256_bytes(collection.canonical(profile["entries"][entry_id]))
+                       if entry_id in profile["entries"] else None)
+            for entry_id in entries
+        }
         try:
             vault.validate_profile(candidate)
+            _clear_stale_confirmation(confirmation_path, key)
             confirmation = vault.seal_confirmation(
                 confirmation_path, key, "vault-change",
                 {"vault_path": str(vault_path), "key_path": str(key_path),
-                 "base_vault_sha256": vault.file_digest(vault_path) if vault_path.is_file() else None,
+                 "prior_digests": prior_digests,
                  "entries": entries})
         except FileExistsError as exc:
             raise FillError(f"CONFIRMATION_EXISTS: 确认文件已存在: {confirmation_path}；"
@@ -564,12 +637,22 @@ def cmd_vault_apply(args) -> dict[str, Any]:
             raise FillError("CONFIRMATION_STALE: 确认文件不属于当前保险柜或密钥")
         entries = {entry_id: vault.validate_entry(entry) for entry_id, entry in staged.get("entries", {}).items()}
         with secure_io.file_lock(str(vault_path) + ".lock"):
-            current_digest = vault.file_digest(vault_path) if vault_path.is_file() else None
-            if current_digest != staged.get("base_vault_sha256"):
-                raise FillError("CONFIRMATION_STALE: 保险柜已变化，请重新预览")
             old_blob = secure_io.read_bytes(vault_path, vault.MAX_BYTES) if vault_path.is_file() else None
             profile = (vault.load_vault(vault_path, key) if vault_path.is_file()
                        else {"format": vault.FORMAT, "entries": {}})
+            prior_digests = staged.get("prior_digests")
+            if isinstance(prior_digests, dict):
+                stale = []
+                for entry_id in entries:
+                    existing = profile["entries"].get(entry_id)
+                    current = (collection.sha256_bytes(collection.canonical(existing))
+                               if existing is not None else None)
+                    if current != prior_digests.get(entry_id):
+                        stale.append(entry_id)
+                if stale:
+                    raise FillError("CONFIRMATION_STALE: 保险柜条目已变化，请重新预览: " + ", ".join(sorted(stale)))
+            elif (vault.file_digest(vault_path) if vault_path.is_file() else None) != staged.get("base_vault_sha256"):
+                raise FillError("CONFIRMATION_STALE: 保险柜已变化，请重新预览")
             created = sorted(set(entries) - set(profile["entries"]))
             updated = sorted(set(entries) & set(profile["entries"]))
             profile["entries"].update(entries)
@@ -739,15 +822,17 @@ def cmd_vault_preview(args) -> dict[str, Any]:
                         "required_missing": [{"id": field_id, "label": labels[field_id]} for field_id in required_missing],
                         "optional_missing": [field_id for field_id in missing if field_id not in required_missing],
                         "same_type_entries": _same_type_entries(form, profile, required_missing)}
-            invite_id = _previous_invite_id(form, getattr(args, "previous", None))
+            previous_arg, previous_source = _resolve_previous(args, vault_path, form["task_id"])
+            invite_id = _previous_invite_id(form, previous_arg)
             vault.ensure_private_dir(confirmation_path.parent)
+            _clear_stale_confirmation(confirmation_path, key)
             confirmation = vault.seal_confirmation(
                 confirmation_path, key, "submission",
                 {"request_sha256": vault.file_digest(Path(form["_path"]), 1024 * 1024),
                  "vault_path": str(vault_path), "key_path": str(key_path),
-                 "vault_sha256": vault.file_digest(vault_path), "mapping": mapping,
+                 "mapping": mapping,
                  "selection_sha256": collection.sha256_bytes(collection.canonical({"values": values, "attachments": attachments})),
-                 "previous_sha256": _optional_digest(getattr(args, "previous", None), collection.MAX_ENVELOPE_BYTES),
+                 "previous_sha256": _optional_digest(previous_arg, collection.MAX_ENVELOPE_BYTES),
                  "invite_id": invite_id})
         except FileExistsError as exc:
             raise FillError(f"CONFIRMATION_EXISTS: 确认文件已存在: {confirmation_path}；"
@@ -755,7 +840,11 @@ def cmd_vault_preview(args) -> dict[str, Any]:
         except (RuntimeError, ValueError) as exc:
             raise FillError(str(exc)) from exc
         preview = _field_preview(form, profile, values, attachments, matches)
-    return {"ready": True, "fields": preview, "mapping": mapping, "optional_missing": missing, **confirmation}
+    result = {"ready": True, "fields": preview, "mapping": mapping, "optional_missing": missing, **confirmation}
+    if previous_arg is not None:
+        result["previous"] = str(previous_arg)
+        result["previous_source"] = previous_source
+    return result
 
 
 def _same_type_entries(form, profile, field_ids):
@@ -793,14 +882,14 @@ def cmd_vault_fill(args) -> dict[str, Any]:
                     raise FillError("TASK_EXPIRED: 请求包已过期，请向 HR 索取新请求包")
                 profile = vault.load_vault(vault_path, key)
                 values, attachments, _missing, matches, _required = _prepare_vault_selection(form, profile, mapping)
+                previous_arg, previous_source = _resolve_previous(args, vault_path, form["task_id"])
                 expected = {
                     "request_sha256": vault.file_digest(Path(form["_path"]), 1024 * 1024),
                     "vault_path": str(vault_path),
                     "key_path": str(key_path),
-                    "vault_sha256": vault.file_digest(vault_path),
                     "selection_sha256": collection.sha256_bytes(collection.canonical({"values": values, "attachments": attachments})),
-                    "previous_sha256": _optional_digest(getattr(args, "previous", None), collection.MAX_ENVELOPE_BYTES),
-                    "invite_id": _previous_invite_id(form, getattr(args, "previous", None)),
+                    "previous_sha256": _optional_digest(previous_arg, collection.MAX_ENVELOPE_BYTES),
+                    "invite_id": _previous_invite_id(form, previous_arg),
                 }
             except FillError as exc:
                 if str(exc).startswith("TASK_EXPIRED"):
@@ -838,11 +927,50 @@ def cmd_vault_fill(args) -> dict[str, Any]:
                 raise FillError("REPLY_ROLLBACK_FAILED: 确认文件无法消费且新回执无法撤回，请停止重试") from rollback_exc
             raise FillError("CONFIRMATION_CONSUME_FAILED: 确认文件无法消费，未保留回执") from exc
         result["matched"] = matches
+        if previous_arg is not None:
+            result["previous"] = str(previous_arg)
+            result["previous_source"] = previous_source
+        try:
+            vault.record_submission(vault_path.parent, {
+                "task_id": form["task_id"], "invite_id": result["invite_id"],
+                "path": result["out"], "sealed_at": collection.now_iso()})
+        except Exception:
+            result["registry_warning"] = "提交登记写入失败，不影响已生成的回执"
         out_path = Path(result["out"])
         earlier = _same_task_receipts(out_path, form["task_id"])
-        if earlier and not getattr(args, "previous", None):
+        if earlier and previous_arg is None:
             result["warning"] = (f"输出目录已有 {len(earlier)} 份属于同一任务的回执（{', '.join(earlier[:3])}{'…' if len(earlier) > 3 else ''}），"
                                  "若其中已发送给 HR，请改用 --previous 指定该回执重新生成，否则 HR 侧会出现重复记录")
+    return result
+
+
+def cmd_receipt_inspect(args) -> dict[str, Any]:
+    """读取回执信封明文头，帮助员工辨认文件属于哪个任务、对应哪次提交。"""
+    path = secure_io.checked_path(args.receipt)
+    if not path.is_file():
+        raise FillError(f"回执文件不存在: {args.receipt}")
+    try:
+        envelope = json.loads(secure_io.read_bytes(path, collection.MAX_ENVELOPE_BYTES))
+    except Exception as exc:
+        raise FillError("RECEIPT_INVALID: 不是有效的回执文件") from exc
+    if not isinstance(envelope, dict):
+        raise FillError("RECEIPT_INVALID: 不是有效的回执文件")
+    result: dict[str, Any] = {}
+    for key in ("task_id", "invite_id", "key_id", "schema_hash", "format_version"):
+        value = envelope.get(key)
+        if not isinstance(value, str) or not value:
+            raise FillError(f"RECEIPT_INVALID: 回执信封头缺少字段 {key}")
+        result[key] = value
+    if not collection.TASK_ID_RE.fullmatch(result["task_id"]):
+        raise FillError("RECEIPT_INVALID: 回执信封头 task_id 无效")
+    try:
+        vault_path, _key_path = _storage_paths(args)
+        match = next((record for record in vault.load_registry(vault_path.parent)
+                      if record["invite_id"] == result["invite_id"]), None)
+        if match is not None:
+            result["registry"] = match
+    except Exception:
+        pass
     return result
 
 
@@ -999,11 +1127,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("doctor", help="只读检查 Python、核心/OCR/VLM 依赖与保险柜存储状态（不联网、不写盘）")
     _add_storage_args(p)
     p.set_defaults(func=cmd_doctor)
-    p = sub.add_parser("inspect", help="查看请求包的告知内容、字段清单与公钥指纹（不修改文件）")
-    p.add_argument("form", metavar="REQUEST.yintian-request")
+    p = sub.add_parser("inspect", help="查看请求包的告知内容、字段清单与公钥指纹；也识别 .yintian-notice 退回/补正通知（不修改文件）")
+    p.add_argument("form", metavar="REQUEST-*.yintian-request")
     p.set_defaults(func=cmd_inspect)
     p = sub.add_parser("vault-status", help="查看本机保险柜摘要及与请求包的字段匹配预览（不输出条目值）")
-    p.add_argument("--request", metavar="REQUEST.yintian-request", help="可选：按该请求包字段预览 match/missing")
+    p.add_argument("--request", metavar="REQUEST-*.yintian-request", help="可选：按该请求包字段预览 match/missing")
     _add_storage_args(p)
     p.set_defaults(func=cmd_vault_status)
     p = sub.add_parser("vault-stage", help="暂存新增或更新条目并输出完整新旧值；不立即修改保险柜")
@@ -1023,21 +1151,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--revision", help="可选模型 revision；不指定时使用模型仓库默认版本")
     p.set_defaults(func=cmd_vault_scan)
     p = sub.add_parser("vault-preview", help="展示本次将提交的完整值并生成 30 分钟有效的加密确认文件")
-    p.add_argument("form", metavar="REQUEST.yintian-request")
+    p.add_argument("form", metavar="REQUEST-*.yintian-request")
     p.add_argument("--mapping", help="请求字段 id → 保险柜条目 id 的显式映射 JSON")
     p.add_argument("--confirmation-out", required=True, help="写入 0600 加密确认文件；路径必须位于 0700 目录")
     p.add_argument("--previous", help="更正时指定本人上一次回执")
+    p.add_argument("--fresh", action="store_true", help="忽略提交登记中的旧回执，强制生成全新记录")
     _add_storage_args(p)
     p.set_defaults(func=cmd_vault_preview)
     p = sub.add_parser("vault-fill", help="用保险柜匹配请求包字段，本人确认后生成 姓名-短码.yintian 回执")
-    p.add_argument("form", metavar="REQUEST.yintian-request")
+    p.add_argument("form", metavar="REQUEST-*.yintian-request")
     p.add_argument("--confirmation", required=True, help="vault-preview 生成的确认文件")
     output = p.add_mutually_exclusive_group(required=True)
     output.add_argument("--out", help="显式指定输出 .yintian 路径")
     output.add_argument("--out-dir", help="在目录中自动生成 姓名-短码.yintian")
     p.add_argument("--previous", help="更正时指定本人上一次回执，以替换同一条记录")
+    p.add_argument("--fresh", action="store_true", help="忽略提交登记中的旧回执，强制生成全新记录")
     _add_storage_args(p)
     p.set_defaults(func=cmd_vault_fill)
+    p = sub.add_parser("receipt-inspect", help="读取回执信封明文头：辨认文件属于哪个任务、对应哪次提交")
+    p.add_argument("receipt", metavar="RECEIPT.yintian")
+    _add_storage_args(p)
+    p.set_defaults(func=cmd_receipt_inspect)
     p = sub.add_parser("vlm-setup", help="下载用户指定的兼容模型（安装时联网，推理离线）")
     p.add_argument("--model", required=True, help="Hugging Face 或 ModelScope 模型 ID")
     p.add_argument("--revision", help="可选模型 revision；不指定时使用模型仓库默认版本")
@@ -1052,7 +1186,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = args.func(args)
         if result is not None:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+            print(json.dumps({"ok": True, **result} if isinstance(result, dict) else result, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:
         print(json.dumps(collection.error_report(exc), ensure_ascii=False, indent=2), file=sys.stderr)

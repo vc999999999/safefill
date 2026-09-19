@@ -22,6 +22,7 @@ import secure_io
 
 SUBMISSION_FORMAT_VERSION = "yintian-submission/4"
 REQUEST_FORMAT_VERSION = "yintian-request/1"
+NOTICE_FORMAT_VERSION = "yintian-notice/1"
 KEY_ENVELOPE_VERSION = "yintian-key/1"
 OPEN_INVITE_PREFIX = "OPEN-"
 SCRYPT_N = 2**16

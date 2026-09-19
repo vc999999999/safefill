@@ -35,6 +35,7 @@ from collection import (
     NOTICE_KEYS,
     OPEN_INVITE_ID_RE,
     PDF_RENDER_SCALE,
+    NOTICE_FORMAT_VERSION,
     REQUEST_FORMAT_VERSION,
     SUBMISSION_FORMAT_VERSION,
     TASK_ID_RE,
@@ -313,13 +314,16 @@ def create_request(config_path: Path, out_parent: Path) -> dict[str, Any]:
         dump_json(root / "task.json", task)
         atomic_write(root / "public.pem", public_pem)
         atomic_write(root / "private.pem.enc", private_blob)
-        request_path = root / "REQUEST.yintian-request"
+        request_path = root / f"REQUEST-{task_id}.yintian-request"
         dump_json(request_path, {"format": REQUEST_FORMAT_VERSION, "kind": "agent_request", "target_skill": "safefill-fill",
+                                 "expects": {"reply_format": SUBMISSION_FORMAT_VERSION, "reply_suffix": ".yintian",
+                                             "notice_format": NOTICE_FORMAT_VERSION,
+                                             "delivery": "员工本人将 .yintian 回执文件发回发放方；勿代发"},
                                  **task, "public_key_pem": public_pem.decode("ascii")})
         init_db(root)
         saved_secret_path = save_local_task_secret(root, task_id, local_secret)
         ocr_bound = [field["id"] for field in config["fields"] if field.get("ocr_fields")]
-        return {"task_id": task_id, "task_dir": str(root), "request": str(request_path),
+        return {"task_id": task_id, "task_dir": str(root), "request": str(request_path), "key_fingerprint": key_id,
                 "deadline": config["deadline"], "retention_until": config["retention_until"], "ocr_bound_fields": ocr_bound,
                 "reminder": (f"收件、汇总与查看必须在保存期限 {config['retention_until']} 之前完成，到期后按告知承诺不再解密任何回执"
                              + ("；已启用附件自动比对的字段：" + ", ".join(ocr_bound) + "，比对不通过的回执需要 HR 本人在终端运行 decide 逐项裁定" if ocr_bound else ""))}
@@ -334,7 +338,7 @@ def cmd_create_request(args) -> dict[str, Any]:
     return create_request(Path(args.config), Path(args.out))
 
 
-def ingest_task(task_dir: str | Path, submissions_dir: str | Path) -> dict[str, Any]:
+def ingest_task(task_dir: str | Path, submissions_dir: str | Path, recursive: bool = False) -> dict[str, Any]:
     root, task = load_task(task_dir)
     if task_expired(task):
         raise RuntimeError(expired_message(task, "接收新提交"))
@@ -343,12 +347,16 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path) -> dict[str, 
         raise NotADirectoryError(source)
     paths = []
     skipped_directories = 0
-    for path in source.iterdir():
+    if recursive:
+        candidates = source.rglob("*")
+    else:
+        candidates = source.iterdir()
+    for path in candidates:
         if path.suffix == ".yintian":
             paths.append(path)
             if len(paths) > MAX_PACKAGE_FILES:
                 raise ValueError(f"INBOX_LIMIT: 单次收件最多处理 {MAX_PACKAGE_FILES} 个回执")
-        elif path.is_dir():
+        elif not recursive and path.is_dir():
             skipped_directories += 1
     summary = {"accepted": 0, "duplicates": 0, "rejected": 0, "errors": [], "skipped_directories": skipped_directories}
     with task_lock(root), closing(connect_db(root)) as db, db:
@@ -410,18 +418,19 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path) -> dict[str, 
                 if created_path is not None:
                     created_path.unlink(missing_ok=True)
                 summary["rejected"] += 1
-                summary["errors"].append({"file_ref": digest[:12] if digest else f"entry-{index}", "error": type(exc).__name__,
+                summary["errors"].append({"file_ref": digest[:12] if digest else f"entry-{index}",
+                                          "error": type(exc).__name__,
                                           "code": "INGEST_IO" if isinstance(exc, OSError) else "SUBMISSION_REJECTED",
                                           "retryable": isinstance(exc, OSError), "next_action": "retry" if isinstance(exc, OSError) else "check_invitation"})
     if skipped_directories:
         processed = summary["accepted"] or summary["duplicates"] or summary["rejected"]
-        summary["hint"] = (f"收件目录{'顶层无 .yintian 文件，' if not processed else ''}不递归子目录；发现 {skipped_directories} 个子目录，"
-                           f"{'请' if not processed else '若其中还有回执请'}将回执文件移到顶层后重试")
+        summary["hint"] = (f"收件目录{'顶层无 .yintian 文件，' if not processed else ''}默认不递归子目录；发现 {skipped_directories} 个子目录，"
+                           f"{'请' if not processed else '若其中还有回执请'}将回执文件移到顶层后重试，或加 --recursive 递归收件")
     return summary
 
 
 def cmd_ingest(args) -> dict[str, Any]:
-    return ingest_task(args.task_dir, args.submissions_dir)
+    return ingest_task(args.task_dir, args.submissions_dir, recursive=getattr(args, "recursive", False))
 
 
 def unlock_private_key(root: Path, task: dict[str, Any]):
@@ -653,12 +662,13 @@ def progress_rows(root: Path) -> list[dict[str, Any]]:
     """每个回执编号一行：最新版本的状态、迟交与校验问题；不含任何字段值。"""
     with closing(connect_db(root)) as db:
         rows = db.execute("""
-            SELECT i.invite_id,i.name,COALESCE(s.status,'invited') AS status,s.late,s.missing_fields,s.conflict_fields,s.received_at
+            SELECT i.invite_id,i.name,COALESCE(s.status,'invited') AS status,s.version,s.late,s.missing_fields,s.conflict_fields,s.received_at
             FROM invites i
             LEFT JOIN submissions s ON s.id=(SELECT MAX(n.id) FROM submissions n WHERE n.invite_id=i.invite_id)
             ORDER BY i.name,i.invite_id
         """).fetchall()
-    return [{"invite_id": row["invite_id"], "name": row["name"], "status": row["status"], "late": bool(row["late"]),
+    return [{"invite_id": row["invite_id"], "name": row["name"], "status": row["status"], "version": row["version"],
+             "late": bool(row["late"]),
              "missing_fields": json.loads(row["missing_fields"] or "[]"), "conflict_fields": json.loads(row["conflict_fields"] or "[]"),
              "received_at": row["received_at"]} for row in rows]
 
@@ -689,6 +699,7 @@ def collect_rows(root: Path, task: dict[str, Any], private_key, attachment_stage
             for field_id in field_defs
             if field_defs[field_id]["type"] not in ATTACHMENT_TYPES
         }
+        record["__receipt_id__"] = row["invite_id"]
         by_field: dict[str, list[dict[str, Any]]] = {}
         for item in attachments:
             by_field.setdefault(item["field_id"], []).append(item)
@@ -712,10 +723,11 @@ def collect_rows(root: Path, task: dict[str, Any], private_key, attachment_stage
 
 
 def suggested_output_name(out_path: Path) -> str:
-    return f"{out_path.stem}-{datetime.now().strftime('%Y%m%d-%H%M')}{out_path.suffix}"
+    return f"{out_path.stem}-{datetime.now().strftime('%Y%m%d-%H%M%S')}{out_path.suffix}"
 
 
-def collect_task(task_dir: str | Path, submissions_dir: str | Path, out: str | Path, retry_needs_review: bool = True) -> dict[str, Any]:
+def collect_task(task_dir: str | Path, submissions_dir: str | Path, out: str | Path, retry_needs_review: bool = True,
+                 recursive: bool = False) -> dict[str, Any]:
     root, task = load_task(task_dir)
     out_path = secure_io.checked_path(out).with_suffix(".xlsx")
     if out_path == root or root in out_path.parents:
@@ -726,8 +738,12 @@ def collect_task(task_dir: str | Path, submissions_dir: str | Path, out: str | P
         raise FileExistsError(f"OUTPUT_EXISTS: 导出文件已存在，请选择新文件名（例如 {suggested_output_name(out_path)}）")
     if attachment_fields and attachment_target.exists():
         raise FileExistsError("OUTPUT_EXISTS: 附件导出目录已存在，请选择新文件名")
-    ingested = ingest_task(root, submissions_dir)
+    print("收件中…", file=sys.stderr)
+    ingested = ingest_task(root, submissions_dir, recursive=recursive)
+    print(f"收件完成：接受 {ingested['accepted']}，重复 {ingested['duplicates']}，拒绝 {ingested['rejected']}", file=sys.stderr)
+    print("解密复核中…", file=sys.stderr)
     reviewed = review_task(root, retry_needs_review=retry_needs_review)
+    print(f"复核完成：通过 {reviewed['verified']}，待复核 {reviewed['needs_review']}，无效 {reviewed['invalid']}", file=sys.stderr)
     attachment_stage = None
     written: dict[str, str] = {}
     try:
@@ -738,7 +754,7 @@ def collect_task(task_dir: str | Path, submissions_dir: str | Path, out: str | P
             private_key = unlock_private_key(root, task)
             rows, attachment_count = collect_rows(root, task, private_key, attachment_stage, attachment_target.name)
             progress = progress_rows(root)
-            exclusions = exclusion_details(progress)
+            exclusions = exclusion_details(root, progress)
             late_count = sum(1 for row in progress if row["late"] and row["status"] in PASSED_STATES)
             name_counts: dict[str, int] = {}
             for record in rows:
@@ -763,8 +779,14 @@ def collect_task(task_dir: str | Path, submissions_dir: str | Path, out: str | P
         if written.get("attachments_dir"):
             shutil.rmtree(written["attachments_dir"], ignore_errors=True)
         raise
+    print(f"已导出 {out_path}", file=sys.stderr)
+    days_left = retention_days_left(task)
     result = {"task_id": task["task_id"], "rows": len(rows), "excluded": len(progress) - len(rows), "exclusions": exclusions,
-              "late": late_count, "attachments": attachment_count, "ingest": ingested, "review": reviewed, **written}
+              "late": late_count, "attachments": attachment_count, "ingest": ingested, "review": reviewed,
+              "retention_until": task["retention_until"], "retention_days_left": days_left, **written}
+    warning = retention_warning(task, days_left)
+    if warning:
+        result["retention_warning"] = warning
     if duplicate_names:
         result["duplicate_names"] = duplicate_names
         result["warning"] = ("Excel 中存在同名多行：" + ", ".join(duplicate_names)
@@ -772,34 +794,133 @@ def collect_task(task_dir: str | Path, submissions_dir: str | Path, out: str | P
     return result
 
 
-def exclusion_details(progress: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """把未进入 Excel 的记录整理成逐人原因与下一步，供 Agent 直接向 HR 概述。"""
+def _exclusion_action(row: dict[str, Any], reasons: list[str]) -> str:
+    """未通过记录的下一步建议；status/notice 与 collect 的 exclusions 共用。"""
+    if row["status"] == "invalid":
+        return "回执损坏、被改动或不属于本任务，请员工用同一请求包重新生成并发送"
+    if any(reason.startswith("runtime:") for reason in reasons):
+        return "收件机器缺少依赖或读取失败；先运行 doctor 定位缺失组件，按需安装后重跑 collect 即会重审"
+    if any(reason.startswith("ocr:") for reason in reasons):
+        return "附件与填写值自动比对未通过；需 HR 本人在终端运行 decide 逐项核对原件，或让员工更正后带 --previous 重交"
+    if row["missing_fields"]:
+        return "必填项缺失；请员工补齐后带 --previous 重交"
+    if row["status"] in {"submitted", "needs_review"}:
+        return "校验未通过；请员工按提示更正后带 --previous 重交"
+    if row["status"] == "returned":
+        return "已退回等待员工重交"
+    return "尚未收到有效回执"
+
+
+def exclusion_details(root: Path, progress: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把未进入 Excel 的记录整理成逐人原因、下一步与可直接运行的 decide 命令，供 Agent 直接向 HR 概述。"""
     details = []
     for row in progress:
         if row["status"] in PASSED_STATES:
             continue
         reasons = list(row["missing_fields"]) + list(row["conflict_fields"])
-        if row["status"] == "invalid":
-            action = "回执损坏、被改动或不属于本任务，请员工用同一请求包重新生成并发送"
-        elif any(reason.startswith("runtime:") for reason in reasons):
-            action = "收件机器缺少 OCR 依赖或读取失败；安装 requirements-ocr.txt 后重跑 collect 即会重审"
-        elif any(reason.startswith("ocr:") for reason in reasons):
-            action = "附件与填写值自动比对未通过；需 HR 本人在终端运行 decide 逐项核对原件，或让员工更正后带 --previous 重交"
-        elif row["missing_fields"]:
-            action = "必填项缺失；请员工补齐后带 --previous 重交"
-        elif row["status"] in {"submitted", "needs_review"}:
-            action = "校验未通过；请员工按提示更正后带 --previous 重交"
-        elif row["status"] == "returned":
-            action = "已退回等待员工重交"
-        else:
-            action = "尚未收到有效回执"
-        details.append({"name": row["name"], "record": row["invite_id"][-6:], "status": row["status"],
-                        "late": row["late"], "reasons": reasons, "next_action": action})
+        detail = {"name": row["name"], "invite_id": row["invite_id"],
+                  "version": row["version"], "status": row["status"],
+                  "late": row["late"], "reasons": reasons, "next_action": _exclusion_action(row, reasons)}
+        if row["version"] is not None and any(reason.startswith("ocr:") for reason in reasons):
+            detail["decide_command"] = (f'decide "{root}" {row["invite_id"]} --version {row["version"]} '
+                                        "--action confirm --operator <HR标识>（需 HR 本人交互终端）")
+        details.append(detail)
     return details
 
 
 def cmd_collect(args) -> dict[str, Any]:
-    return collect_task(args.task_dir, args.submissions_dir, args.out, retry_needs_review=not getattr(args, "no_retry_needs_review", False))
+    return collect_task(args.task_dir, args.submissions_dir, args.out,
+                        retry_needs_review=not getattr(args, "no_retry_needs_review", False),
+                        recursive=getattr(args, "recursive", False))
+
+
+def retention_days_left(task: dict[str, Any]) -> int:
+    return (parse_time(task["retention_until"]) - datetime.now(timezone.utc)).days
+
+
+def retention_warning(task: dict[str, Any], days_left: int) -> str | None:
+    """保存期限临期/到期提示；status 与 collect 共用。"""
+    if task_expired(task):
+        return "已超过保存期限，按告知承诺不再解密任何回执；只能新建请求包重收"
+    if days_left <= 7:
+        return f"距保存期限 {task['retention_until']} 仅剩 {days_left} 天，请尽快完成收件、汇总与人工裁定"
+    return None
+
+
+def cmd_status(args) -> dict[str, Any]:
+    """只读进度：逐人回执编号、版本、状态与保存期限剩余天数；不解密、不写盘。"""
+    root, task = load_task(args.task_dir)
+    days_left = retention_days_left(task)
+    result = {"task_id": task["task_id"], "deadline": task["deadline"],
+              "retention_until": task["retention_until"], "retention_days_left": days_left,
+              "expired": task_expired(task), "counts": status_counts(root), "rows": progress_rows(root)}
+    warning = retention_warning(task, days_left)
+    if warning:
+        result["retention_warning"] = warning
+    return result
+
+
+def cmd_list_tasks(args) -> dict[str, Any]:
+    """列出目录下全部 YT- 任务：找回 task_dir 的入口，逐任务状态计数。"""
+    parent = secure_io.checked_path(args.tasks_dir)
+    if not parent.is_dir():
+        raise NotADirectoryError(parent)
+    tasks = []
+    for child in sorted(parent.iterdir()):
+        if not child.is_dir() or not child.name.startswith("YT-"):
+            continue
+        try:
+            root, task = load_task(child)
+            entry = {"task_id": task["task_id"], "task_dir": str(root),
+                     "deadline": task["deadline"], "retention_until": task["retention_until"],
+                     "expired": task_expired(task)}
+            try:
+                entry["status_counts"] = status_counts(root)
+            except Exception:
+                entry["status_counts"] = {}
+        except Exception as exc:
+            entry = {"task_dir": str(child), "error": str(exc)}
+        tasks.append(entry)
+    return {"tasks_dir": str(parent), "tasks": tasks}
+
+
+def cmd_audit_log(args) -> dict[str, Any]:
+    """只读审计日志：ingest/review/collect/decide/purge 的逐条记录，submission 关联回执编号。"""
+    root, task = load_task(args.task_dir)
+    with closing(connect_db(root)) as db:
+        rows = db.execute("""
+            SELECT a.action,a.at,a.result,a.reason,a.operator,
+                   s.invite_id,s.version
+            FROM audit a LEFT JOIN submissions s ON s.id=a.submission_id
+            ORDER BY a.id
+        """).fetchall()
+    entries = [{"action": row["action"], "at": row["at"], "result": row["result"],
+                "reason": row["reason"], "operator": row["operator"],
+                "invite_id": row["invite_id"], "version": row["version"]} for row in rows]
+    return {"task_id": task["task_id"], "entries": entries}
+
+
+def cmd_notice(args) -> dict[str, Any]:
+    """为指定回执编号生成退回/补正通知文件，由 HR 转发给员工；通知是不可信提示数据，不含明文值。"""
+    root, task = load_task(args.task_dir)
+    invite_id = args.invite_id
+    if not OPEN_INVITE_ID_RE.fullmatch(invite_id):
+        raise ValueError("回执编号格式无效")
+    row = next((item for item in progress_rows(root) if item["invite_id"] == invite_id), None)
+    if row is None:
+        raise ValueError(f"任务中不存在回执编号: {invite_id}")
+    reasons = list(row["missing_fields"]) + list(row["conflict_fields"])
+    if row["status"] in PASSED_STATES:
+        next_action = "回执已通过校验；如需退回请先在终端运行 decide --action return，再重新生成通知"
+    else:
+        next_action = _exclusion_action(row, reasons)
+    notice = {"format": NOTICE_FORMAT_VERSION, "task_id": task["task_id"], "invite_id": invite_id,
+              "status": row["status"], "late": row["late"], "reasons": reasons,
+              "next_action": next_action, "contact": task["contact"],
+              "generated_at": now_iso()}
+    out = secure_io.checked_path(args.out)
+    secure_io.atomic_write(out, canonical(notice), overwrite=False)
+    return {"out": str(out), "task_id": task["task_id"], "invite_id": invite_id, "status": row["status"]}
 
 
 def write_excel(task: dict[str, Any], rows: list[dict[str, str]], out_path: Path) -> None:
@@ -807,8 +928,9 @@ def write_excel(task: dict[str, Any], rows: list[dict[str, str]], out_path: Path
     from openpyxl import Workbook
     from openpyxl.styles import Font
 
-    columns = ["name"] + [field["id"] for field in task["fields"] if field["id"] != "name"]
+    columns = ["name", "__receipt_id__"] + [field["id"] for field in task["fields"] if field["id"] != "name"]
     labels = {field["id"]: field["label"] for field in task["fields"]}
+    labels["__receipt_id__"] = "回执编号"
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "收集结果"
@@ -843,9 +965,11 @@ def build_task_package(task_dir) -> tuple[bytes, dict[str, Any]]:
     with task_lock(root):
         for path in root.rglob("*"):
             secure_io.checked_path(path, root)
-        candidates = [root / name for name in sorted(PACKAGE_REQUIRED_FILES)]
-        if any(not path.is_file() for path in candidates):
+        request_files = sorted(root.glob("REQUEST*.yintian-request"))
+        candidates = [root / name for name in sorted(PACKAGE_REQUIRED_FILES) if name != "REQUEST.yintian-request"]
+        if any(not path.is_file() for path in candidates) or len(request_files) != 1:
             raise ValueError("任务目录缺少必要文件")
+        candidates += request_files
         candidates += list((root / "submissions").glob("*/*.yintian"))
         if len(candidates) + 1 > MAX_PACKAGE_FILES:
             raise ValueError("任务内容超过交接包安全上限")
@@ -860,7 +984,8 @@ def build_task_package(task_dir) -> tuple[bytes, dict[str, Any]]:
             total += len(raw)
             if len(raw) > MAX_PACKAGE_MEMBER_BYTES or total > MAX_PACKAGE_BYTES:
                 raise ValueError("任务内容超过交接包安全上限")
-            data[path.relative_to(root).as_posix()] = raw
+            member = "REQUEST.yintian-request" if path in request_files else path.relative_to(root).as_posix()
+            data[member] = raw
         raw = load_local_task_secret(root, task["task_id"]).encode("ascii")
         total += len(raw)
         if total > MAX_PACKAGE_BYTES:
@@ -1004,6 +1129,9 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
             _, imported_task = load_task(target)
             if imported_task["task_id"] != task_id:
                 raise ValueError("任务包内外 task_id 不一致")
+            canonical_request = target / "REQUEST.yintian-request"
+            if canonical_request.is_file():
+                canonical_request.rename(target / f"REQUEST-{task_id}.yintian-request")
             try:
                 secret = open_secret.decode("ascii")
             except UnicodeDecodeError as exc:
@@ -1079,9 +1207,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=True); p.add_argument("--out", required=True); p.set_defaults(func=cmd_create_request)
     p = sub.add_parser("collect", help="一键收件、校验、解密并导出 Excel 与附件目录")
     p.add_argument("task_dir"); p.add_argument("submissions_dir"); p.add_argument("--out", required=True)
-    p.add_argument("--no-retry-needs-review", action="store_true", help="默认重审历史 needs_review 回执；此旗标关闭重审"); p.set_defaults(func=cmd_collect)
+    p.add_argument("--no-retry-needs-review", action="store_true", help="默认重审历史 needs_review 回执；此旗标关闭重审")
+    p.add_argument("--recursive", action="store_true", help="递归收件目录下的子目录"); p.set_defaults(func=cmd_collect)
     p = sub.add_parser("ingest", help="只接收 .yintian 密文提交，不解密")
-    p.add_argument("task_dir"); p.add_argument("submissions_dir"); p.set_defaults(func=cmd_ingest)
+    p.add_argument("task_dir"); p.add_argument("submissions_dir")
+    p.add_argument("--recursive", action="store_true", help="递归收件目录下的子目录"); p.set_defaults(func=cmd_ingest)
+    p = sub.add_parser("status", help="只读查看进度：逐人回执编号、版本、状态与保存期限剩余天数（不解密）")
+    p.add_argument("task_dir"); p.set_defaults(func=cmd_status)
+    p = sub.add_parser("list-tasks", help="列出目录下全部 YT- 任务及状态计数，用于找回 task_dir")
+    p.add_argument("tasks_dir"); p.set_defaults(func=cmd_list_tasks)
+    p = sub.add_parser("notice", help="为指定回执编号生成 yintian-notice/1 退回/补正通知文件，转发给员工")
+    p.add_argument("task_dir"); p.add_argument("invite_id"); p.add_argument("--out", required=True); p.set_defaults(func=cmd_notice)
+    p = sub.add_parser("audit-log", help="只读审计日志：收件/复核/汇总/裁定/销毁的逐条记录（不解密内容）")
+    p.add_argument("task_dir"); p.set_defaults(func=cmd_audit_log)
     p = sub.add_parser("review", help="只解密校验并做 OCR 复核，不导出")
     p.add_argument("task_dir"); p.add_argument("--retry-needs-review", action="store_true"); p.add_argument("--invite"); p.set_defaults(func=cmd_review)
     p = sub.add_parser("decide", help="HR 本人终端逐项核对 OCR 证据（Tk 窗口）或退回重填")
@@ -1104,7 +1242,7 @@ def main() -> None:
     try:
         result = args.func(args)
         if result is not None:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+            print(json.dumps({"ok": True, **result} if isinstance(result, dict) else result, ensure_ascii=False, indent=2))
     except Exception as exc:
         print(json.dumps(error_report(exc), ensure_ascii=False, indent=2), file=sys.stderr)
         raise SystemExit(1)
