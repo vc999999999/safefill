@@ -15,6 +15,7 @@ import sqlite3
 import string
 import sys
 import tempfile
+import warnings
 import zipfile
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
@@ -56,9 +57,9 @@ from collection import (
     parse_time,
     positive_int_env,
     random_id,
-    safe_filename_component,
     sha256_bytes,
     sha256_file,
+    suppress_private_output,
     task_expired,
     task_late,
     valid_private_key_blob,
@@ -67,7 +68,7 @@ from collection import (
     validate_payload,
 )
 
-DB_VERSION = 1
+DB_VERSION = 2
 TASK_PACKAGE_VERSION = "yintian-task/2"
 ENCRYPTED_TASK_PACKAGE_VERSION = "yintian-task/3"
 PASSED_STATES = ("verified", "verified_manual")
@@ -92,16 +93,19 @@ def open_control_terminal():
         return None
 
 
-def print_once_secret(heading: str, secret: str, footnote: str) -> None:
-    """一次性密码只写控制终端；控制终端不可用时回退 stderr，绝不写可能被管道采集的 stdout。"""
-    stream = open_control_terminal()
+def print_once_secret(heading: str, secret: str, footnote: str, *, stream=None) -> None:
+    """一次性密码只写控制终端，绝不回退到会被 Agent 采集的标准输出流。"""
+    owned = stream is None
+    stream = open_control_terminal() if owned else stream
+    if stream is None:
+        raise RuntimeError("SECRET_TTY_REQUIRED: 无法打开安全控制终端")
     try:
-        target = stream if stream is not None else sys.stderr
-        print(f"\n{heading}", file=target)
-        print(secret, file=target)
-        print(footnote + "\n", file=target)
+        print(f"\n{heading}", file=stream)
+        print(secret, file=stream)
+        print(footnote + "\n", file=stream)
+        stream.flush()
     finally:
-        if stream is not None:
+        if owned:
             stream.close()
 
 
@@ -116,26 +120,30 @@ def load_task(task_dir: str | Path) -> tuple[Path, dict[str, Any]]:
     if not task_path.is_file():
         raise FileNotFoundError(f"不是有效任务目录: {root}")
     task = load_json(task_path)
-    if not isinstance(task, dict) or not TASK_ID_RE.fullmatch(task.get("task_id", "")):
-        raise ValueError("task.json 中的 task_id 无效")
+    if not isinstance(task, dict) or not isinstance(task.get("task_id"), str) or not TASK_ID_RE.fullmatch(task["task_id"]):
+        raise ValueError("TASK_INVALID: task.json 中的 task_id 无效")
     if task.get("format_version") != SUBMISSION_FORMAT_VERSION:
-        raise ValueError("任务格式版本不受支持")
+        raise ValueError("LEGACY_TASK_UNSUPPORTED: 旧任务须使用原版本完成，新版不迁移旧任务")
     required = ("key_id", "template_version", "schema_hash", "notice_hash", "fields", *NOTICE_KEYS)
     if any(key not in task for key in required) or not isinstance(task["fields"], list):
-        raise ValueError("task.json 缺少必要配置")
+        raise ValueError("TASK_INVALID: task.json 缺少必要配置")
     for key in (*NOTICE_KEYS, "template_version"):
         if not isinstance(task[key], str) or not task[key] or len(task[key]) > MAX_VALUE_CHARS:
-            raise ValueError(f"task.json 文本字段无效: {key}")
+            raise ValueError(f"TASK_INVALID: task.json 文本字段无效: {key}")
     if not isinstance(task["key_id"], str) or not re.fullmatch(r"[0-9a-f]{24}", task["key_id"]) or any(not isinstance(task[key], str) or not re.fullmatch(r"[0-9a-f]{64}", task[key]) for key in ("schema_hash", "notice_hash")):
-        raise ValueError("task.json 公钥或摘要标识无效")
-    if parse_time(task["retention_until"]) <= parse_time(task["deadline"]):
-        raise ValueError("task.json 保存期限无效")
+        raise ValueError("TASK_INVALID: task.json 公钥或摘要标识无效")
+    try:
+        deadline, retention = parse_time(task["deadline"]), parse_time(task["retention_until"])
+    except ValueError:
+        raise ValueError("TASK_INVALID: task.json 日期时间无效") from None
+    if retention <= deadline:
+        raise ValueError("RETENTION_INVALID: task.json 保存期限无效")
     if validate_field_definitions(task["fields"]) != task["fields"]:
-        raise ValueError("task.json 字段模板未规范化")
+        raise ValueError("SCHEMA_INVALID: task.json 字段模板未规范化")
     if sha256_bytes(canonical(task["fields"])) != task["schema_hash"]:
-        raise ValueError("task.json 字段模板哈希不匹配")
+        raise ValueError("TASK_INVALID: task.json 字段模板哈希不匹配")
     if sha256_bytes(canonical({key: task[key] for key in NOTICE_KEYS})) != task["notice_hash"]:
-        raise ValueError("task.json 告知内容哈希不匹配")
+        raise ValueError("TASK_INVALID: task.json 告知内容哈希不匹配")
     return root, task
 
 
@@ -172,6 +180,7 @@ def init_db(root: Path) -> None:
                 employee_id TEXT NOT NULL UNIQUE,
                 name TEXT NOT NULL,
                 token_hash TEXT NOT NULL,
+                -- Legacy cache columns retained for DB2 compatibility; current state is derived from revision.
                 status TEXT NOT NULL DEFAULT 'invited',
                 current_submission_id INTEGER,
                 created_at TEXT NOT NULL
@@ -180,6 +189,7 @@ def init_db(root: Path) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 invite_id TEXT NOT NULL REFERENCES invites(invite_id),
                 version INTEGER NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 2147483647),
                 sha256 TEXT NOT NULL UNIQUE,
                 path TEXT NOT NULL,
                 received_at TEXT NOT NULL,
@@ -202,7 +212,8 @@ def init_db(root: Path) -> None:
                 reason TEXT NOT NULL,
                 operator TEXT NOT NULL DEFAULT ''
             );
-            PRAGMA user_version=1;
+            CREATE INDEX submissions_revision ON submissions(invite_id, revision);
+            PRAGMA user_version=2;
             """
         )
     os.chmod(root / "state.sqlite3", 0o600)
@@ -211,6 +222,30 @@ def init_db(root: Path) -> None:
 def audit(db, action, submission_id=None, result="ok", reason="", operator=""):
     db.execute("INSERT INTO audit(action,submission_id,at,result,reason,operator) VALUES(?,?,?,?,?,?)",
                (action, submission_id, now_iso(), result, reason, operator))
+
+
+def current_submissions(db, invite_id=None) -> list[dict[str, Any]]:
+    """先选最大已验签 revision，再看业务状态；同序号分叉永不择一放行。"""
+    query = """SELECT s.* FROM submissions s
+               WHERE s.revision=(SELECT MAX(n.revision) FROM submissions n WHERE n.invite_id=s.invite_id)"""
+    params: tuple[Any, ...] = ()
+    if invite_id is not None:
+        query += " AND s.invite_id=?"
+        params = (invite_id,)
+    query += " ORDER BY s.invite_id,s.version"
+    heads: dict[str, dict[str, Any]] = {}
+    for row in db.execute(query, params):
+        if row["invite_id"] not in heads:
+            heads[row["invite_id"]] = {**dict(row), "conflicting_versions": []}
+        else:
+            head = heads[row["invite_id"]]
+            if not head["conflicting_versions"]:
+                head["conflicting_versions"].append(head["version"])
+            head["conflicting_versions"].append(row["version"])
+            head["status"] = "revision_conflict"
+            head["missing_fields"] = "[]"
+            head["conflict_fields"] = '["revision_conflict"]'
+    return list(heads.values())
 
 
 def cmd_doctor(args):
@@ -242,22 +277,22 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     from collection import explicit_timezone
 
     if not isinstance(config, dict):
-        raise ValueError("配置必须是 JSON 对象")
+        raise ValueError("CONFIG_INVALID: 配置必须是 JSON 对象")
     for key in (*NOTICE_KEYS, "template_version", "fields"):
         if not config.get(key):
-            raise ValueError(f"配置缺少必填项: {key}")
+            raise ValueError(f"CONFIG_MISSING_FIELDS: 配置缺少必填项: {key}")
     for key in (*NOTICE_KEYS, "template_version"):
         if not isinstance(config[key], str) or len(config[key]) > MAX_VALUE_CHARS:
-            raise ValueError(f"配置字段必须是长度不超过 {MAX_VALUE_CHARS} 的文本: {key}")
+            raise ValueError(f"CONFIG_INVALID: 配置字段必须是长度不超过 {MAX_VALUE_CHARS} 的文本: {key}")
     for key in ("deadline", "retention_until"):
         if not explicit_timezone(config[key]):
             raise ValueError(f"TIME_ZONE_REQUIRED: {key} 必须带时间和时区偏移（例如 2026-10-01T18:00:00+08:00），"
                              "不接受纯日期或无时区时间，以免员工与 HR 对截止时刻理解不一致")
     deadline, retention = parse_time(config["deadline"]), parse_time(config["retention_until"])
     if deadline <= datetime.now(timezone.utc):
-        raise ValueError("deadline 必须晚于当前时间")
+        raise ValueError("DEADLINE_INVALID: deadline 必须晚于当前时间")
     if retention <= deadline:
-        raise ValueError("retention_until 必须晚于 deadline")
+        raise ValueError("RETENTION_INVALID: retention_until 必须晚于 deadline")
     result = dict(config)
     result["fields"] = validate_field_definitions(config["fields"])
     return result
@@ -359,14 +394,16 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path, recursive: bo
         elif not recursive and path.is_dir():
             skipped_directories += 1
     summary = {"accepted": 0, "duplicates": 0, "rejected": 0, "errors": [], "skipped_directories": skipped_directories}
+    current_storage_blocked = None
     with task_lock(root), closing(connect_db(root)) as db, db:
         stored_bytes = 0
-        for stored in db.execute("SELECT path FROM submissions"):
+        for stored in db.execute("SELECT path FROM submissions WHERE path<>''"):
             stored_path = secure_io.checked_path(root / stored["path"], root)
             stored_bytes += stored_path.stat().st_size
         for index, path in enumerate(sorted(paths), start=1):
             digest = None
             created_path = None
+            authenticated_current = False
             db.execute("SAVEPOINT receive_one")
             try:
                 if not path.is_file() or path.is_symlink():
@@ -375,12 +412,17 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path, recursive: bo
                     raise ValueError("提交包超过 32MB 上限")
                 raw = secure_io.read_bytes(path, MAX_ENVELOPE_BYTES)
                 digest = sha256_bytes(raw)
-                if db.execute("SELECT 1 FROM submissions WHERE sha256=?", (digest,)).fetchone():
+                envelope = json.loads(raw)
+                invite_id = validate_envelope_header(envelope, task)
+                raw = canonical(envelope)
+                digest = sha256_bytes(raw)
+                existing = db.execute("SELECT * FROM submissions WHERE sha256=?", (digest,)).fetchone()
+                if existing is not None and (existing["path"] or existing["status"] != "storage_blocked"):
                     summary["duplicates"] += 1
                     db.execute("RELEASE receive_one")
                     continue
-                envelope = json.loads(raw)
-                invite_id = validate_envelope_header(envelope, task)
+                current = current_submissions(db, invite_id)
+                authenticated_current = not current or envelope["revision"] >= current[0]["revision"]
                 if not db.execute("SELECT 1 FROM invites WHERE invite_id=?", (invite_id,)).fetchone():
                     if db.execute("SELECT COUNT(*) FROM invites").fetchone()[0] >= MAX_OPEN_INVITES:
                         raise ValueError(f"OPEN_INVITE_LIMIT: 任务最多接收 {MAX_OPEN_INVITES} 个不同回执编号")
@@ -388,12 +430,12 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path, recursive: bo
                         "INSERT INTO invites(invite_id,employee_id,name,token_hash,status,created_at) VALUES(?,?,?,'','invited',?)",
                         (invite_id, invite_id, "", now_iso()),
                     )
-                existing_versions = db.execute("SELECT COUNT(*) FROM submissions WHERE invite_id=?", (invite_id,)).fetchone()[0]
+                existing_versions = db.execute("SELECT COUNT(*) FROM submissions WHERE invite_id=? AND path<>''", (invite_id,)).fetchone()[0]
                 if existing_versions >= MAX_VERSIONS_PER_INVITE:
-                    raise ValueError(f"该回执编号的提交版本数已达上限 {MAX_VERSIONS_PER_INVITE}，拒绝继续存储")
+                    raise ValueError("TASK_STORAGE_LIMIT: 该回执编号的历史数量达到安全上限")
                 if stored_bytes + len(raw) > MAX_TASK_SUBMISSION_BYTES:
                     raise ValueError("TASK_STORAGE_LIMIT: 任务密文总量达到安全上限")
-                version = db.execute("SELECT COALESCE(MAX(version),0)+1 FROM submissions WHERE invite_id=?", (invite_id,)).fetchone()[0]
+                version = existing["version"] if existing is not None else db.execute("SELECT COALESCE(MAX(version),0)+1 FROM submissions WHERE invite_id=?", (invite_id,)).fetchone()[0]
                 target_dir = secure_io.checked_path(root / "submissions" / invite_id, root)
                 target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 target = target_dir / f"v{version:04d}_{digest[:12]}.yintian"
@@ -403,25 +445,48 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path, recursive: bo
                     created_path = target
                 atomic_write(target, raw)
                 received_at = now_iso()
-                db.execute(
-                    "INSERT INTO submissions(invite_id,version,sha256,path,received_at,late,status) VALUES(?,?,?,?,?,?,?)",
-                    (invite_id, version, digest, target.relative_to(root).as_posix(), received_at, int(task_late(task, received_at)), "submitted"),
-                )
-                db.execute("UPDATE invites SET status='submitted' WHERE invite_id=?", (invite_id,))
-                audit(db, "ingest", db.execute("SELECT last_insert_rowid()").fetchone()[0])
+                if existing is None:
+                    db.execute(
+                        "INSERT INTO submissions(invite_id,version,revision,sha256,path,received_at,late,status) VALUES(?,?,?,?,?,?,?,?)",
+                        (invite_id, version, envelope["revision"], digest, target.relative_to(root).as_posix(), received_at, int(task_late(task, received_at)), "submitted"),
+                    )
+                    submission_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+                else:
+                    submission_id = existing["id"]
+                    db.execute("UPDATE submissions SET path=?,status='submitted',conflict_fields='[]' WHERE id=?",
+                               (target.relative_to(root).as_posix(), submission_id))
+                audit(db, "ingest", submission_id)
                 db.execute("RELEASE receive_one")
                 summary["accepted"] += 1
                 stored_bytes += len(raw)
             except Exception as exc:
                 db.execute("ROLLBACK TO receive_one")
                 db.execute("RELEASE receive_one")
+                if isinstance(exc, sqlite3.Error):
+                    # Keep any written ciphertext for recovery; a database failure is not a rejected receipt.
+                    raise RuntimeError("DATABASE_WRITE_FAILED: 数据库写入失败，保留原始回执并修复后重试") from None
                 if created_path is not None:
                     created_path.unlink(missing_ok=True)
+                if authenticated_current and (isinstance(exc, OSError) or str(exc).startswith("TASK_STORAGE_LIMIT:")):
+                    # Keep authenticated ordering metadata even if ciphertext storage fails; never revive older values.
+                    current_storage_blocked = "INGEST_IO" if isinstance(exc, OSError) else "TASK_STORAGE_LIMIT"
+                    received_at = now_iso()
+                    db.execute("INSERT OR IGNORE INTO invites(invite_id,employee_id,name,token_hash,status,created_at) VALUES(?,?,'','','invited',?)",
+                               (invite_id, invite_id, received_at))
+                    version = db.execute("SELECT COALESCE(MAX(version),0)+1 FROM submissions WHERE invite_id=?", (invite_id,)).fetchone()[0]
+                    db.execute("INSERT OR IGNORE INTO submissions(invite_id,version,revision,sha256,path,received_at,late,status,conflict_fields) VALUES(?,?,?,?,'',?,?,'storage_blocked',?)",
+                               (invite_id, version, envelope["revision"], digest, received_at, int(task_late(task, received_at)), json.dumps([current_storage_blocked])))
+                    blocked_id = db.execute("SELECT id FROM submissions WHERE sha256=?", (digest,)).fetchone()[0]
+                    audit(db, "ingest_blocked", blocked_id, "storage_blocked", current_storage_blocked)
+                    break
                 summary["rejected"] += 1
+                code = error_report(exc)["error"]
                 summary["errors"].append({"file_ref": digest[:12] if digest else f"entry-{index}",
                                           "error": type(exc).__name__,
-                                          "code": "INGEST_IO" if isinstance(exc, OSError) else "SUBMISSION_REJECTED",
+                                          "code": "INGEST_IO" if isinstance(exc, OSError) else code if code in {"SIGNATURE_INVALID", "REVISION_INVALID", "TASK_STORAGE_LIMIT"} else "SUBMISSION_REJECTED",
                                           "retryable": isinstance(exc, OSError), "next_action": "retry" if isinstance(exc, OSError) else "check_invitation"})
+    if current_storage_blocked:
+        raise RuntimeError(f"{current_storage_blocked}: 无法保存已验证的新回执，已记录阻断状态，停止汇总以免导出旧值")
     if skipped_directories:
         processed = summary["accepted"] or summary["duplicates"] or summary["rejected"]
         summary["hint"] = (f"收件目录{'顶层无 .yintian 文件，' if not processed else ''}默认不递归子目录；发现 {skipped_directories} 个子目录，"
@@ -462,10 +527,12 @@ def decrypt_envelope(root: Path, task: dict[str, Any], path: Path, private_key, 
     payload = json.loads(plaintext)
     if not isinstance(payload, dict):
         raise ValueError("解密载荷必须是对象")
-    payload_fields = {"format_version", "task_id", "invite_id", "schema_hash", "notice_hash", "template_version", "submitted_at", "consent_confirmed", "values", "attachments"}
+    payload_fields = {"format_version", "task_id", "invite_id", "schema_hash", "revision", "notice_hash", "template_version", "submitted_at", "consent_confirmed", "values", "attachments"}
     if set(payload) - payload_fields:
         raise ValueError("解密载荷包含协议外字段")
-    for key in ("format_version", "task_id", "invite_id", "schema_hash"):
+    if type(payload.get("revision")) is not int:
+        raise ValueError("REVISION_INVALID: 解密载荷更正序号无效")
+    for key in ("format_version", "task_id", "invite_id", "schema_hash", "revision"):
         if payload.get(key) != envelope[key]:
             raise ValueError(f"解密载荷 {key} 与外层不一致")
     return payload
@@ -561,7 +628,10 @@ def stored_payload(root, task, row, private_key):
     path = secure_io.checked_path(root / row["path"], root)
     if sha256_file(path) != row["sha256"]:
         raise ValueError("CIPHERTEXT_CHANGED: 已接收的文件发生变化")
-    return decrypt_envelope(root, task, path, private_key, row["invite_id"])
+    payload = decrypt_envelope(root, task, path, private_key, row["invite_id"])
+    if payload["revision"] != row["revision"]:
+        raise ValueError("CIPHERTEXT_CHANGED: 回执更正序号与数据库不一致")
+    return payload
 
 
 def review_task(task_dir, retry_needs_review=False, invite_id=None):
@@ -581,8 +651,8 @@ def review_task(task_dir, retry_needs_review=False, invite_id=None):
         if invite_id:
             query += " AND s.invite_id=?"
             params.append(invite_id)
-        # Only the newest version remains actionable; resolved history is immutable.
-        query += " AND (s.status='submitted' OR s.id=(SELECT MAX(n.id) FROM submissions n WHERE n.invite_id=s.invite_id)) ORDER BY s.id"
+        # Historical pending receipts may be checked, but only the signed current revision is actionable.
+        query += " AND (s.status='submitted' OR s.revision=(SELECT MAX(n.revision) FROM submissions n WHERE n.invite_id=s.invite_id)) ORDER BY s.id"
         for row in db.execute(query, params).fetchall():
             if task_expired(load_task(root)[1]):
                 raise RuntimeError("TASK_EXPIRED: 任务已超过保存期限")
@@ -591,7 +661,8 @@ def review_task(task_dir, retry_needs_review=False, invite_id=None):
                 payload = stored_payload(root, task, row, private_key)
                 missing, conflicts, attachments = validate_payload(task, payload)
                 if not missing and not conflicts:
-                    conflicts = compare_ocr(payload, attachments, task["fields"])
+                    with suppress_private_output():
+                        conflicts = compare_ocr(payload, attachments, task["fields"])
                 state = "needs_review" if missing or conflicts else "verified"
             except (OSError, ImportError):
                 state, conflicts = "needs_review", ["runtime:dependency_or_io"]
@@ -602,10 +673,6 @@ def review_task(task_dir, retry_needs_review=False, invite_id=None):
             db.execute(
                 "UPDATE submissions SET submitted_at=?,reviewed_at=?,status=?,missing_fields=?,conflict_fields=?,attachment_count=?,consent_confirmed=? WHERE id=?",
                 (normalize_submitted_at(payload.get("submitted_at")), now_iso(), state, json.dumps(missing), json.dumps(conflicts), len(attachments), int(payload.get("consent_confirmed") is True), row["id"]))
-            if state != "invalid":
-                db.execute("UPDATE invites SET current_submission_id=?,name=? WHERE invite_id=? AND (current_submission_id IS NULL OR current_submission_id<=?)",
-                           (row["id"], normalize_value("text", payload.get("values", {}).get("name", "")), row["invite_id"], row["id"]))
-            db.execute("UPDATE invites SET status=? WHERE invite_id=? AND ?=(SELECT MAX(id) FROM submissions WHERE invite_id=?)", (state, row["invite_id"], row["id"], row["invite_id"]))
             audit(db, "review", row["id"], state, ",".join(missing + conflicts))
             summary[state] += 1
     return summary
@@ -624,7 +691,12 @@ def cmd_decide(args):
         raise ValueError("OPERATOR_INVALID: 操作者标识限字母、数字、_.@-")
     private_key = unlock_private_key(root, task)
     with task_lock(root), closing(connect_db(root)) as db:
-        row = db.execute("SELECT * FROM submissions WHERE invite_id=? ORDER BY version DESC LIMIT 1", (args.invite_id,)).fetchone()
+        heads = current_submissions(db, args.invite_id)
+        row = heads[0] if heads else None
+        if row is not None and row["status"] == "revision_conflict":
+            raise RuntimeError("REVISION_CONFLICT: 同一序号存在不同回执，须由本人生成更高序号")
+        if row is not None and row["status"] == "storage_blocked":
+            raise RuntimeError("MANUAL_NOT_ALLOWED: 必须先恢复原始回执存储，不能人工绕过")
         if row is None or row['version'] != args.version or row['status'] in {'verified_manual', 'returned'}:
             raise RuntimeError("STATE_CHANGED: 版本不符或已人工结案")
         snapshot = export_snapshot(root)
@@ -652,25 +724,22 @@ def cmd_decide(args):
         if args.action == 'confirm':
             stored_payload(root, task, row, private_key)
         db.execute('UPDATE submissions SET status=?,reviewed_at=? WHERE id=?', (state, now_iso(), row['id']))
-        db.execute('UPDATE invites SET status=?,current_submission_id=? WHERE invite_id=?', (state, row['id'], args.invite_id))
         for code in issues if args.action == 'confirm' else [reason]:
             audit(db, 'manual_' + args.action, row['id'], state, code, args.operator)
-    return {'version': args.version, 'status': state}
+    return {'version': args.version, 'revision': row['revision'], 'status': state}
 
 
 def progress_rows(root: Path) -> list[dict[str, Any]]:
-    """每个回执编号一行：最新版本的状态、迟交与校验问题；不含任何字段值。"""
+    """每个回执编号一行：当前签名序号的状态与校验问题，不含姓名或字段值。"""
     with closing(connect_db(root)) as db:
-        rows = db.execute("""
-            SELECT i.invite_id,i.name,COALESCE(s.status,'invited') AS status,s.version,s.late,s.missing_fields,s.conflict_fields,s.received_at
-            FROM invites i
-            LEFT JOIN submissions s ON s.id=(SELECT MAX(n.id) FROM submissions n WHERE n.invite_id=i.invite_id)
-            ORDER BY i.name,i.invite_id
-        """).fetchall()
-    return [{"invite_id": row["invite_id"], "name": row["name"], "status": row["status"], "version": row["version"],
+        heads = {row["invite_id"]: row for row in current_submissions(db)}
+        rows = [heads.get(row["invite_id"], {"invite_id": row["invite_id"], "status": "invited", "version": None,
+                "revision": None, "late": False, "missing_fields": "[]", "conflict_fields": "[]", "received_at": None,
+                "conflicting_versions": []}) for row in db.execute("SELECT invite_id FROM invites ORDER BY invite_id")]
+    return [{"invite_id": row["invite_id"], "status": row["status"], "version": row["version"], "revision": row["revision"],
              "late": bool(row["late"]),
              "missing_fields": json.loads(row["missing_fields"] or "[]"), "conflict_fields": json.loads(row["conflict_fields"] or "[]"),
-             "received_at": row["received_at"]} for row in rows]
+             "received_at": row["received_at"], "conflicting_versions": row["conflicting_versions"]} for row in rows]
 
 
 def status_counts(root: Path) -> dict[str, int]:
@@ -684,9 +753,7 @@ def collect_rows(root: Path, task: dict[str, Any], private_key, attachment_stage
     """只解密每人最新且已通过的提交，重新做硬性校验；附件写入暂存目录并在单元格保存相对路径。"""
     field_defs = {field["id"]: field for field in task["fields"]}
     with closing(connect_db(root)) as db:
-        db_rows = db.execute(
-            "SELECT s.* FROM submissions s WHERE s.id=(SELECT MAX(n.id) FROM submissions n WHERE n.invite_id=s.invite_id) AND s.status IN ('verified','verified_manual')"
-        ).fetchall()
+        db_rows = [row for row in current_submissions(db) if row["status"] in PASSED_STATES]
     output, attachment_count = [], 0
     for row in db_rows:
         payload = stored_payload(root, task, row, private_key)
@@ -703,14 +770,14 @@ def collect_rows(root: Path, task: dict[str, Any], private_key, attachment_stage
         by_field: dict[str, list[dict[str, Any]]] = {}
         for item in attachments:
             by_field.setdefault(item["field_id"], []).append(item)
-        person_dir = f"{safe_filename_component(record.get('name'), 'reply')}-{row['invite_id'][-16:]}"
+        person_dir = row["invite_id"]
         for field_id, field in field_defs.items():
             if field["type"] not in ATTACHMENT_TYPES:
                 continue
             paths = []
             for index, item in enumerate(by_field.get(field_id, []), 1):
                 suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf"}[item["type"]]
-                filename = f"{safe_filename_component(field['label'], field_id)}-{field_id}-{index}{suffix}"
+                filename = f"{field_id}-{index}{suffix}"
                 if attachment_stage is None:
                     raise RuntimeError("ATTACHMENT_EXPORT_UNAVAILABLE: 附件暂存目录未创建")
                 secure_io.atomic_write(attachment_stage / person_dir / filename, item["data"], overwrite=False)
@@ -756,10 +823,10 @@ def collect_task(task_dir: str | Path, submissions_dir: str | Path, out: str | P
             progress = progress_rows(root)
             exclusions = exclusion_details(root, progress)
             late_count = sum(1 for row in progress if row["late"] and row["status"] in PASSED_STATES)
-            name_counts: dict[str, int] = {}
+            name_groups: dict[str, list[str]] = {}
             for record in rows:
-                name_counts[record.get("name", "")] = name_counts.get(record.get("name", ""), 0) + 1
-            duplicate_names = sorted(name for name, count in name_counts.items() if count > 1)
+                name_groups.setdefault(record.get("name", ""), []).append(record["__receipt_id__"])
+            duplicate_groups = [sorted(group) for group in name_groups.values() if len(group) > 1]
             write_excel(task, rows, out_path)
             written["xlsx"] = str(out_path)
             if attachment_stage is not None:
@@ -779,7 +846,7 @@ def collect_task(task_dir: str | Path, submissions_dir: str | Path, out: str | P
         if written.get("attachments_dir"):
             shutil.rmtree(written["attachments_dir"], ignore_errors=True)
         raise
-    print(f"已导出 {out_path}", file=sys.stderr)
+    print("导出完成。", file=sys.stderr)
     days_left = retention_days_left(task)
     result = {"task_id": task["task_id"], "rows": len(rows), "excluded": len(progress) - len(rows), "exclusions": exclusions,
               "late": late_count, "attachments": attachment_count, "ingest": ingested, "review": reviewed,
@@ -787,25 +854,28 @@ def collect_task(task_dir: str | Path, submissions_dir: str | Path, out: str | P
     warning = retention_warning(task, days_left)
     if warning:
         result["retention_warning"] = warning
-    if duplicate_names:
-        result["duplicate_names"] = duplicate_names
-        result["warning"] = ("Excel 中存在同名多行：" + ", ".join(duplicate_names)
-                             + "。可能是同一人未带 --previous 重复提交，也可能是真实同名；请 HR 与本人核对，脚本不会自动合并")
+    if duplicate_groups:
+        result["duplicate_name_groups"] = duplicate_groups
+        result["warning"] = "Excel 中存在同名多行；请 HR 在本地核对列出的回执编号，脚本不会自动合并。"
     return result
 
 
 def _exclusion_action(row: dict[str, Any], reasons: list[str]) -> str:
     """未通过记录的下一步建议；status/notice 与 collect 的 exclusions 共用。"""
+    if row["status"] == "revision_conflict":
+        return "同一更正序号存在不同回执；请持有人使用本人原保险柜，以同一回执编号生成更高序号的补正回执"
+    if row["status"] == "storage_blocked":
+        return "已验证回执未能保存；请检查容量或写入权限，再将同一原始回执放回收件目录重试，旧版本不会导出"
     if row["status"] == "invalid":
         return "回执损坏、被改动或不属于本任务，请员工用同一请求包重新生成并发送"
     if any(reason.startswith("runtime:") for reason in reasons):
         return "收件机器缺少依赖或读取失败；先运行 doctor 定位缺失组件，按需安装后重跑 collect 即会重审"
     if any(reason.startswith("ocr:") for reason in reasons):
-        return "附件与填写值自动比对未通过；需 HR 本人在终端运行 decide 逐项核对原件，或让员工更正后带 --previous 重交"
+        return "附件与填写值自动比对未通过；需 HR 本人在终端运行 decide 逐项核对原件，或让员工在本人原保险柜更正，以同一回执编号生成更高序号重交"
     if row["missing_fields"]:
-        return "必填项缺失；请员工补齐后带 --previous 重交"
+        return "必填项缺失；请员工在本人原保险柜补齐，以同一回执编号生成更高序号重交"
     if row["status"] in {"submitted", "needs_review"}:
-        return "校验未通过；请员工按提示更正后带 --previous 重交"
+        return "校验未通过；请员工在本人原保险柜按提示更正，以同一回执编号生成更高序号重交"
     if row["status"] == "returned":
         return "已退回等待员工重交"
     return "尚未收到有效回执"
@@ -818,9 +888,11 @@ def exclusion_details(root: Path, progress: list[dict[str, Any]]) -> list[dict[s
         if row["status"] in PASSED_STATES:
             continue
         reasons = list(row["missing_fields"]) + list(row["conflict_fields"])
-        detail = {"name": row["name"], "invite_id": row["invite_id"],
-                  "version": row["version"], "status": row["status"],
+        detail = {"invite_id": row["invite_id"],
+                  "version": row["version"], "revision": row["revision"], "status": row["status"],
                   "late": row["late"], "reasons": reasons, "next_action": _exclusion_action(row, reasons)}
+        if row.get("conflicting_versions"):
+            detail["conflicting_versions"] = row["conflicting_versions"]
         if row["version"] is not None and any(reason.startswith("ocr:") for reason in reasons):
             detail["decide_command"] = (f'decide "{root}" {row["invite_id"]} --version {row["version"]} '
                                         "--action confirm --operator <HR标识>（需 HR 本人交互终端）")
@@ -879,7 +951,8 @@ def cmd_list_tasks(args) -> dict[str, Any]:
             except Exception:
                 entry["status_counts"] = {}
         except Exception as exc:
-            entry = {"task_dir": str(child), "error": str(exc)}
+            report = error_report(exc)
+            entry = {"task_dir": str(child), "error": report["error"], "message": report["message"]}
         tasks.append(entry)
     return {"tasks_dir": str(parent), "tasks": tasks}
 
@@ -890,13 +963,13 @@ def cmd_audit_log(args) -> dict[str, Any]:
     with closing(connect_db(root)) as db:
         rows = db.execute("""
             SELECT a.action,a.at,a.result,a.reason,a.operator,
-                   s.invite_id,s.version
+                   s.invite_id,s.version,s.revision
             FROM audit a LEFT JOIN submissions s ON s.id=a.submission_id
             ORDER BY a.id
         """).fetchall()
     entries = [{"action": row["action"], "at": row["at"], "result": row["result"],
-                "reason": row["reason"], "operator": row["operator"],
-                "invite_id": row["invite_id"], "version": row["version"]} for row in rows]
+                "reason": row["reason"], "operator_recorded": bool(row["operator"]),
+                "invite_id": row["invite_id"], "version": row["version"], "revision": row["revision"]} for row in rows]
     return {"task_id": task["task_id"], "entries": entries}
 
 
@@ -915,12 +988,13 @@ def cmd_notice(args) -> dict[str, Any]:
     else:
         next_action = _exclusion_action(row, reasons)
     notice = {"format": NOTICE_FORMAT_VERSION, "task_id": task["task_id"], "invite_id": invite_id,
+              "revision": row["revision"],
               "status": row["status"], "late": row["late"], "reasons": reasons,
               "next_action": next_action, "contact": task["contact"],
               "generated_at": now_iso()}
     out = secure_io.checked_path(args.out)
     secure_io.atomic_write(out, canonical(notice), overwrite=False)
-    return {"out": str(out), "task_id": task["task_id"], "invite_id": invite_id, "status": row["status"]}
+    return {"out": str(out), "task_id": task["task_id"], "invite_id": invite_id, "revision": row["revision"], "status": row["status"]}
 
 
 def write_excel(task: dict[str, Any], rows: list[dict[str, str]], out_path: Path) -> None:
@@ -951,7 +1025,7 @@ def write_excel(task: dict[str, Any], rows: list[dict[str, str]], out_path: Path
 
 def export_snapshot(root):
     with closing(connect_db(root)) as db:
-        rows = [tuple(row) for row in db.execute("SELECT id,sha256,status FROM submissions ORDER BY id")]
+        rows = [tuple(row) for row in db.execute("SELECT id,invite_id,version,revision,sha256,status FROM submissions ORDER BY id")]
     return sha256_bytes(canonical([load_task(root)[1], rows]))
 
 
@@ -1020,9 +1094,18 @@ def export_task(task_dir: str | Path, out: str | Path, handoff_password: str | N
 
 def cmd_export(args) -> dict[str, Any]:
     require_tty("export-task")
-    result = export_task(args.task_dir, args.out)
-    password = result.pop("handoff_password")
-    print_once_secret("交接密码（仅显示一次，丢失不可恢复）：", password, "请通过另一独立安全渠道告知接收方；不要与交接包同渠道发送，也不要写入任务目录或聊天提示词。")
+    stream = open_control_terminal()
+    if stream is None:
+        raise RuntimeError("SECRET_TTY_REQUIRED: 无法打开安全控制终端")
+    with stream:
+        result = export_task(args.task_dir, args.out)
+        password = result.pop("handoff_password")
+        try:
+            print_once_secret("交接密码（仅显示一次，丢失不可恢复）：", password,
+                              "请通过另一独立安全渠道告知接收方；不要与交接包同渠道发送，也不要写入聊天。", stream=stream)
+        except OSError:
+            Path(result["out"]).unlink(missing_ok=True)
+            raise RuntimeError("SECRET_TTY_REQUIRED: 密码显示失败，已撤回交接包") from None
     return result
 
 
@@ -1052,7 +1135,14 @@ def open_task_package(package_path: Path, handoff_password: str | None = None) -
     task_id = envelope.get("task_id")
     if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
         raise ValueError("交接包 task_id 无效")
-    password = handoff_password if handoff_password is not None else getpass.getpass("交接密码: ")
+    password = handoff_password
+    if password is None:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                password = getpass.getpass("交接密码: ")
+        except getpass.GetPassWarning:
+            raise RuntimeError("SECRET_TTY_REQUIRED: 无法安全读取交接密码") from None
     try:
         zip_bytes = aes_gcm_open(envelope, password, task_package_aad(task_id))
     except Exception as exc:
@@ -1087,7 +1177,7 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
             parts = rel_path.parts
             allowed = (
                 rel in PACKAGE_REQUIRED_FILES or rel == "local-open-key"
-                or (len(parts) == 3 and parts[0] == "submissions" and OPEN_INVITE_ID_RE.fullmatch(parts[1]) and re.fullmatch(r"v\d{4}_[0-9a-f]{12}\.yintian", parts[2]))
+                or (len(parts) == 3 and parts[0] == "submissions" and OPEN_INVITE_ID_RE.fullmatch(parts[1]) and re.fullmatch(r"v\d{4,}_[0-9a-f]{12}\.yintian", parts[2]))
             )
             if not allowed or rel in manifest:
                 raise ValueError("任务包包含不允许或重复的文件")

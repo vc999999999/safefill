@@ -1,16 +1,21 @@
-# SafeFill · 收集者 5.0.0
+# SafeFill · 收集者 6.0.0
 
-HR 在对话中说明用途、字段、截止时间和联系人，Agent 生成无需名单的 `REQUEST-{任务编号}.yintian-request`（文件名带任务编号，防止多任务同名混淆）。这是给 `safefill-fill` Agent 读取的 JSON 请求包，不是让员工填写的表单。SafeFill 任何模式都不生成 HTML；员工只与 Agent 对话，HR 收到加密回执后由 Agent 汇总 Excel。
+HR 说明用途、字段、截止时间和联系人，Agent 生成请求包，接收员工密文回执并调用脚本在本机导出 Excel/附件。正常命令输出仅含回执编号、计数、状态与结果路径，不含员工姓名、字段值或识别内容；HR 自行打开本地结果。
 
-Agent 内部命令：
+完整指令见 [SKILL.md](SKILL.md)，格式和边界见随包携带的 [PROTOCOL.md](references/PROTOCOL.md)，字段定义见 [collection-config.md](references/collection-config.md)。安装整个 Skill 目录即可，不依赖填写端目录或仓库根文件。
 
 ```bash
 python scripts/collector.py create-request --config collection.json --out tasks
-python scripts/collector.py list-tasks tasks            # 找回任务目录
-python scripts/collector.py status TASK_DIR             # 只读进度：回执编号/版本/状态/期限
-python scripts/collector.py ingest TASK_DIR INCOMING_DIR [--recursive]
-python scripts/collector.py collect TASK_DIR INCOMING_DIR --out result.xlsx [--recursive]
-python scripts/collector.py notice TASK_DIR INVITE_ID --out NOTICE.yintian-notice   # 退回/补正通知
+python scripts/collector.py list-tasks tasks
+python scripts/collector.py status TASK_DIR
+python scripts/collector.py collect TASK_DIR INCOMING_DIR --out result.xlsx
+python scripts/collector.py notice TASK_DIR INVITE_ID --out NOTICE.yintian-notice
 ```
 
-HR 不需要准备姓名名单、网页表单或运行终端（OCR 裁定 `decide`、交接 `export-task`/`import-task`、销毁 `purge` 除外，需 HR 本人交互终端）。必须原样发送请求包，并建议把 `task_id` 尾 6 位公示给员工做带外核对。字段 id 使用 [标准字段 id](references/collection-config.md)，截止/保存时间必须带时区。`create-request` 返回保存期限提醒（到期后不再解密）与启用了附件比对的字段；`collect` 返回逐人排除原因（含完整回执编号、版本与可直接运行的 `decide_command`）、迟交人数与同名多行提醒，Agent 直接概述给 HR。Excel 第二列固定为回执编号供对账。回执文件名显示员工填写的姓名，收集端仍以解密后的姓名为准；需要强身份认证时应采用独立认证渠道。
+请求包和通知可由获授权的宿主发送工具原样交付，或交 HR 转发；员工回执由员工本人发送。请求摘要校验一致性，员工仍须通过可信发放渠道核对任务编号和公钥指纹。
+
+新回执为 `yintian-submission/5`。Ed25519 签名验证修订归属，最高已签名修订决定当前状态，文件名和收件顺序不能改变新旧关系；最高修订冲突时阻断导出与人工放行，由员工签发更高唯一修订解决。签名不认证现实员工身份。旧任务由对应旧版工具单独完成或重新创建，不静默迁移。
+
+Excel 第二列为完整回执编号；待复核、无效、退回或冲突的当前记录不混入结果。`exclusions` 按编号给出原因与下一步，`duplicate_name_groups` 只给同名记录的编号组。`status` 仅涵盖收到的回执，不能判断谁未提交；不要求新增员工名单。
+
+保存期限到达即拒绝解密。OCR 比对默认关闭，明确启用后的异常由 HR 本人在本地裁定或退回重交。`decide`、任务交接与销毁仍需 HR 本人交互终端；Agent 不读取附件代替看图裁定，也不获取交接密码。Agent 不打开 Excel 或解密附件来生成含员工值的聊天总结。

@@ -5,7 +5,6 @@ import json
 import os
 import stat
 import sys
-import unicodedata
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -251,8 +250,9 @@ def test_validate_profile_rejects_over_max_entries():
 
 def test_validate_entry_rejects_long_label():
     with pytest.raises(ValueError, match="VAULT_INVALID"):
-        vault.validate_entry(make_entry(label="x" * 101))
-    assert vault.validate_entry(make_entry(label="x" * 100))["label"] == "x" * 100
+        vault.validate_entry(make_entry(label="x" * (collection.MAX_LABEL_CHARS + 1)))
+    label = "x" * collection.MAX_LABEL_CHARS
+    assert vault.validate_entry(make_entry(label=label))["label"] == label
 
 
 def test_validate_entry_rejects_bad_attachment_sha256():
@@ -329,31 +329,6 @@ def test_validate_kdf_params_accepts_boundary():
     salt, n, r, p = collection.validate_kdf_params(_kdf())
     assert salt == b"s" * 16 and (n, r, p) == (collection.SCRYPT_N, collection.SCRYPT_R, collection.SCRYPT_P)
     assert collection.validate_kdf_params(_kdf(n=2**10, r=1, p=2))[1:] == (2**10, 1, 2)
-
-
-@pytest.mark.parametrize("value", ["../etc/passwd", "..\\..\\win", "a/b\\c:d*e?f\"g<h>i|j"])
-def test_safe_filename_component_strips_dangerous_chars(value):
-    result = collection.safe_filename_component(value)
-    assert result and "/" not in result and "\\" not in result
-    assert not result.startswith(".") and ".." not in result
-
-
-def test_safe_filename_component_control_chars_and_fallback():
-    assert collection.safe_filename_component("\x00\x1fname\x7f") == "name"
-    assert collection.safe_filename_component("///") == "item"  # 全部消毒后回退 fallback
-    assert collection.safe_filename_component("") == "item"
-
-
-def test_safe_filename_component_length_limits():
-    assert len(collection.safe_filename_component("a" * 500)) <= 60
-    long_cjk = collection.safe_filename_component("张" * 100)
-    assert len(long_cjk.encode("utf-8")) <= 120
-
-
-def test_terminal_text_strips_control_chars():
-    assert collection.terminal_text("a\tb\x00c​d") == "a b c d"
-    assert all(unicodedata.category(c) not in {"Cc", "Cf"} for c in collection.terminal_text("\x00\x1f\x7f‍"))
-    assert collection.terminal_text(123) == "123"
 
 
 def _zip_bytes(members: dict[str, bytes]) -> io.BytesIO:
@@ -491,15 +466,6 @@ def test_prop_validate_chinese_id_only_bool_or_valueerror(value):
     except ValueError:
         return  # 预期异常类型：Unicode 数字（如 ²）触发 int() 的 ValueError
     assert isinstance(result, bool)
-
-
-@given(_SAFE_TEXT)
-@settings(max_examples=50, derandomize=True)
-def test_prop_safe_filename_component_output_safe(value):
-    result = collection.safe_filename_component(value)
-    assert result and "/" not in result and "\\" not in result
-    assert all(unicodedata.category(c) not in {"Cc", "Cf"} for c in result)
-    assert len(result) <= 60 and len(result.encode("utf-8")) <= 120
 
 
 _JSON_SCALAR = st.none() | st.booleans() | st.integers() | st.floats(allow_nan=False, allow_infinity=False) | _SAFE_TEXT

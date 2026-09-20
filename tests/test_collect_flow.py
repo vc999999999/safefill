@@ -50,6 +50,36 @@ def run_collect(argv):
     return args.func(args)
 
 
+@pytest.mark.parametrize("change,code", [
+    ({"purpose": ""}, "CONFIG_MISSING_FIELDS"),
+    ({"purpose": 123}, "CONFIG_INVALID"),
+    ({"deadline": "2000-01-01T00:00:00Z"}, "DEADLINE_INVALID"),
+    ({"retention_until": "2098-01-01T00:00:00Z"}, "RETENTION_INVALID"),
+    ({"deadline": "2098-12-31"}, "TIME_ZONE_REQUIRED"),
+    ({"fields": [{"id": "name", "label": "PRIVATE_SCHEMA_SENTINEL", "type": []}]}, "SCHEMA_INVALID"),
+])
+def test_config_errors_remain_actionable_without_echoing_input(change, code):
+    with pytest.raises(ValueError) as caught:
+        collector.validate_config({**base_config(), **change})
+    report = collector.error_report(caught.value)
+    assert report["error"] == code
+    assert "doctor" not in report["message"] and "PRIVATE_SCHEMA_SENTINEL" not in report["message"]
+
+
+@pytest.mark.parametrize("field,value", [("task_id", 123), ("deadline", "PRIVATE_INVALID_DATE")])
+def test_corrupt_task_metadata_reports_safe_recovery_action(tmp_path, field, value):
+    root = make_open_task(tmp_path)
+    task_file = root / "task.json"
+    task = json.loads(task_file.read_bytes())
+    task[field] = value
+    collector.dump_json(task_file, task)
+    with pytest.raises(ValueError) as caught:
+        collector.load_task(root)
+    report = collector.error_report(caught.value)
+    assert report["error"] == "TASK_INVALID" and "备份" in report["message"]
+    assert "PRIVATE_INVALID_DATE" not in report["message"]
+
+
 def test_ingest_reports_skipped_directories_and_hint(tmp_path):
     task_dir = make_open_task(tmp_path)
     incoming = private(tmp_path / "incoming")
@@ -240,7 +270,7 @@ def test_notice_roundtrip_fields_and_validation(tmp_path):
     with pytest.raises(ValueError, match="回执编号格式无效"):
         run_collect(["notice", str(task_dir), "BAD-ID", "--out", str(tmp_path / "n.yintian-notice")])
     with pytest.raises(ValueError, match="不存在回执编号"):
-        run_collect(["notice", str(task_dir), "OPEN-ABCDEFGHIJKLMNOP", "--out", str(tmp_path / "n.yintian-notice")])
+        run_collect(["notice", str(task_dir), "OPEN-0123456789ABCDEF0123456789ABCDEF", "--out", str(tmp_path / "n.yintian-notice")])
 
 
 def test_export_import_preserves_request_filename(tmp_path):

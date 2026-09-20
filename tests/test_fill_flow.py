@@ -86,6 +86,8 @@ def test_vault_stage_reads_answers_from_stdin(tmp_path, isolated_vault, monkeypa
 
     applied = run(["vault-apply", "--confirmation", str(confirmation)])
     assert applied["created"] == ["phone"] and not confirmation.exists()
+    key = vault.load_or_create_key(vault.default_key_path())
+    assert vault.load_vault(vault.default_vault_path(), key)["entries"]["phone"]["value"] == "13800138000"
 
 
 def test_vault_stage_stdin_invalid_json(tmp_path, isolated_vault, monkeypatch):
@@ -280,18 +282,18 @@ def test_corrupt_confirmation_auto_cleaned(tmp_path, isolated_vault, monkeypatch
 def test_inspect_recognizes_notice(tmp_path, isolated_vault):
     notice_path = tmp_path / "n.yintian-notice"
     private_json(notice_path, {
-        "format": "yintian-notice/1", "task_id": "YT-20260101-ABCDEF", "invite_id": "OPEN-ABCDEFGHIJKLMNOP",
+        "format": "yintian-notice/1", "task_id": "YT-20260101-ABCDEF", "invite_id": "OPEN-0123456789ABCDEF0123456789ABCDEF",
         "status": "returned", "late": False, "reasons": ["phone"], "next_action": "补齐后带 --previous 重交",
         "contact": "hr@example.com", "generated_at": "2026-01-01T00:00:00Z"})
     result = run(["inspect", str(notice_path)])
-    assert result["kind"] == "notice" and result["invite_id"] == "OPEN-ABCDEFGHIJKLMNOP"
+    assert result["kind"] == "notice" and result["invite_id"] == "OPEN-0123456789ABCDEF0123456789ABCDEF"
     assert result["reasons"] == ["phone"] and result["contact"] == "hr@example.com"
 
 
 def test_inspect_rejects_notice_with_extra_fields(tmp_path, isolated_vault):
     notice_path = tmp_path / "n.yintian-notice"
     private_json(notice_path, {
-        "format": "yintian-notice/1", "task_id": "YT-20260101-ABCDEF", "invite_id": "OPEN-ABCDEFGHIJKLMNOP",
+        "format": "yintian-notice/1", "task_id": "YT-20260101-ABCDEF", "invite_id": "OPEN-0123456789ABCDEF0123456789ABCDEF",
         "status": "returned", "next_action": "x", "reasons": [], "payload": "evil"})
     with pytest.raises(fill.FillError, match="NOTICE_INVALID"):
         run(["inspect", str(notice_path)])

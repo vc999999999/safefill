@@ -10,9 +10,13 @@ import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import collection
 import secure_io
+
+if TYPE_CHECKING:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 FORMAT = "yintian-vault/2"
 CONFIRMATION_FORMAT = "yintian-confirmation/1"
@@ -22,7 +26,7 @@ MAX_CONFIRMATION_BYTES = 40 * 1024 * 1024
 MAX_ENTRIES = 100
 VAULT_FILENAME = "vault.yintian-vault"
 KEY_FILENAME = "vault.key"
-SOURCE_KINDS = {"manual", "openvino-ocr", "openvino-vlm"}
+SOURCE_KINDS = {"manual", "openvino-ocr", "openvino-vlm", "openvino-text"}
 
 
 def _home() -> Path:
@@ -121,7 +125,7 @@ def check_vault_file(vault_path: Path) -> None:
 
 def _validate_source(source) -> dict:
     if not isinstance(source, dict) or source.get("kind") not in SOURCE_KINDS:
-        raise ValueError("VAULT_INVALID: 条目来源无效（manual/openvino-ocr/openvino-vlm）")
+        raise ValueError("VAULT_INVALID: 条目来源无效（manual/openvino-ocr/openvino-vlm/openvino-text）")
     digest = source.get("sha256")
     if digest is not None and not (isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)):
         raise ValueError("VAULT_INVALID: 条目来源 sha256 无效")
@@ -152,7 +156,7 @@ def validate_entry(entry) -> dict:
     if entry_type not in collection.ALLOWED_TYPES:
         raise ValueError("VAULT_INVALID: 条目类型无效")
     label = entry.get("label", "")
-    if not isinstance(label, str) or len(label) > 100:
+    if not isinstance(label, str) or len(label) > collection.MAX_LABEL_CHARS:
         raise ValueError("VAULT_INVALID: 条目标签无效")
     result = {"type": entry_type, "label": label, "source": _validate_source(entry.get("source"))}
     updated_at = entry.get("updated_at")
@@ -181,7 +185,51 @@ def validate_profile(profile) -> dict:
     if any(not isinstance(key, str) or not collection.FIELD_ID_RE.fullmatch(key) for key in entries):
         raise ValueError("VAULT_INVALID: 保险柜条目 id 无效")
     profile["entries"] = {key: validate_entry(entry) for key, entry in entries.items()}
+    if "submission_identities" in profile:
+        identities = profile["submission_identities"]
+        if not isinstance(identities, dict):
+            raise ValueError("VAULT_INVALID: 提交身份结构无效")
+        for task_id, state in identities.items():
+            if not isinstance(task_id, str) or not collection.TASK_ID_RE.fullmatch(task_id) or not isinstance(state, dict):
+                raise ValueError("VAULT_INVALID: 提交身份任务无效")
+            keys = state.get("identities")
+            if not isinstance(keys, dict) or not keys or not isinstance(state.get("current"), str) or state["current"] not in keys:
+                raise ValueError("VAULT_INVALID: 当前提交身份无效")
+            for invite_id, identity in keys.items():
+                if not isinstance(identity, dict):
+                    raise ValueError("VAULT_INVALID: 提交身份无效")
+                try:
+                    private_key = identity_key(identity)
+                    public_b64 = base64.b64encode(private_key.public_key().public_bytes_raw()).decode("ascii")
+                    valid_id = collection.derive_invite_id(task_id, public_b64)
+                except (ValueError, TypeError, KeyError):
+                    raise ValueError("VAULT_INVALID: 提交身份密钥无效") from None
+                revision = identity.get("last_reserved_revision")
+                if invite_id != valid_id or type(revision) is not int or not 0 <= revision <= collection.MAX_REVISION:
+                    raise ValueError("VAULT_INVALID: 提交身份编号或序号无效")
     return profile
+
+
+def identity_key(identity: dict) -> Ed25519PrivateKey:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    return Ed25519PrivateKey.from_private_bytes(base64.b64decode(identity["private_key_b64"], validate=True))
+
+
+def create_identity(profile: dict, task_id: str) -> str:
+    """Caller holds the vault lock and persists this profile before issuing a confirmation."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    private_key = Ed25519PrivateKey.generate()
+    public_b64 = base64.b64encode(private_key.public_key().public_bytes_raw()).decode("ascii")
+    invite_id = collection.derive_invite_id(task_id, public_b64)
+    states = profile.setdefault("submission_identities", {})
+    state = states.setdefault(task_id, {"current": invite_id, "identities": {}})
+    state["identities"][invite_id] = {
+        "private_key_b64": base64.b64encode(private_key.private_bytes_raw()).decode("ascii"),
+        "last_reserved_revision": 0,
+    }
+    return invite_id
 
 
 def load_vault(vault_path: Path, key: str) -> dict:
@@ -249,7 +297,7 @@ def build_entry(entry_id: str, spec: dict, build_attachments) -> dict:
     if entry_type not in collection.ALLOWED_TYPES:
         raise ValueError(f"VAULT_ENTRY_INVALID: 条目 {entry_id} 类型无效")
     label = spec.get("label", "")
-    if not isinstance(label, str) or len(label) > 100:
+    if not isinstance(label, str) or len(label) > collection.MAX_LABEL_CHARS:
         raise ValueError(f"VAULT_ENTRY_INVALID: 条目 {entry_id} 标签无效")
     label = label.strip() or entry_id  # 空标签回退为条目 id，保证 vault-status 里每条都可读
     source = _validate_source(spec.get("source") or {"kind": "manual"})
@@ -378,10 +426,10 @@ def record_submission(vault_dir: Path, record: dict) -> Path:
     return path
 
 
-def find_previous(vault_dir: Path, task_id: str) -> dict | None:
+def find_previous(vault_dir: Path, task_id: str, invite_id: str | None = None) -> dict | None:
     """该任务最近一次提交且回执文件仍在原路径的登记；供 --previous 自动解析。"""
     for record in reversed(load_registry(vault_dir)):
-        if record["task_id"] == task_id:
+        if record["task_id"] == task_id and (invite_id is None or record["invite_id"] == invite_id):
             try:
                 if secure_io.checked_path(record["path"]).is_file():
                     return record

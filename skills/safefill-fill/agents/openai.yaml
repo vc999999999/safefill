@@ -1,4 +1,4 @@
 interface:
   display_name: "SafeFill · 填写者"
-  short_description: "读取 AI 请求包，本机保险柜复用资料生成加密回执"
-  default_prompt: "使用 $safefill-fill：读取收集方发来的请求包或退回通知，只按字段 ID 精确匹配本机保险柜，缺项在对话补录；提交前逐项展示完整值和来源，待我确认后生成姓名可读、内容加密的回执；更正时自动沿用上次的回执编号。不要创建 HTML，也不要让我运行终端。"
+  short_description: "复用本机保险柜，支持对话或本地文本补录，经本人确认生成加密回执"
+  default_prompt: "使用 $safefill-fill 处理请求包或补正通知，复用本机资料；缺项时提供对话或本地文本补录选项，经我核对确认后生成签名加密回执。"

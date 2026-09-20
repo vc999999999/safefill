@@ -1,7 +1,11 @@
 import json
 import os
+import re
+import shutil
 import stat
+import subprocess
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -98,7 +102,8 @@ def test_open_roundtrip_uses_only_exact_ids_and_explicit_mapping(tmp_path, isola
     incoming = private(tmp_path / "incoming")
     reply = Path(run(["vault-fill", str(request), "--confirmation", str(confirmation),
                       "--out-dir", str(incoming)])["out"])
-    assert reply.name.startswith("张三-") and reply.suffix == ".yintian"
+    assert reply.name.startswith("RECEIPT-") and reply.suffix == ".yintian"
+    assert "张三" not in reply.name
 
     result = collector.collect_task(task_dir, incoming, tmp_path / "result.xlsx")
     book = load_workbook(result["xlsx"], read_only=True)
@@ -107,6 +112,47 @@ def test_open_roundtrip_uses_only_exact_ids_and_explicit_mapping(tmp_path, isola
     assert result["rows"] == 1
     assert rows[0][:3] == ("姓名", "回执编号", "入职日期")
     assert rows[1][0] == "张三" and rows[1][1].startswith("OPEN-") and rows[1][2] == "2026-09-01"
+
+
+@pytest.mark.parametrize("skill_name,entrypoint", [("safefill-fill", "fill.py"), ("safefill-collect", "collector.py")])
+def test_skill_runs_with_only_its_own_directory_outside_repository(skill_name, entrypoint):
+    source = SCRIPTS.parents[1] / skill_name
+    repository = source.parents[1].resolve()
+    with tempfile.TemporaryDirectory(prefix="safefill-independent-") as folder:
+        outside = Path(folder).resolve()
+        assert repository not in outside.parents
+        package = outside / skill_name
+        shutil.copytree(source, package, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        skill_text = (package / "SKILL.md").read_text(encoding="utf-8")
+        references = re.findall(r"\]\(([^)]+)\)", skill_text)
+        assert references
+        for reference in references:
+            if re.match(r"^[a-z]+://", reference) or reference.startswith("#"):
+                continue
+            target = (package / reference.split("#", 1)[0]).resolve()
+            assert package in target.parents, reference
+            assert target.is_file(), reference
+        environment = {key: value for key, value in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}}
+        result = subprocess.run(
+            [sys.executable, str(package / "scripts" / entrypoint), "--help"],
+            cwd=outside, env=environment, capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "usage:" in result.stdout.lower()
+
+
+def test_fill_can_diagnose_missing_dependencies(tmp_path):
+    for arguments in (["--help"], ["doctor", "--vault", str(tmp_path / "data" / "vault"),
+                                   "--key-file", str(tmp_path / "keys" / "key")]):
+        result = subprocess.run(
+            [sys.executable, "-S", str(SCRIPTS / "fill.py"), *arguments],
+            cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        if arguments[0] == "doctor":
+            report = json.loads(result.stdout)
+            assert not report["core"]["ok"] and "cryptography" in report["core"]["detail"]
+    assert not list(tmp_path.iterdir())
 
 
 def test_confirmation_rejects_changed_request_tampering_and_reuse(tmp_path, isolated_vault):
@@ -285,7 +331,8 @@ def test_vault_fill_warns_only_about_same_task_receipts(tmp_path, isolated_vault
     confirmation2 = tmp_path / "private" / "submit2.yintian-confirmation"
     run(["vault-preview", str(request), "--fresh", "--confirmation-out", str(confirmation2)])
     second = run(["vault-fill", str(request), "--fresh", "--confirmation", str(confirmation2), "--out-dir", str(incoming)])
-    assert "--previous" in second["warning"] and Path(first["out"]).name in second["warning"]
+    assert "明确新建记录" in second["warning"] and "1 份本任务回执" in second["warning"]
+    assert Path(first["out"]).name not in second["warning"] and "张三" not in second["warning"]
     assert json.loads(Path(first["out"]).read_text(encoding="utf-8"))["task_id"] == task_id
 
 

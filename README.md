@@ -1,149 +1,83 @@
 # SafeFill Skills
 
-SafeFill 是一个 AI→AI 的私密资料收集协议。HR Agent 把需求编译成机器请求包；员工 Agent 读取字段，从本机加密保险柜匹配取值（首次初始化、缺项补录、OpenVINO 本地识别证件）并生成加密回执；HR Agent 收回密文后统一校验并导出 Excel。
+SafeFill 是一对协作收集资料的 Agent Skills：HR Agent 把需求变成机器请求包，员工端脚本从本机加密保险柜复用资料，由员工通过私有对话或本地文本补录并确认，最后生成签名加密回执；收集端验证后在本机导出 Excel 与附件。
 
 > Fill locally. Share securely.
 
-## 设计亮点
+**补录可选择本地文本：员工自行保存资料，脚本调用 OpenVINO 提取，Agent 只获得字段状态和本地核对文件路径。** 普通对话补录仍允许填写 Agent 处理必要明文；收集端脚本本机解密到 Excel/附件，HR Agent 只拿匿名摘要与路径。本项目不新增填写表单或弹窗。
 
-**1. 本机加密保险柜 · 一次录入，终身复用**
+## 两个可独立安装的 Skill
 
-员工资料沉淀在系统用户数据目录的 `yintian-vault/2` 保险柜中：scrypt + AES-256-GCM 静态加密，`0600` 本机密钥放在独立用户密钥目录，不联网、不分发。之后只问保险柜里没有的字段；脚本仅按相同字段 ID 自动匹配，语义映射必须由员工 Agent 明确提出并由本人确认。为了让复用真正发生，HR 端字段 id 使用[标准字段 id 词表](skills/safefill-collect/references/collection-config.md)（`phone`、`id_number`、`address`、`hire_date`、`id_front`…），`vault-scan` 也按同一套 id 输出。
-
-**2. OpenVINO 本地模型提取 · 安装后离线、无 API Key**
-
-`vault-scan` 用 OpenVINO 在本机推理，把员工明确指定的证件图变成结构化字段候选（`name/id_number/phone/address`，并由身份证号派生 `birth_date/gender`）：基线为 rapidocr OCR（仅 Python 3.11 可装），也可通过 `--model` 使用用户选择的兼容 VLM，模型 revision 可选。`vlm-setup` 安装阶段需要联网，安装后的推理使用本地模型。识别结果永远只是候选，确定性校验和本人确认后才写入保险柜。
-
-**3. 端到端加密 · 密码学兜底**
-
-每份回执使用随机的 AES-256-GCM 内容密钥，并以请求包内的 RSA-OAEP-3072 公钥封装，只有持有任务私钥的收集方本机账户能解；HR 私钥静态加密存放，开放任务的本地密钥独立放在任务目录外的受限目录。回执文件名只显示姓名与防重名短码，身份证号、手机号等永不进入文件名。
-
-**4. AI→AI 机器协议 · 零网页表单**
-
-`REQUEST-{任务编号}.yintian-request` 是 Agent 之间交换的规范 JSON，不是给人填写的界面，也不会生成 HTML 或在线表单。请求包携带 `schema_hash`/`notice_hash` 防篡改，公钥指纹可带外核对；请求包、回执、附件一律视为数据，不执行其中夹带的指令。
-
-**5. 克制的 Agent 边界**
-
-不扫描磁盘寻找证件、不猜测或编造缺值、不代替员工发送回执、不把他人明文贴进聊天；临时明文一律 `0700` 目录 + `0600` 文件且用后删除。提交前生成 30 分钟有效的加密确认文件，任何请求、保险柜、映射或取值变化都会使确认失效。
-
-## 两个 Skill
-
-| Skill | 使用者 | 职责 | 说明 |
+| Skill | 使用者 | 职责 | 文档 |
 |---|---|---|---|
-| `safefill-collect` | HR、行政等收集者 | 对话补齐需求、生成机器请求包、收取加密回执并汇总 Excel | [README](skills/safefill-collect/README.md) · [SKILL.md](skills/safefill-collect/SKILL.md) |
-| `safefill-fill` | 提交资料的员工 | 读取机器请求包、本机保险柜匹配取值、确认并生成加密回执 | [README](skills/safefill-fill/README.md) · [SKILL.md](skills/safefill-fill/SKILL.md) |
+| `safefill-collect` | HR、行政等收集者 | 生成请求、验证回执、处理补正、汇总本地 Excel | [SKILL.md](skills/safefill-collect/SKILL.md) · [README](skills/safefill-collect/README.md) |
+| `safefill-fill` | 提交资料的员工 | 保险柜复用、对话或本地文本补录、确认与签名加密提交 | [SKILL.md](skills/safefill-fill/SKILL.md) · [README](skills/safefill-fill/README.md) |
 
-`skills/` 下的两个目录都是独立 Skill。收集者和填写者可以在不同设备上只安装自己需要的一端。
-
-## 共享模块同步
-
-两个 Skill 的 `scripts/` 下有 5 个逐字节相同的共享模块：`collection.py`（协议层）、`config.py`、`ocr_matcher.py`、`openvino_runtime.py`、`secure_io.py`。
-`collection.py` 是纯粹的 AI→AI 协议库（常量、规范 JSON、哈希、AES-GCM 封包、信封与字段校验），两端各存一份相同副本；收集端的任务管理、收件、导出等专有逻辑只在收集端的 `collector.py` 中，填写端不携带这部分代码。
-修改其中任何一个必须双侧同步提交；`tests/check_skill_sync.py` 会逐字节比对两侧副本，发现漂移即失败（CI 与本地均可直接运行）。
-
-## 版本与兼容
-
-当前协议版本：请求包 `yintian-request/1`、保险柜 `yintian-vault/2`、回执 `yintian-submission/4`、确认文件 `yintian-confirmation/1`、交接包 `yintian-task/3`、退回/补正通知 `yintian-notice/1`、填写端本地提交登记 `yintian-submissions/1`（仅存本机保险柜目录，不传输）。代码只为当前版本实现，不包含旧版本（`yintian-form/*`、名单/凭据模式、v1 保险柜与交接包）的迁移路径——5.0/6.0 起老产物需用旧版本脚本先行处理或重新生成。协议格式变更时会递增版本号并在本段说明；`schema_hash`/`notice_hash` 保证回执与发出时的请求包严格对应，混用不同版本生成的文件会被明确拒绝而非静默接受。
-
-## 默认使用方式：AI 请求包 + 本机保险柜
-
-HR 不准备员工名单、配置文件或网页表单，也不需要运行终端。Agent 只补问尚未说明的用途、字段、必填性、截止时间和联系人，然后生成 `REQUEST-{任务编号}.yintian-request`。截止与保存时间必须带时区偏移；保存期限（默认截止后 30 天）一到，收件端按告知承诺拒绝解密，HR 需在此之前完成汇总。附件与填写值的自动比对（`ocr_fields`）默认关闭，只在 HR 明确要求并知晓"比对不通过需 HR 本人在终端 `decide` 裁定"后启用；字段名本身不会触发比对。
-
-员工把请求包交给安装了 `safefill-fill` 的 Agent：Agent 读取并说明用途、与发放方带外核对任务编号和公钥指纹后运行 `vault-status`。首次使用或存在缺项时，通过 `vault-stage` 展示完整新旧值、本人确认后 `vault-apply`；提交前再由 `vault-preview` 展示本次完整取值和来源，确认后 `vault-fill` 生成 `姓名-随机短码.yintian` 并在保险柜目录登记本次提交（更正时自动沿用回执编号，`--fresh` 可强制新记录）。员工本人发送回执，HR Agent 收件后统一解密、校验并导出 Excel（第二列固定为回执编号）和附件；`collect` 同时返回逐人排除原因（含可直接运行的 `decide` 命令）、迟交人数与同名多行提醒。HR 侧还可用 `list-tasks` 找回任务、`status` 只读看进度和保存期限预警、`notice` 生成退回/补正通知交给员工 Agent 识别。
-
-这意味着当前 Agent 会实际处理用户主动提供的明文。保险柜保护静态资料，回执端到端加密保护传输与汇总侧的内容，都不把明文对正在执行填写或汇总的 Agent 隐藏。若部署方不允许 Agent 接触明文，当前自动流程不适用。经标准输入传入的明文也会出现在 Agent 的命令行与宿主工具日志中；宿主持久化命令日志时应改用 `0700` 目录内的 `0600` 临时文件传值。
-
-请求包的身份是提交者自报，不能防止同名、冒名、请求包转发或垃圾提交；需要强身份认证时应采用独立认证渠道。
-
-两端的可选 OCR 均支持用 `YINTIAN_OCR_DEVICE` 选择 `CPU/GPU/NPU/AUTO`。保险柜和密钥目录可分别用 `YINTIAN_VAULT_DIR`、`YINTIAN_VAULT_KEY_DIR` 重定向。填写端 VLM 独立安装 `requirements-vlm.txt`，模型缓存可用 `YINTIAN_VLM_MODEL_DIR` 重定向；VLM 不可用时由 Agent 改用核心环境运行普通 OCR。
+Agent 负责需求理解、字段语义、命令编排与结果说明；确定性脚本负责加密、签名、修订选择、校验和确认绑定。通用环境准备、文件操作与获授权的发送交给宿主已有能力；没有网站、后台、账号或名单系统。
 
 ## 工作流程
 
-```text
-HR 说明用途、字段、期限和联系人
-  → safefill-collect 生成 REQUEST-{任务编号}.yintian-request
-  → 员工 Agent inspect 核对任务编号与公钥指纹，保险柜匹配取值（首次初始化、缺项补录、可选本地识别）并加密
-  → 员工本人把回执发送给 HR
-  → safefill-collect 校验并汇总 Excel 与附件目录（status 随时看进度，notice 可向员工发退回/补正通知）
-```
+1. HR 说明用途、字段、期限和联系人。收集 Agent 补齐缺失需求，使用[标准字段 ID](skills/safefill-collect/references/collection-config.md)生成 `REQUEST-{task_id}.yintian-request`，交 HR 或获授权的宿主工具原样转发。
+2. 员工 Agent 核对任务编号与发放方公钥指纹，查询保险柜字段元数据。相同 ID 自动匹配；不同 ID 的语义映射由 Agent 提出，在员工私有会话中明确确认。
+3. 首次录入、缺项或修改时，Agent 主动告知可在私有会话补录，也可自行将字段含义和值写入本地 UTF-8 `.txt`。对话使用 `vault-stage --answers`；文本使用 `vault-stage --text-file LOCAL.txt --request REQUEST --model MODEL`，由脚本调用本地模型提取，只返回字段状态和 review 路径。本人核对完整新旧值、明确确认后，`vault-apply` 入库。
+4. `vault-preview` 准备本次取值、来源、映射与附件摘要。选择过本地文本的条目在后续复用和映射中不回传值：缺项时仅返回元数据，就绪后使用本地 review，Agent 不读取文件；普通资料可在私有会话展示。本人确认后，`vault-fill` 生成匿名命名的签名加密回执，员工本人发送。可选图片 `vault-scan` 的候选仍在本人私有会话中核对。
+5. HR Agent 调用 `collect`；脚本验证、解密并导出 Excel/附件，Agent 只返回路径、数量和按回执编号标识的异常。HR 自行查看本地结果。
 
-1. Agent 从对话提取需求，只合并询问缺项；`name` 自动作为必填字段，不向 HR 索取名单。
-2. HR 原样转发机器请求包；员工不打开、不手工填写，员工 Agent 读取后按保险柜匹配结果只问缺项，取值与映射经本人确认后加密。
-3. 首次回执生成随机记录编号；更正时必须携带本人上一次回执沿用编号，不能按姓名猜测覆盖。
-4. 收集端不信任文件名，以解密后的姓名和字段为准；异常、待复核或非最新记录不进入 Excel，`collect` 会按人给出原因与下一步。
-5. 附件解密到 Excel 同名目录，单元格保存相对路径；明文输出只留给获授权的 HR。
+员工取消或拒绝时停止写入/提交。确认凭据绑定精确内容，有效期 30 分钟；有关内容变更后需重新展示并确认，无关保险柜条目变更不作废。凭据已生成或 `ready:true` 不代表真人已经同意，确认仍依赖宿主交互和 Agent 遵守流程。
 
-## 安装
+## 核心保证与边界
 
-安装为 Agent Skill 时，请选择具体的 `skills/safefill-collect` 或 `skills/safefill-fill` 目录，不要把仓库根目录或 `skills/` 当成一个 Skill。每个 Skill 目录都应整体安装，不能只复制 `SKILL.md`，因为运行时还需要同目录下的脚本和参考文件。
+**资料跨任务复用。** 保险柜使用 scrypt + AES-256-GCM 加密，资料只需在缺项或变更时重新输入；标准字段 ID 减少重复匹配。保险柜与密钥分别存放在系统用户数据目录和密钥目录，可用 `YINTIAN_VAULT_DIR`、`YINTIAN_VAULT_KEY_DIR` 重定向。POSIX 使用受限权限；Windows 依赖本机用户目录权限，不把 POSIX mode 位视为 ACL 隔离证明。
 
-以下命令只供 Skill 安装者或维护者使用，不是 HR/员工业务流程步骤。首次本地安装示例（macOS / Linux）：
+**加密与可验证更正。** 回执使用随机 AES-256-GCM 内容密钥，由请求包 RSA-OAEP-3072 公钥封装；Ed25519 签名绑定完整信封和修订号。回执编号由任务与提交者公钥派生，持有他人回执文件不能取得更正权。同一编号按最高已签名修订处理，收件乱序不能覆盖新值；同修订分叉阻断导出，需更高唯一修订解决。签名证明密钥持有连续性，不证明现实员工身份。
+
+**减少资料进入模型。** 文本补录由脚本读取用户指定的源文件并本地推理；完整候选、旧值与预览写入受限权限的 `REVIEW-*.txt`，本人自行在编辑器中核对，不自动弹窗。Agent 不读取、回显或截图源文件/review；文本 stage 的源文件与 review 均受摘要绑定，修改使确认失效，成功消费凭据后脚本尝试删除 review，源文件保留。对话及图片识别路径仍向填写 Agent 返回必要明文，stdin 和输出可能留在宿主日志。源文本和 review 本身是本地明文，这不防御拥有同一系统账户权限的主动读取。
+
+**收集端不把明文回传模型。** 收件、状态和汇总命令只返回编号、数量、字段级原因与路径，同名提醒仅返回编号组；HR 自行查看本地 Excel。回执文件名仅含编号、修订号及随机后缀。
+
+**本地识别是可选能力。** 文本提取使用兼容 OpenVINO GenAI `LLMPipeline` 的模型，只处理至多 16 KiB 的 UTF-8 `.txt`；OCR 与兼容 VLM 处理指定图片。两类模型不能假定互换，提取结果都只是候选，须本人核对。文本提取失败时停止，不自动读取原文或换云端；用户明确选择后可回到对话补录。模型安装需要联网，安装后推理使用本地文件；这不代表宿主 Agent 离线。设备枚举或本地文件哈希校验不等于所有设备、模型质量或来源已获验证。
+
+**收集状态有明确范围。** `status` 只统计收到的回执，不声称知道谁没交；`notice` 用于补正。保存期限默认截止后 30 天，到期拒绝解密，无宽限。OCR 比对默认关闭；明确启用后，异常由 HR 本人本地裁定或退回重交。人工裁定、任务交接和销毁仍有本人终端步骤。
+
+## 版本与兼容
+
+当前格式：请求 `yintian-request/1`，回执 `yintian-submission/5`，保险柜 `yintian-vault/2`，确认 `yintian-confirmation/1`，交接包 `yintian-task/3`，补正通知 `yintian-notice/1`，本机登记 `yintian-submissions/1`。
+
+已有 v2 保险柜可继续使用，其加密内容新增签名身份。v4 回执和 DB1 旧任务不原地迁移，使用对应旧版工具单独完成，或重新创建请求；新版明确拒绝旧任务，不混收旧回执。新任务的回执版本由请求包 `format_version` 指定。
+
+## 安装与环境
+
+分别整体安装 `skills/safefill-collect` 或 `skills/safefill-fill`，不要只复制 `SKILL.md` 或把仓库根目录当作一个 Skill。每端已包含运行脚本和协议参考，不依赖另一端或仓库根文档。
+
+核心环境使用 Python 3.11–3.13，填写端不需要图形窗口；Tk 仅用于收集端原有的 OCR 人工裁定。以下是安装者的 macOS/Linux 示例，Agent 可使用宿主已有环境完成相同准备：
 
 ```bash
-git clone https://github.com/vc999999999/safefill.git
-cd safefill
-
 python3 -m venv skills/safefill-collect/.venv
 skills/safefill-collect/.venv/bin/python -m pip install -r skills/safefill-collect/requirements.txt
 skills/safefill-collect/.venv/bin/python skills/safefill-collect/scripts/collector.py doctor
-
 python3 -m venv skills/safefill-fill/.venv
 skills/safefill-fill/.venv/bin/python -m pip install -r skills/safefill-fill/requirements.txt
-skills/safefill-fill/.venv/bin/python skills/safefill-fill/scripts/fill.py --help
+skills/safefill-fill/.venv/bin/python skills/safefill-fill/scripts/fill.py doctor
 ```
 
-Windows 中将 `.venv/bin/python` 换为 `.venv\Scripts\python.exe`。核心流程不强制安装 OCR/VLM 或配置 API Key；本地 OCR 只在需要时额外安装各端的 `requirements-ocr.txt`，本地 VLM 使用独立虚拟环境安装 `requirements-vlm.txt` 并运行一次 `vlm-setup`。
+Windows 使用 `.venv\Scripts\python.exe`。对话核心流程不需要 OCR/VLM 或 API Key；普通 OCR 额外安装 `requirements-ocr.txt`，其固定后端需要 Python 3.11。VLM 与本地文本提取复用独立环境的 `requirements-vlm.txt` 和 `vlm-setup --model MODEL [--revision REV]`，选择各自兼容的模型。OCR 设备由 `YINTIAN_OCR_DEVICE` 配置；本地模型目录和设备分别由 `YINTIAN_VLM_MODEL_DIR`、`YINTIAN_VLM_DEVICE` 配置，能否运行以具体模型和设备实测为准。
 
-## 关键文件与边界
+## 文件与维护
 
-| 文件 | 用途 | 应留在哪里 |
-|---|---|---|
-| `REQUEST-{任务编号}.yintian-request` | AI→AI 信息请求包，文件名含任务编号；不含名单或个人值 | HR 原样转发给员工 Agent |
-| `vault.yintian-vault` | 员工的加密个人保险柜（yintian-vault/2） | 系统用户数据目录（0600） |
-| `vault.key` | 保险柜本机密钥 | 独立系统用户密钥目录（0600），永不外发 |
-| `姓名-短码.yintian` | 本次加密提交；仅文件名显示姓名 | 由员工本人按授权渠道交回收集者 |
-| `result.xlsx` / `result-attachments/` | 最新通过记录与解密附件 | 只留在获授权的 HR / 接收方 |
+| 产物 | 应留在哪里 |
+|---|---|
+| `REQUEST-*.yintian-request`、`*.yintian-notice` | 按授权渠道原样交付，不含员工值 |
+| `RECEIPT-{invite_id}-{revision}-{随机6位}.yintian` | 由员工本人交给 HR，内容加密 |
+| `vault.yintian-vault`、`vault.key`、确认凭据、本机登记 | 员工本机，不交给 HR 或贴入对话 |
+| 文本补录源文件、`REVIEW-*.txt` | 员工本机明文，本人自行查看；Agent 不读取，源文件由本人保管或删除 |
+| `result.xlsx`、同名附件目录 | 获授权的 HR 本机，Agent 不读取内容 |
+| HR 数据库、私钥与解密密钥 | HR 本机；跨设备只通过加密任务包交接 |
 
-- 默认开放流程中，填写 Agent 和 HR Agent 会处理各自获授权的明文；不得扩大字段、扫描磁盘、猜测缺值、把他人明文贴进聊天或自动替员工发送回执。
-- 任务私钥始终加密，本地随机密钥存放在任务目录之外的受限目录。
-- OCR/VLM 结果只是候选，不代替填写者确认和 HR 复核。
-- 仓库不保存真实明文资料、附件、提交文件、保险柜、导出表格或项目外文稿；`skills/safefill-fill/data/` 已在 `.gitignore` 中排除。
-
-更完整的操作与权限说明见[收集者文档](skills/safefill-collect/README.md)与[填写者文档](skills/safefill-fill/README.md)；两端共享的格式、输出契约、错误处置与交接话术以 [PROTOCOL.md](PROTOCOL.md) 为准——它是接口稳定性的单一事实源，协议变更先改它再改代码。
-
-## 仓库结构
-
-```text
-safefill/
-├── README.md
-├── skills/                  # 可安装的 Skill 集合
-│   ├── safefill-collect/       # 收集者 Skill，可独立安装
-│   │   ├── SKILL.md         # Agent 入口与权限边界
-│   │   ├── agents/          # Skill 界面元数据
-│   │   ├── scripts/         # 收集、解密校验与 Excel 导出
-│   │   └── references/      # 收集配置说明
-│   └── safefill-fill/        # 填写者 Skill，可独立安装
-│       ├── SKILL.md
-│       ├── agents/
-│       └── scripts/         # 保险柜、确认、OCR/VLM 与加密
-└── .github/
-```
-
-## 验证方式
-
-仓库包含合成数据回归套件和端到端门禁：
+[PROTOCOL.md](PROTOCOL.md) 是接口维护源，两个 Skill 的 `references/PROTOCOL.md` 是独立安装副本。另有 5 个共享脚本：`collection.py`、`config.py`、`ocr_matcher.py`、`openvino_runtime.py`、`secure_io.py`。修改共享内容后同步副本，`tests/check_skill_sync.py` 比对脚本和协议并检查 Skill 内部文档引用。
 
 ```bash
-# HR 侧：生成请求包
-$PY skills/safefill-collect/scripts/collector.py create-request --config collection.json --out tasks
-# 员工侧：暂存确认 → 精确匹配 → 提交确认 → 生成回执
-printf '%s' "$JSON" | $PY skills/safefill-fill/scripts/fill.py vault-stage --answers - --confirmation-out "$WORK/CHANGE.yintian-confirmation"   # $WORK 为 0700 目录
-$PY skills/safefill-fill/scripts/fill.py vault-apply --confirmation "$WORK/CHANGE.yintian-confirmation"
-$PY skills/safefill-fill/scripts/fill.py vault-preview tasks/<TASK_DIR>/REQUEST-<TASK_ID>.yintian-request --confirmation-out "$WORK/SUBMIT.yintian-confirmation"
-$PY skills/safefill-fill/scripts/fill.py vault-fill tasks/<TASK_DIR>/REQUEST-<TASK_ID>.yintian-request --confirmation "$WORK/SUBMIT.yintian-confirmation" --out-dir incoming
-# HR 侧：解密汇总
-$PY skills/safefill-collect/scripts/collector.py collect tasks/<TASK_DIR> incoming --out result.xlsx
-$PY -m pytest -q
+python tests/check_skill_sync.py
+python -m pytest -q
 ```
 
-普通提交由 `.github/workflows/tests.yml` 跑 Python 3.11–3.13 与跨平台矩阵。VLM 由使用者按所选模型自行安装和验证，不绑定仓库指定的模型或 revision。
+回归测试使用合成数据。文本路径在当前开发环境使用替身模型验证，尚未完成真实 OpenVINO GenAI 文本推理验证。自动测试验证协议与失败路径，不替代真实 Agent 交互、原有 HR 人工裁定及具体本地模型和设备的实际验证。仓库不得提交真实员工资料、密钥、保险柜、回执或导出结果。

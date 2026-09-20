@@ -1,13 +1,14 @@
 {
   "display_name": "SafeFill · 收集者",
-  "display_description": "生成 AI 信息请求包，收件后直接汇总 Excel",
-  "detail_describe": "HR 说明用途和字段，Agent 生成机器请求包并将员工加密回执汇总为 Excel",
+  "display_description": "生成机器请求包、验证回执并在本机汇总 Excel 与附件",
+  "detail_describe": "HR 说明收集需求，Agent 生成请求包，脚本验证签名及修订后本地导出 Excel 和附件；Agent 仅获得回执编号、计数、状态和结果路径，不读取员工明文",
   "name": "safefill-collect",
   "icon": "",
   "use_cases": [
-    "无需姓名名单生成 AI 信息请求包",
-    "员工回执一键解密校验并汇总 Excel"
+    "根据收集需求生成机器请求包，无需员工名单",
+    "验证签名与修订，避免乱序收件覆盖新值",
+    "本地汇总 Excel 和附件，按回执编号说明异常与补正"
   ],
   "author": "vc999999999",
-  "version": "5.0.0"
+  "version": "6.0.0"
 }
