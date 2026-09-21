@@ -35,15 +35,18 @@ def test_built_packages_install_without_repository_and_refuse_overwrite(tmp_path
 
 @pytest.mark.parametrize("member", ["../escape.py", "safefill-fill/../escape.py", "safefill-fill/C:/bad.py",
                                      "safefill-fill/scripts/CON", "safefill-fill/scripts\\bad.py"])
-def test_install_rejects_unsafe_members_before_writing(tmp_path, member):
+def test_install_rejects_unsafe_members_before_writing(tmp_path, monkeypatch, member):
     package = tmp_path / "bad.skill"
     with zipfile.ZipFile(package, "w") as archive:
         info = zipfile.ZipInfo()
         # Preserve malformed names; ZipInfo(member) normalizes backslashes on Windows.
         info.filename = member
         archive.writestr(info, "bad")
-    with pytest.raises(ValueError, match="package path"):
-        install.install(package, tmp_path / "destination", "fill", dependencies=False)
+    for separator in ("/", "\\"):
+        with monkeypatch.context() as patch:
+            patch.setattr(zipfile.os, "sep", separator)
+            with pytest.raises(ValueError, match="package path"):
+                install.install(package, tmp_path / "destination", "fill", dependencies=False)
     assert not (tmp_path / "destination").exists()
 
 

@@ -24,7 +24,8 @@ def install(package: Path, destination: Path, role: str, *, dependencies: bool =
         seen = set()
         for item in members:
             path = PurePosixPath(item.filename)
-            if (len(path.parts) < 2 or path.parts[0] != name or item.filename != path.as_posix()
+            if (item.orig_filename != item.filename or len(path.parts) < 2
+                    or path.parts[0] != name or item.filename != path.as_posix()
                     or any(not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", part)
                            or part.endswith(".") or PureWindowsPath(part).is_reserved() for part in path.parts)
                     or stat.S_ISLNK(item.external_attr >> 16)
