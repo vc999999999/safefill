@@ -62,6 +62,18 @@ python dist/install.py --role collect --dest ~/.codex/skills
 
 Windows 可用 `py -3.12 dist/install.py --role fill --dest "$env:USERPROFILE/.codex/skills"`。安装会创建所选 Skill 的独立 `.venv`、联网安装核心依赖并运行 `doctor`；已有同名目录则停止，避免覆盖用户修改。依赖安装失败会清理本次新建的该端目录，已成功安装的另一端保留。`--no-deps` 仅解包，适合宿主已提供依赖的情况。重载宿主 Skills 后使用；OCR、OpenVINO 模型仍按需单独安装，不增加云端接口或自动下载模型。
 
+### 下载来源与完整性校验
+
+项目源代码位于 [vc999999999/safefill](https://github.com/vc999999999/safefill)。预构建包从该仓库的 [tests 工作流](https://github.com/vc999999999/safefill/actions/workflows/tests.yml) 下载：选择 `main` 分支上由 `push` 触发且整轮成功的运行，核对其提交 SHA，再下载 `safefill-skills` artifact；不要把其他分支或 PR 的构建当作维护者发布。产物过期时，可检出选定提交并按上文自行打包。
+
+执行安装脚本前，在解压后的产物目录校验两个 `.skill` 包及 `install.py`，保留同一构建中的全部文件与 `SHA256SUMS`：
+
+- Linux：`sha256sum -c SHA256SUMS`。
+- macOS：`shasum -a 256 -c SHA256SUMS`。
+- Windows PowerShell：`Get-FileHash safefill-collect.skill,safefill-fill.skill,install.py -Algorithm SHA256`，将三个结果与 `Get-Content SHA256SUMS` 中对应文件的哈希逐一比较。
+
+文件缺失或哈希不符时停止安装，重新从同一构建下载。当前未提供包级数字签名；校验和只能发现内容不一致，不能抵御安装包与校验和同时被替换。来源信任依赖你核对的仓库、提交和构建渠道，不能仅凭转发文件附带的校验和确认发布者。
+
 ### 从源目录安装
 
 分别整体安装 `skills/safefill-collect` 或 `skills/safefill-fill`，不要只复制 `SKILL.md` 或把仓库根目录当作一个 Skill。每端已包含运行脚本和协议参考，不依赖另一端或仓库根文档。
@@ -103,6 +115,8 @@ python -m pytest -q
 ## 验证范围
 
 [版本 c963c3f 的 CI](https://github.com/vc999999999/safefill/actions/runs/35573285463) 已通过 Linux（Python 3.11、3.13）、macOS 与 Windows（Python 3.12）的回归、同步、静态与类型检查，以及打包和核心依赖安装验证。这是该版本的操作系统测试结果，不代表各宿主 Agent 已通过实测。
+
+安全证据目前属于项目自查与自动回归，不是独立第三方安全审计。可核对的测试包括[签名更正、乱序与隐私输出](tests/test_revision_privacy.py)、[输入与文件安全检查](tests/test_security.py)和[安装路径校验、拒绝覆盖及失败清理](tests/test_distribution.py)。这些检查只覆盖测试所列条件，不构成完整密码协议审计；跨语言互操作未验证，同一系统账户下的恶意 Agent 隔离不在当前保证范围内。
 
 | 范围 | 已有证据与限制 |
 |---|---|
