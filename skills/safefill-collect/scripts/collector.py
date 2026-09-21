@@ -18,7 +18,7 @@ import tempfile
 import warnings
 import zipfile
 from contextlib import closing, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -45,6 +45,7 @@ from collection import (
     aes_gcm_seal,
     atomic_write,
     canonical,
+    configure_cli_stdio,
     decrypt_private_key,
     dump_json,
     error_report,
@@ -111,7 +112,7 @@ def print_once_secret(heading: str, secret: str, footnote: str, *, stream=None) 
 
 def require_tty(action: str) -> None:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        raise RuntimeError(f"{action} 必须在交互终端中运行；TTY 检查不能证明该终端未被 Agent 控制。")
+        raise RuntimeError(f"TTY_REQUIRED: {action} 必须在交互终端中运行；TTY 检查不能证明该终端未被 Agent 控制。")
 
 
 def load_task(task_dir: str | Path) -> tuple[Path, dict[str, Any]]:
@@ -278,9 +279,17 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
 
     if not isinstance(config, dict):
         raise ValueError("CONFIG_INVALID: 配置必须是 JSON 对象")
-    for key in (*NOTICE_KEYS, "template_version", "fields"):
+    for key in ("purpose", "deadline", "contact", "fields"):
         if not config.get(key):
             raise ValueError(f"CONFIG_MISSING_FIELDS: 配置缺少必填项: {key}")
+    config = dict(config)
+    config.setdefault("title", config["purpose"])
+    config.setdefault("correction", "联系任务联系人后重新提交")
+    config.setdefault("template_version", "1.0")
+    if not config.get("retention_until") and explicit_timezone(config["deadline"]):
+        config["retention_until"] = (datetime.fromisoformat(config["deadline"]) + timedelta(days=30)).isoformat()
+    if isinstance(config["fields"], list) and not any(isinstance(f, dict) and f.get("id") == "name" for f in config["fields"]):
+        config["fields"] = [{"id": "name", "label": "姓名", "type": "text", "required": True}, *config["fields"]]
     for key in (*NOTICE_KEYS, "template_version"):
         if not isinstance(config[key], str) or len(config[key]) > MAX_VALUE_CHARS:
             raise ValueError(f"CONFIG_INVALID: 配置字段必须是长度不超过 {MAX_VALUE_CHARS} 的文本: {key}")
@@ -351,9 +360,6 @@ def create_request(config_path: Path, out_parent: Path) -> dict[str, Any]:
         atomic_write(root / "private.pem.enc", private_blob)
         request_path = root / f"REQUEST-{task_id}.yintian-request"
         dump_json(request_path, {"format": REQUEST_FORMAT_VERSION, "kind": "agent_request", "target_skill": "safefill-fill",
-                                 "expects": {"reply_format": SUBMISSION_FORMAT_VERSION, "reply_suffix": ".yintian",
-                                             "notice_format": NOTICE_FORMAT_VERSION,
-                                             "delivery": "员工本人将 .yintian 回执文件发回发放方；勿代发"},
                                  **task, "public_key_pem": public_pem.decode("ascii")})
         init_db(root)
         saved_secret_path = save_local_task_secret(root, task_id, local_secret)
@@ -408,9 +414,9 @@ def ingest_task(task_dir: str | Path, submissions_dir: str | Path, recursive: bo
             db.execute("SAVEPOINT receive_one")
             try:
                 if not path.is_file() or path.is_symlink():
-                    raise ValueError("提交项不是普通文件")
+                    raise ValueError("SUBMISSION_REJECTED: 提交项不是普通文件")
                 if path.stat().st_size > MAX_ENVELOPE_BYTES:
-                    raise ValueError("提交包超过 32MB 上限")
+                    raise ValueError("SUBMISSION_REJECTED: 提交包超过 32MB 上限")
                 raw = secure_io.read_bytes(path, MAX_ENVELOPE_BYTES)
                 digest = sha256_bytes(raw)
                 envelope = json.loads(raw)
@@ -504,7 +510,7 @@ def unlock_private_key(root: Path, task: dict[str, Any]):
 
     data = secure_io.read_bytes(root / "private.pem.enc", 128 * 1024)
     if not valid_private_key_blob(data):
-        raise ValueError("私钥文件不是 yintian-key/1 信封，拒绝解锁")
+        raise ValueError("LOCAL_KEY_INVALID: 私钥文件不是 yintian-key/1 信封，拒绝解锁")
     private_der = decrypt_private_key(json.loads(data), load_local_task_secret(root, task["task_id"]))
     return serialization.load_der_private_key(private_der, password=None)
 
@@ -517,25 +523,25 @@ def decrypt_envelope(root: Path, task: dict[str, Any], path: Path, private_key, 
     path = secure_io.checked_path(path, root)
     submissions_root = secure_io.checked_path(root / "submissions", root)
     if submissions_root not in path.parents or not path.is_file():
-        raise ValueError("提交路径不在任务 submissions 目录内")
+        raise ValueError("CIPHERTEXT_CHANGED: 提交路径不在任务 submissions 目录内")
     envelope = load_json(path)
     invite_id = validate_envelope_header(envelope, task)
     if invite_id != expected_invite_id:
-        raise ValueError("提交包与数据库记录不匹配")
+        raise ValueError("CIPHERTEXT_CHANGED: 提交包与数据库记录不匹配")
     encrypted_key = base64.b64decode(envelope["encrypted_key_b64"], validate=True)
     aes_key = private_key.decrypt(encrypted_key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
     plaintext = AESGCM(aes_key).decrypt(base64.b64decode(envelope["iv_b64"], validate=True), base64.b64decode(envelope["ciphertext_b64"], validate=True), aad_for(envelope))
     payload = json.loads(plaintext)
     if not isinstance(payload, dict):
-        raise ValueError("解密载荷必须是对象")
+        raise ValueError("PAYLOAD_INVALID: 解密载荷必须是对象")
     payload_fields = {"format_version", "task_id", "invite_id", "schema_hash", "revision", "notice_hash", "template_version", "submitted_at", "consent_confirmed", "values", "attachments"}
     if set(payload) - payload_fields:
-        raise ValueError("解密载荷包含协议外字段")
+        raise ValueError("PAYLOAD_INVALID: 解密载荷包含协议外字段")
     if type(payload.get("revision")) is not int:
         raise ValueError("REVISION_INVALID: 解密载荷更正序号无效")
     for key in ("format_version", "task_id", "invite_id", "schema_hash", "revision"):
         if payload.get(key) != envelope[key]:
-            raise ValueError(f"解密载荷 {key} 与外层不一致")
+            raise ValueError(f"PAYLOAD_INVALID: 解密载荷 {key} 与外层不一致")
     return payload
 
 
@@ -799,7 +805,7 @@ def collect_task(task_dir: str | Path, submissions_dir: str | Path, out: str | P
     root, task = load_task(task_dir)
     out_path = secure_io.checked_path(out).with_suffix(".xlsx")
     if out_path == root or root in out_path.parents:
-        raise ValueError("导出路径不能位于任务目录内")
+        raise ValueError("OUTPUT_PATH_INVALID: 导出路径不能位于任务目录内")
     attachment_fields = [field for field in task["fields"] if field["type"] in ATTACHMENT_TYPES]
     attachment_target = out_path.with_name(out_path.stem + "-attachments")
     if out_path.exists():
@@ -980,10 +986,10 @@ def cmd_notice(args) -> dict[str, Any]:
     root, task = load_task(args.task_dir)
     invite_id = args.invite_id
     if not OPEN_INVITE_ID_RE.fullmatch(invite_id):
-        raise ValueError("回执编号格式无效")
+        raise ValueError("INVITE_ID_INVALID: 回执编号格式无效")
     row = next((item for item in progress_rows(root) if item["invite_id"] == invite_id), None)
     if row is None:
-        raise ValueError(f"任务中不存在回执编号: {invite_id}")
+        raise ValueError(f"INVITE_NOT_FOUND: 任务中不存在回执编号: {invite_id}")
     reasons = list(row["missing_fields"]) + list(row["conflict_fields"])
     if row["status"] in PASSED_STATES:
         next_action = "回执已通过校验；如需退回请先在终端运行 decide --action return，再重新生成通知"
@@ -1044,11 +1050,11 @@ def build_task_package(task_dir) -> tuple[bytes, dict[str, Any]]:
         request_files = sorted(root.glob("REQUEST*.yintian-request"))
         candidates = [root / name for name in sorted(PACKAGE_REQUIRED_FILES) if name != "REQUEST.yintian-request"]
         if any(not path.is_file() for path in candidates) or len(request_files) != 1:
-            raise ValueError("任务目录缺少必要文件")
+            raise ValueError("TASK_INVALID: 任务目录缺少必要文件")
         candidates += request_files
         candidates += list((root / "submissions").glob("*/*.yintian"))
         if len(candidates) + 1 > MAX_PACKAGE_FILES:
-            raise ValueError("任务内容超过交接包安全上限")
+            raise ValueError("TASK_PACKAGE_LIMIT: 任务内容超过交接包安全上限")
         data, total = {}, 0
         for path in sorted(candidates):
             if path.name == "state.sqlite3":
@@ -1059,13 +1065,13 @@ def build_task_package(task_dir) -> tuple[bytes, dict[str, Any]]:
                 raw = secure_io.read_bytes(path, MAX_PACKAGE_MEMBER_BYTES)
             total += len(raw)
             if len(raw) > MAX_PACKAGE_MEMBER_BYTES or total > MAX_PACKAGE_BYTES:
-                raise ValueError("任务内容超过交接包安全上限")
+                raise ValueError("TASK_PACKAGE_LIMIT: 任务内容超过交接包安全上限")
             member = "REQUEST.yintian-request" if path in request_files else path.relative_to(root).as_posix()
             data[member] = raw
         raw = load_local_task_secret(root, task["task_id"]).encode("ascii")
         total += len(raw)
         if total > MAX_PACKAGE_BYTES:
-            raise ValueError("任务内容超过交接包安全上限")
+            raise ValueError("TASK_PACKAGE_LIMIT: 任务内容超过交接包安全上限")
         data["local-open-key"] = raw
         metadata = {"package_version": TASK_PACKAGE_VERSION, "task_id": task["task_id"], "created_at": now_iso(),
                     "manifest": {name: sha256_bytes(raw) for name, raw in data.items()}}
@@ -1089,7 +1095,7 @@ def export_task(task_dir: str | Path, out: str | Path, handoff_password: str | N
     envelope["task_id"] = task["task_id"]
     out_path = secure_io.checked_path(out)
     if out_path == root or root in out_path.parents:
-        raise ValueError("导出路径不能位于任务目录内")
+        raise ValueError("OUTPUT_PATH_INVALID: 导出路径不能位于任务目录内")
     secure_io.atomic_write(out_path, canonical(envelope), overwrite=False)
     return {**info, "out": str(out_path), "handoff_password": password}
 
@@ -1121,22 +1127,22 @@ def read_package_member(archive: zipfile.ZipFile, name: str, remaining: int) -> 
                 return bytes(data)
             data += chunk
             if len(data) > MAX_PACKAGE_MEMBER_BYTES or len(data) > remaining:
-                raise ValueError("任务包解压后超过安全上限")
+                raise ValueError("TASK_PACKAGE_LIMIT: 任务包解压后超过安全上限")
 
 
 def open_task_package(package_path: Path, handoff_password: str | None = None) -> zipfile.ZipFile:
     """解密 yintian-task/3 交接信封并返回其中的 ZIP；先按 stat 尺寸拒绝超限文件，再解密认证。"""
     if package_path.stat().st_size > MAX_PACKAGE_ENVELOPE_BYTES:
-        raise ValueError("交接包信封超过 200MB 安全上限，拒绝读取")
+        raise ValueError("TASK_PACKAGE_LIMIT: 交接包信封超过 200MB 安全上限，拒绝读取")
     try:
         envelope = json.loads(package_path.read_bytes())
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise ValueError("交接包信封无效") from exc
+        raise ValueError("TASK_PACKAGE_INVALID: 交接包信封无效") from exc
     if not isinstance(envelope, dict) or envelope.get("format") != ENCRYPTED_TASK_PACKAGE_VERSION:
-        raise ValueError("交接包格式不受支持")
+        raise ValueError("TASK_PACKAGE_INVALID: 交接包格式不受支持")
     task_id = envelope.get("task_id")
     if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
-        raise ValueError("交接包 task_id 无效")
+        raise ValueError("TASK_PACKAGE_INVALID: 交接包 task_id 无效")
     password = handoff_password
     if password is None:
         try:
@@ -1148,44 +1154,44 @@ def open_task_package(package_path: Path, handoff_password: str | None = None) -
     try:
         zip_bytes = aes_gcm_open(envelope, password, task_package_aad(task_id))
     except Exception as exc:
-        raise ValueError("交接密码错误或交接包已被篡改，拒绝导入") from exc
+        raise ValueError("TASK_PACKAGE_UNLOCK_FAILED: 交接密码错误或交接包已被篡改，拒绝导入") from exc
     return zipfile.ZipFile(io.BytesIO(zip_bytes))
 
 
 def import_task(package: str | Path, out_parent: str | Path, handoff_password: str | None = None) -> dict[str, Any]:
     package_path, parent = secure_io.checked_path(package), secure_io.checked_path(out_parent)
     if package_path.stat().st_size > MAX_PACKAGE_BYTES:
-        raise ValueError("任务包超过安全上限")
+        raise ValueError("TASK_PACKAGE_LIMIT: 任务包超过安全上限")
     with open_task_package(package_path, handoff_password) as archive:
         if "package.json" not in archive.namelist():
-            raise ValueError("任务包缺少清单")
+            raise ValueError("TASK_PACKAGE_INVALID: 任务包缺少清单")
         package_info = archive.getinfo("package.json")
         if package_info.file_size > 1024 * 1024:
-            raise ValueError("任务包清单过大")
+            raise ValueError("TASK_PACKAGE_LIMIT: 任务包清单过大")
         metadata = json.loads(read_package_member(archive, "package.json", 1024 * 1024))
         task_id = metadata.get("task_id")
         if metadata.get("package_version") != TASK_PACKAGE_VERSION or not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
-            raise ValueError("任务包格式无效")
+            raise ValueError("TASK_PACKAGE_INVALID: 任务包格式无效")
         raw_manifest = metadata.get("manifest")
         if not isinstance(raw_manifest, dict) or len(raw_manifest) > MAX_PACKAGE_FILES:
-            raise ValueError("任务包清单无效或文件过多")
+            raise ValueError("TASK_PACKAGE_INVALID: 任务包清单无效或文件过多")
         manifest: dict[str, str] = {}
         for rel, expected_hash in raw_manifest.items():
             if not isinstance(rel, str) or not rel or not isinstance(expected_hash, str) or ":" in rel or "\\" in rel:
-                raise ValueError("任务包包含不安全路径")
+                raise ValueError("TASK_PACKAGE_INVALID: 任务包包含不安全路径")
             rel_path = PurePosixPath(rel)
             if rel_path.is_absolute() or ".." in rel_path.parts:
-                raise ValueError("任务包包含不安全路径")
+                raise ValueError("TASK_PACKAGE_INVALID: 任务包包含不安全路径")
             parts = rel_path.parts
             allowed = (
                 rel in PACKAGE_REQUIRED_FILES or rel == "local-open-key"
                 or (len(parts) == 3 and parts[0] == "submissions" and OPEN_INVITE_ID_RE.fullmatch(parts[1]) and re.fullmatch(r"v\d{4,}_[0-9a-f]{12}\.yintian", parts[2]))
             )
             if not allowed or rel in manifest:
-                raise ValueError("任务包包含不允许或重复的文件")
+                raise ValueError("TASK_PACKAGE_INVALID: 任务包包含不允许或重复的文件")
             manifest[rel] = expected_hash
         if not (PACKAGE_REQUIRED_FILES | {"local-open-key"}).issubset(manifest):
-            raise ValueError("任务包缺少必要文件")
+            raise ValueError("TASK_PACKAGE_INVALID: 任务包缺少必要文件")
         target = parent / task_id
         if target.exists():
             raise FileExistsError(f"目标任务已存在: {target}")
@@ -1193,14 +1199,14 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
         names = set()
         for info in archive.infolist():
             if "\\" in info.filename or info.filename in names:
-                raise ValueError("任务包包含不安全或重复的条目")
+                raise ValueError("TASK_PACKAGE_INVALID: 任务包包含不安全或重复的条目")
             names.add(info.filename)
         expected_names = {expected_prefix + rel for rel in manifest}
         if names != expected_names | {"package.json"}:
-            raise ValueError("任务包文件不完整或包含额外条目")
+            raise ValueError("TASK_PACKAGE_INVALID: 任务包文件不完整或包含额外条目")
         infos = [archive.getinfo(name) for name in expected_names]
         if any(info.file_size > MAX_PACKAGE_MEMBER_BYTES for info in infos) or sum(info.file_size for info in infos) > MAX_PACKAGE_BYTES:
-            raise ValueError("任务包解压后超过安全上限")
+            raise ValueError("TASK_PACKAGE_LIMIT: 任务包解压后超过安全上限")
         target.mkdir(parents=True, mode=0o700)
         imported_secret_path = None
         try:
@@ -1209,18 +1215,18 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
             for rel, expected_hash in manifest.items():
                 destination = (target.joinpath(*PurePosixPath(rel).parts)).resolve()
                 if target != destination and target not in destination.parents:
-                    raise ValueError("任务包包含越界路径")
+                    raise ValueError("TASK_PACKAGE_INVALID: 任务包包含越界路径")
                 data = read_package_member(archive, expected_prefix + rel, MAX_PACKAGE_BYTES - total_size)
                 total_size += len(data)
                 if sha256_bytes(data) != expected_hash:
-                    raise ValueError(f"任务包哈希不匹配: {rel}")
+                    raise ValueError(f"TASK_PACKAGE_INVALID: 任务包哈希不匹配: {rel}")
                 if rel == "local-open-key":
                     open_secret = data
                 else:
                     atomic_write(destination, data)
             _, imported_task = load_task(target)
             if imported_task["task_id"] != task_id:
-                raise ValueError("任务包内外 task_id 不一致")
+                raise ValueError("TASK_PACKAGE_INVALID: 任务包内外 task_id 不一致")
             canonical_request = target / "REQUEST.yintian-request"
             if canonical_request.is_file():
                 canonical_request.rename(target / f"REQUEST-{task_id}.yintian-request")
@@ -1236,10 +1242,10 @@ def import_task(package: str | Path, out_parent: str | Path, handoff_password: s
             public_key = serialization.load_pem_public_key((target / "public.pem").read_bytes())
             public_der = public_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
             if hashlib.sha256(public_der).hexdigest()[:24] != imported_task["key_id"]:
-                raise ValueError("任务包密钥材料无效")
+                raise ValueError("TASK_PACKAGE_INVALID: 任务包密钥材料无效")
             private_der = unlock_private_key(target, imported_task).public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
             if not secrets.compare_digest(private_der, public_der):
-                raise ValueError("任务包公私钥不匹配")
+                raise ValueError("TASK_PACKAGE_INVALID: 任务包公私钥不匹配")
             with task_lock(target):
                 pass
         except Exception:
@@ -1262,10 +1268,10 @@ def cmd_purge(args) -> dict[str, Any]:
     require_tty("purge")
     root, task = load_task(args.task_dir)
     if not task_expired(task) and not args.allow_early:
-        raise RuntimeError("任务尚未到保存期限；如确需提前删除，请增加 --allow-early")
+        raise RuntimeError("TASK_NOT_EXPIRED: 任务尚未到保存期限；如确需提前删除，请增加 --allow-early")
     typed = input(f"输入任务 ID {task['task_id']} 以确认删除任务目录: ").strip()
     if typed != task["task_id"]:
-        raise RuntimeError("任务 ID 不匹配，已取消")
+        raise RuntimeError("CANCELLED: 任务 ID 不匹配，已取消")
     parent = root.parent
     local_secret = local_task_secret_path(root, task["task_id"])
     with task_lock(root):
@@ -1329,14 +1335,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    configure_cli_stdio()
     parser = build_parser()
     args = parser.parse_args()
     try:
         result = args.func(args)
         if result is not None:
-            print(json.dumps({"ok": True, **result} if isinstance(result, dict) else result, ensure_ascii=False, indent=2))
+            print(json.dumps({"ok": True, **result} if isinstance(result, dict) else result, ensure_ascii=False, separators=(",", ":")))
     except Exception as exc:
-        print(json.dumps(error_report(exc), ensure_ascii=False, indent=2), file=sys.stderr)
+        print(json.dumps(error_report(exc), ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
         raise SystemExit(1)
 
 

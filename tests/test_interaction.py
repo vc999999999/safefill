@@ -165,9 +165,9 @@ def test_collect_reports_rejections_late_and_duplicate_name_groups(tmp_path, iso
         reply = run(["vault-fill", str(request), "--fresh", "--confirmation", str(confirmation), "--out-dir", str(incoming)])
         receipt_ids.append(reply["invite_id"])
     (incoming / "坏掉-XXXXXX.yintian").write_text(json.dumps({
-        "format_version": collection.SUBMISSION_FORMAT_VERSION, "task_id": json.loads(request.read_text())["task_id"],
-        "invite_id": "OPEN-AAAAAAAAAAAAAAAA", "schema_hash": json.loads(request.read_text())["schema_hash"],
-        "key_id": json.loads(request.read_text())["key_id"],
+        "format_version": collection.SUBMISSION_FORMAT_VERSION, "task_id": json.loads(request.read_text(encoding="utf-8"))["task_id"],
+        "invite_id": "OPEN-AAAAAAAAAAAAAAAA", "schema_hash": json.loads(request.read_text(encoding="utf-8"))["schema_hash"],
+        "key_id": json.loads(request.read_text(encoding="utf-8"))["key_id"],
         "algorithms": {"content": "AES-256-GCM", "key_wrap": "RSA-OAEP-3072-SHA256"},
         "encrypted_key_b64": "AAAA", "iv_b64": "AAAA", "ciphertext_b64": "AAAA"}), encoding="utf-8")
 
@@ -205,8 +205,72 @@ def test_error_report_extracts_code():
     assert report["ok"] is False and report["error"] == "CONFIRMATION_STALE"
     assert "重新预览" in report["message"] and "PRIVATE_VALUE_13800138000" not in json.dumps(report)
     missing = collection.error_report(FileNotFoundError("PRIVATE_ATTACHMENT_NAME.pdf"))
-    assert missing["error"] == "FileNotFoundError"
+    assert missing["error"] == "PATH_MISSING"
     assert "PRIVATE_ATTACHMENT_NAME" not in json.dumps(missing)
+
+
+def test_every_raised_code_has_static_message_and_no_bare_raises():
+    """每个带前缀的错误码都要有静态说明；脚本对外 raise 必须带错误码，否则 Agent 只会收到异常类名。"""
+    import re
+    scripts = [*SCRIPTS.glob("*.py"), *COLLECT_SCRIPTS.glob("*.py")]
+    source = "\n".join(p.read_text(encoding="utf-8") for p in scripts)
+    raised = set(re.findall(r'(?:Error|Unavailable)\(f?"([A-Z][A-Z0-9_]+):', source))
+    for code in raised:
+        report = collection.error_report(RuntimeError(f"{code}: PRIVATE_DETAIL"))
+        assert report["error"] == code and "PRIVATE_DETAIL" not in report["message"], code
+    generic = collection.error_report(RuntimeError("no code"))["message"]
+    assert all(collection.error_report(RuntimeError(f"{c}: x"))["message"] != generic for c in raised)
+    bare = [(p.name, m.group(0)) for p in scripts for m in re.finditer(
+        r'raise (FillError|VlmUnavailable)\(f?"[^A-Z]', p.read_text(encoding="utf-8"))]
+    assert bare == []
+    for exc, code in ((NotADirectoryError("x"), "PATH_MISSING"), (PermissionError("x"), "PERMISSION_DENIED"),
+                      (FileExistsError("x"), "OUTPUT_EXISTS"), (OSError("x"), "IO_ERROR")):
+        assert collection.error_report(exc)["error"] == code
+
+
+def test_cli_errors_carry_protocol_codes(tmp_path, isolated_vault, capsys):
+    assert fill.main(["inspect", str(tmp_path / "missing.yintian-request")]) == 1
+    assert json.loads(capsys.readouterr().err)["error"] == "REQUEST_MISSING"
+    bad = tmp_path / "bad.yintian-request"
+    bad.write_text("garbage", encoding="utf-8")
+    assert fill.main(["inspect", str(bad)]) == 1
+    assert json.loads(capsys.readouterr().err)["error"] == "REQUEST_INVALID"
+    _, request, task_dir = make_request(tmp_path, [NAME])
+    args = collector.build_parser().parse_args(
+        ["notice", str(task_dir), "OPEN-" + "0" * 32, "--out", str(tmp_path / "n.yintian-notice")])
+    with pytest.raises(ValueError, match="INVITE_NOT_FOUND"):
+        args.func(args)
+    args.invite_id = "OPEN-short"
+    with pytest.raises(ValueError, match="INVITE_ID_INVALID"):
+        args.func(args)
+    with pytest.raises(NotADirectoryError):
+        collector.ingest_task(task_dir, tmp_path / "no_inbox")
+
+
+def test_create_request_fills_documented_defaults(tmp_path):
+    config = {"purpose": "团建订票", "deadline": "2098-12-31T18:00:00+08:00", "contact": "hr@example.com",
+              "fields": [{"id": "phone", "label": "本人手机号", "type": "phone_cn", "required": True}]}
+    result = collector.validate_config(config)
+    assert result["title"] == "团建订票" and result["template_version"] == "1.0" and result["correction"]
+    assert result["retention_until"] == "2099-01-30T18:00:00+08:00"
+    assert result["fields"][0]["type"] == "text" and result["fields"][0]["required"] is True
+    assert [f["id"] for f in result["fields"]] == ["name", "phone"]
+    assert "name" not in json.dumps(config["fields"])  # 不改写调用方对象
+    with pytest.raises(ValueError, match="CONFIG_MISSING_FIELDS"):
+        collector.validate_config({"purpose": "x", "deadline": "2098-12-31T18:00:00+08:00", "fields": [NAME]})
+    with pytest.raises(ValueError, match="SCHEMA_INVALID"):
+        collector.validate_config({**config, "fields": [{"id": "name", "label": "姓名", "type": "text", "required": False}]})
+
+
+def test_inspect_and_request_omit_static_boilerplate(tmp_path, isolated_vault):
+    _, request, _ = make_request(tmp_path, [NAME, {"id": "room_type", "label": "房型", "type": "text"}])
+    assert "expects" not in json.loads(request.read_text(encoding="utf-8"))
+    info = run(["inspect", str(request)])
+    assert not {"verify_hint", "expects", "key_id"} & set(info) and info["key_id_match"] is True
+    stage(tmp_path, {"name": {"type": "text", "label": "姓名", "value": "张三"},
+                     "hobby": {"type": "text", "label": "爱好", "value": "跑步"}})
+    status = run(["vault-status", "--request", str(request)])
+    assert status["missing"] == ["room_type"] and status["same_type_entries"] == {}
 
 
 def test_expired_message_names_retention_and_next_step():

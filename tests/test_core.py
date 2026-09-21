@@ -135,7 +135,7 @@ def test_skill_runs_with_only_its_own_directory_outside_repository(skill_name, e
         environment = {key: value for key, value in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}}
         result = subprocess.run(
             [sys.executable, str(package / "scripts" / entrypoint), "--help"],
-            cwd=outside, env=environment, capture_output=True, text=True, timeout=30,
+            cwd=outside, env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30,
         )
         assert result.returncode == 0, result.stderr
         assert "usage:" in result.stdout.lower()
@@ -146,7 +146,7 @@ def test_fill_can_diagnose_missing_dependencies(tmp_path):
                                    "--key-file", str(tmp_path / "keys" / "key")]):
         result = subprocess.run(
             [sys.executable, "-S", str(SCRIPTS / "fill.py"), *arguments],
-            cwd=tmp_path, capture_output=True, text=True, timeout=30,
+            cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", timeout=30,
         )
         assert result.returncode == 0, result.stderr
         if arguments[0] == "doctor":

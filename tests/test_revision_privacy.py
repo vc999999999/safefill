@@ -272,13 +272,21 @@ import ctypes, os, sys
 sys.path.insert(0, {str(scripts)!r})
 from collection import suppress_private_output
 runtime = ctypes.CDLL("ucrtbase" if os.name == "nt" else None)
-runtime.printf.argtypes = [ctypes.c_char_p]
+fdopen = runtime._fdopen if os.name == "nt" else runtime.fdopen
+fdopen.argtypes = [ctypes.c_int, ctypes.c_char_p]
+fdopen.restype = ctypes.c_void_p
+stream = fdopen(1, b"wb")
+assert stream
+runtime.fwrite.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p]
+runtime.fwrite.restype = ctypes.c_size_t
 runtime.fflush.argtypes = [ctypes.c_void_p]
 with suppress_private_output():
-    runtime.printf(b"PRIVATE_BUFFER_NORMAL")
+    raw = b"PRIVATE_BUFFER_NORMAL"
+    assert runtime.fwrite(raw, 1, len(raw), stream) == len(raw)
 try:
     with suppress_private_output():
-        runtime.printf(b"PRIVATE_BUFFER_FAILURE")
+        raw = b"PRIVATE_BUFFER_FAILURE"
+        assert runtime.fwrite(raw, 1, len(raw), stream) == len(raw)
         raise RuntimeError("synthetic failure")
 except RuntimeError:
     pass

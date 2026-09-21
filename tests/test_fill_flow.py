@@ -171,7 +171,7 @@ def test_registry_records_submission_and_reuses_invite_id(tmp_path, isolated_vau
     vault_dir = Path(os.environ["YINTIAN_VAULT_DIR"])
     records = vault.load_registry(vault_dir)
     assert [record["invite_id"] for record in records] == [first["invite_id"]]
-    assert records[0]["task_id"] == json.loads(request.read_text())["task_id"]
+    assert records[0]["task_id"] == json.loads(request.read_text(encoding="utf-8"))["task_id"]
     assert records[0]["path"] == first["out"]
 
     preview_path = work / "s2.yintian-confirmation"
@@ -317,9 +317,10 @@ def test_receipt_inspect_reads_header_and_registry(tmp_path, isolated_vault):
         run(["receipt-inspect", str(request)])
 
 
-def test_inspect_includes_verify_hint(tmp_path, isolated_vault):
+def test_inspect_omits_static_boilerplate(tmp_path, isolated_vault):
     request, _task_dir = make_request(tmp_path, [
         {"id": "name", "label": "姓名", "type": "text", "required": True, "sensitive": True},
     ])
     info = run(["inspect", str(request)])
-    assert "key_fingerprint" in info["verify_hint"] or "task_id" in info["verify_hint"]
+    assert info["key_id_match"] is True and len(info["key_fingerprint"]) == 24
+    assert not {"verify_hint", "expects", "key_id"} & set(info)

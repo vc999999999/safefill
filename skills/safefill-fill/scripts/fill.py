@@ -34,7 +34,7 @@ class FillError(Exception):
 def _bootstrap_repo_scripts() -> None:
     scripts = Path(__file__).resolve().parent
     if not all((scripts / name).is_file() for name in ('collection.py', 'ocr_matcher.py', 'secure_io.py', 'vault.py')):
-        raise RuntimeError("填写者 Skill 安装不完整，请重新复制整个 safefill-fill 文件夹")
+        raise RuntimeError("INSTALL_INCOMPLETE: 填写者 Skill 安装不完整，请重新复制整个 safefill-fill 文件夹")
     if str(scripts) not in sys.path:
         sys.path.insert(0, str(scripts))
 
@@ -60,14 +60,14 @@ def load_form(form_path: str | Path) -> dict[str, Any]:
     """读取机器请求包并做完整性校验；不修改文件。"""
     path = secure_io.checked_path(form_path)
     if not path.is_file():
-        raise FillError(f"信息请求包不存在: {form_path}")
+        raise FillError(f"REQUEST_MISSING: 信息请求包不存在: {form_path}")
     try:
         request_bytes = secure_io.read_bytes(path, 1024 * 1024)
         form = json.loads(request_bytes)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise FillError("信息请求包不是有效 JSON") from exc
+        raise FillError("REQUEST_INVALID: 信息请求包不是有效 JSON") from exc
     if not isinstance(form, dict) or form.get("format") != OPEN_REQUEST_FORMAT:
-        raise FillError("不是受支持的 SafeFill 机器请求包")
+        raise FillError("REQUEST_INVALID: 不是受支持的 SafeFill 机器请求包")
     if form.get("kind") != "agent_request" or form.get("target_skill") != "safefill-fill":
         raise FillError("OPEN_REQUEST_INVALID: 不是发给 safefill-fill 的 Agent 请求包")
     if form.get("format_version") != collection.SUBMISSION_FORMAT_VERSION:
@@ -77,12 +77,12 @@ def load_form(form_path: str | Path) -> dict[str, Any]:
         raise FillError("OPEN_REQUEST_INVALID: 请求包不应包含个人身份或邀请信息")
     missing = [key for key in REQUIRED_REQUEST_KEYS if not form.get(key)]
     if missing:
-        raise FillError(f"信息请求包缺少必要字段: {', '.join(missing)}")
+        raise FillError(f"REQUEST_INVALID: 信息请求包缺少必要字段: {', '.join(missing)}")
     for key in (*NOTICE_KEYS, "template_version"):
         if not isinstance(form[key], str) or len(form[key]) > collection.MAX_VALUE_CHARS:
             raise FillError(f"FORM_INVALID: {key} 必须是长度受限的文本")
     if not collection.TASK_ID_RE.fullmatch(str(form["task_id"])):
-        raise FillError("信息请求包 task_id 无效")
+        raise FillError("REQUEST_INVALID: 信息请求包 task_id 无效")
     if not isinstance(form["public_key_pem"], str):
         raise FillError("FORM_INVALID: public_key_pem 必须是文本")
     if not re.fullmatch(r"[0-9a-f]{24}", str(form["key_id"])) or any(not re.fullmatch(r"[0-9a-f]{64}", str(form[key])) for key in ("schema_hash", "notice_hash")):
@@ -94,10 +94,10 @@ def load_form(form_path: str | Path) -> dict[str, Any]:
     except ValueError as exc:
         raise FillError(f"FORM_INVALID: {exc}") from exc
     if collection.sha256_bytes(collection.canonical(fields)) != form["schema_hash"]:
-        raise FillError("字段清单与 schema_hash 不匹配，文件可能被篡改，请向发放人重新索取")
+        raise FillError("REQUEST_TAMPERED: 字段清单与 schema_hash 不匹配，文件可能被篡改，请向发放人重新索取")
     notice = {key: form[key] for key in NOTICE_KEYS}
     if collection.sha256_bytes(collection.canonical(notice)) != form["notice_hash"]:
-        raise FillError("告知内容与 notice_hash 不匹配，文件可能被篡改，请向发放人重新索取")
+        raise FillError("REQUEST_TAMPERED: 告知内容与 notice_hash 不匹配，文件可能被篡改，请向发放人重新索取")
     try:
         fingerprint = _public_key_fingerprint(form["public_key_pem"])
     except Exception as exc:
@@ -111,7 +111,6 @@ def load_form(form_path: str | Path) -> dict[str, Any]:
 def inspect_info(form: dict[str, Any]) -> dict[str, Any]:
     info = {
         "task_id": form["task_id"],
-        "key_id": form["key_id"],
         "key_fingerprint": form["_key_fingerprint"],
         "key_id_match": form["_key_fingerprint"] == form["key_id"],
         **{key: form[key] for key in NOTICE_KEYS},
@@ -131,11 +130,7 @@ def inspect_info(form: dict[str, Any]) -> dict[str, Any]:
         ],
         "past_deadline": collection.task_late(form, collection.now_iso()),
         "expired": collection.task_expired(form),
-        "verify_hint": "请与发放方核对 task_id 尾 6 位与 key_fingerprint 一致后再填写，不一致立即停手并联系 contact",
     }
-    expects = form.get("expects")
-    if isinstance(expects, dict):
-        info["expects"] = expects
     if not info["key_id_match"]:
         info["stop_reason"] = "KEY_MISMATCH: 请求包内公钥与 key_id 不一致，文件可能被替换，请勿填写并联系发放人"
     elif info["expired"]:
@@ -168,12 +163,12 @@ def extract_ocr_fields(path: Path) -> dict[str, Any]:
 
 def _resolve_attachment(raw: Any) -> Path:
     if not isinstance(raw, str) or not raw.strip():
-        raise FillError("附件路径无效（answers 的附件值应为文件路径字符串或字符串数组）")
+        raise FillError("ATTACHMENT_INVALID: 附件路径无效（answers 的附件值应为文件路径字符串或字符串数组）")
     if ".." in PurePosixPath(raw.replace("\\", "/")).parts:
-        raise FillError(f"附件路径不允许包含 ..: {raw}")
+        raise FillError(f"ATTACHMENT_INVALID: 附件路径不允许包含 ..: {raw}")
     path = secure_io.checked_path(raw)
     if not path.is_file():
-        raise FillError(f"附件文件不存在: {raw}")
+        raise FillError(f"ATTACHMENT_MISSING: 附件文件不存在: {raw}")
     return path
 
 
@@ -196,9 +191,9 @@ def _check_values(form: dict[str, Any], values: Any) -> tuple[dict[str, str], li
     """逐字段确定性校验，规则与收集端 validate_payload 完全一致；返回归一化值与全部问题。"""
     problems: list[str] = []
     if not isinstance(values, dict):
-        raise FillError("values 必须是 {字段id: 值} 对象")
+        raise FillError("VALUES_INVALID: values 必须是 {字段id: 值} 对象")
     if len(values) > collection.MAX_FIELDS:
-        raise FillError("values 字段数量超过安全上限")
+        raise FillError("VALUES_INVALID: values 字段数量超过安全上限")
     labels = {field["id"]: field["label"] for field in form["fields"]}
     allowed_ids = {field["id"] for field in form["fields"] if field["type"] not in collection.ATTACHMENT_TYPES}
     unknown_ids = set(values) - allowed_ids
@@ -206,7 +201,7 @@ def _check_values(form: dict[str, Any], values: Any) -> tuple[dict[str, str], li
     try:
         collection.validate_scalar_values({key: value for key, value in values.items() if key in allowed_ids}, allowed_ids)
     except ValueError as exc:
-        raise FillError(str(exc)) from exc
+        raise FillError(f"VALUES_INVALID: {exc}") from exc
     normalized: dict[str, str] = {}
     for field in form["fields"]:
         field_id, field_type = field["id"], field["type"]
@@ -231,7 +226,7 @@ def _check_values(form: dict[str, Any], values: Any) -> tuple[dict[str, str], li
 def _build_attachments(form: dict[str, Any], specs: Any) -> tuple[dict[str, list], list[str]]:
     problems: list[str] = []
     if not isinstance(specs, dict):
-        raise FillError("attachments 必须是 {字段id: 文件路径} 对象")
+        raise FillError("ATTACHMENTS_INVALID: attachments 必须是 {字段id: 文件路径} 对象")
     attachment_fields = {field["id"]: field for field in form["fields"] if field["type"] in collection.ATTACHMENT_TYPES}
     for key in specs:
         if key not in attachment_fields:
@@ -243,7 +238,7 @@ def _build_attachments(form: dict[str, Any], specs: Any) -> tuple[dict[str, list
         raw_spec = specs.get(field_id, [])
         raws = [raw_spec] if isinstance(raw_spec, str) else list(raw_spec) if isinstance(raw_spec, list) else None
         if raws is None:
-            raise FillError(f"附件字段取值应为文件路径或路径数组: {field_id}")
+            raise FillError(f"ATTACHMENTS_INVALID: 附件字段取值应为文件路径或路径数组: {field_id}")
         label = field["label"]
         if field.get("required") and not raws:
             problems.append(f"必填附件缺失: {label}（{field_id}）")
@@ -354,7 +349,7 @@ def seal_data(form, values, attachments, out_path, *, signing_key, revision):
     envelope = collection.sign_envelope(envelope, signing_key)
     blob = collection.canonical(envelope)
     if len(blob) > collection.MAX_ENVELOPE_BYTES:
-        raise FillError("加密信封超过 32MB 上限，未生成文件")
+        raise FillError("FILE_LIMIT: 加密信封超过 32MB 上限，未生成文件")
     out = Path(out_path).expanduser()
     if out.suffix != ".yintian":
         out = out.with_suffix(out.suffix + ".yintian") if out.suffix else out.with_suffix(".yintian")
@@ -602,7 +597,8 @@ def cmd_vault_status(args) -> dict[str, Any]:
     result = vault.status_view(profile, form)
     result.update(vault_path=str(vault_path), key_path=str(key_path), wiki_path=str(vault_path.parent / "wiki.md"))
     if form is not None and result.get("missing"):
-        result["same_type_entries"] = _same_type_entries(form, profile, result["missing"])
+        required = {field["id"] for field in form["fields"] if field.get("required")}
+        result["same_type_entries"] = _same_type_entries(form, profile, [item for item in result["missing"] if item in required])
     return result
 
 
@@ -848,7 +844,7 @@ def cmd_vault_scan(args) -> dict[str, Any]:
     for image in args.images:
         path = secure_io.checked_path(image)
         if not path.is_file():
-            raise FillError(f"图片不存在: {image}")
+            raise FillError(f"IMAGE_MISSING: 图片不存在: {image}")
         digest = collection.sha256_bytes(secure_io.read_bytes(path, collection.MAX_FILE_BYTES))
         backend, extracted = "openvino-ocr", None
         if getattr(args, "vlm", False):
@@ -1107,7 +1103,7 @@ def cmd_receipt_inspect(args) -> dict[str, Any]:
     """读取回执信封明文头，帮助员工辨认文件属于哪个任务、对应哪次提交。"""
     path = secure_io.checked_path(args.receipt)
     if not path.is_file():
-        raise FillError(f"回执文件不存在: {args.receipt}")
+        raise FillError(f"RECEIPT_MISSING: 回执文件不存在: {args.receipt}")
     try:
         envelope = json.loads(secure_io.read_bytes(path, collection.MAX_ENVELOPE_BYTES))
     except Exception as exc:
@@ -1353,14 +1349,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    collection.configure_cli_stdio()
     args = build_parser().parse_args(argv)
     try:
         result = args.func(args)
         if result is not None:
-            print(json.dumps({"ok": True, **result} if isinstance(result, dict) else result, ensure_ascii=False, indent=2))
+            print(json.dumps({"ok": True, **result} if isinstance(result, dict) else result, ensure_ascii=False, separators=(",", ":")))
         return 0
     except Exception as exc:
-        print(json.dumps(collection.error_report(exc), ensure_ascii=False, indent=2), file=sys.stderr)
+        print(json.dumps(collection.error_report(exc), ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
         return 1
 
 

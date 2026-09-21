@@ -9,7 +9,7 @@
 - `deadline`：截止时间；
 - `contact`：联系人及联系方式。
 
-Agent 自动补齐：`title` 从用途概括，`name` 设为必填，`retention_until` 默认为截止后 30 天，`correction` 默认为联系任务联系人后重新提交，`template_version` 为 `1.0`。完成后必须调用 `create-request`；不得把配置直接交给 HR，也不得生成 HTML 表单。
+`create-request` 自动补齐缺省项：`title` 取 `purpose`，必填 `name` 字段置于首位，`retention_until` 为截止后 30 天（保留 deadline 的时区偏移），`correction` 为“联系任务联系人后重新提交”，`template_version` 为 `1.0`；需要不同值时在配置中显式给出。完成后必须调用 `create-request`；不得把配置直接交给 HR，也不得生成 HTML 表单。
 
 ## Wiki 与字段说明
 
@@ -35,7 +35,7 @@ Agent 自动补齐：`title` 从用途概括，`name` 设为必填，`retention_
 
 | 含义 | id | type |
 |---|---|---|
-| 姓名 | `name` | `text`（自动加入，必填） |
+| 姓名 | `name` | `text`（缺省时脚本自动加入，必填） |
 | 工号 | `employee_id` | `text` |
 | 本人手机号 | `phone` | `phone_cn` |
 | 身份证号 | `id_number` | `cn_id` |

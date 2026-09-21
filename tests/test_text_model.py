@@ -91,7 +91,8 @@ def test_text_extraction_uses_verified_local_model_and_suppresses_output(tmp_pat
     ('{"name":{"nested":"合成私密标记"}}', "TEXT_EXTRACTION_INVALID"),
     ("{}", "TEXT_FIELDS_EMPTY"),
     ('{"name":" "}', "TEXT_FIELDS_EMPTY"),
-])
+], ids=["array", "unknown-field", "number", "invented", "duplicate", "long-value", "long-output",
+        "markdown", "nested", "empty", "blank"])
 def test_text_model_rejects_invalid_or_ungrounded_output(tmp_path, monkeypatch, answer, code, capfd):
     local_model(tmp_path, monkeypatch)
     stub_pipeline(monkeypatch, answer)
@@ -121,7 +122,7 @@ def test_text_inference_failure_is_safe_and_integrity_prevents_loading(tmp_path,
     ("私" * (vlm_extract.MAX_TEXT_BYTES // 3 + 1), FIELDS),
     (SOURCE, [FIELDS[0], FIELDS[0]]),
     (SOURCE, [{"id": "name", "label": "姓名", "type": "not-a-type"}]),
-])
+], ids=["blank", "oversized", "duplicate-field", "invalid-type"])
 def test_text_input_bounds_reject_before_model_loading(monkeypatch, text, fields):
     calls = stub_pipeline(monkeypatch, "{}")
     with pytest.raises(vlm_extract.VlmUnavailable, match="TEXT_EXTRACTION_INVALID"):

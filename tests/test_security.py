@@ -128,6 +128,12 @@ def test_file_lock_rejects_live_legacy_pid(tmp_path):
 def test_file_lock_ignores_dead_legacy_pid(tmp_path):
     lock = tmp_path / "dead.lock"
     lock.write_text("pid=99999999 legacy-writer\n", encoding="ascii")
+    if os.name == "nt":
+        # Windows intentionally refuses legacy PID locks it cannot verify.
+        with pytest.raises(RuntimeError, match="TASK_BUSY"):
+            with secure_io.file_lock(lock):
+                pass
+        return
     with secure_io.file_lock(lock):  # 死进程的 pid 记录不阻塞新锁
         pass
 

@@ -69,6 +69,13 @@ NOTICE_KEYS = ("title", "purpose", "deadline", "retention_until", "contact", "co
 _PRIVATE_OUTPUT_LOCK = threading.RLock()
 
 
+def configure_cli_stdio():
+    """Keep the JSON/Chinese CLI contract independent of Windows' locale."""
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper) and stream.encoding.lower().replace("-", "") != "utf8":
+            stream.reconfigure(encoding="utf-8")
+
+
 def _flush_native_output():
     """Flush C stdio while its descriptors still point to the intended destination."""
     import ctypes
@@ -91,7 +98,7 @@ def _flush_native_output():
 def suppress_private_output():
     """Suppress SDK Python/native output without writing sensitive text to a temporary file."""
     # ponytail: output redirection is process-wide; use worker processes if parallel inference is needed.
-    with _PRIVATE_OUTPUT_LOCK, open(os.devnull, "w") as sink:
+    with _PRIVATE_OUTPUT_LOCK, open(os.devnull, "w", encoding="utf-8") as sink:
         saved = []
         prior_logging = logging.root.manager.disable
         try:
@@ -288,15 +295,15 @@ def aes_gcm_open(envelope: dict[str, Any], password: str, aad: bytes) -> bytes:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     if not isinstance(envelope, dict) or envelope.get("cipher") != "AES-256-GCM":
-        raise ValueError("加密信封格式不受支持")
+        raise ValueError("ENVELOPE_INVALID: 加密信封格式不受支持")
     salt, n, r, p = validate_kdf_params(envelope.get("kdf"))
     try:
         nonce = base64.b64decode(envelope["nonce"], validate=True)
         ciphertext = base64.b64decode(envelope["ciphertext"], validate=True)
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("加密信封缺少 nonce 或密文") from exc
+        raise ValueError("ENVELOPE_INVALID: 加密信封缺少 nonce 或密文") from exc
     if len(nonce) != 12:
-        raise ValueError("加密信封 nonce 无效")
+        raise ValueError("ENVELOPE_INVALID: 加密信封 nonce 无效")
     key = derive_scrypt_key(password, salt, n, r, p)
     return AESGCM(key).decrypt(nonce, ciphertext, aad)
 
@@ -308,7 +315,7 @@ def encrypt_private_key(private_der: bytes, password: str) -> bytes:
 
 def decrypt_private_key(envelope: dict[str, Any], password: str) -> bytes:
     if envelope.get("format") != KEY_ENVELOPE_VERSION:
-        raise ValueError("私钥信封格式不受支持")
+        raise ValueError("LOCAL_KEY_INVALID: 私钥信封格式不受支持")
     return aes_gcm_open(envelope, password, KEY_ENVELOPE_VERSION.encode("utf-8"))
 
 
@@ -365,27 +372,27 @@ def validate_envelope_header(envelope: dict[str, Any], task: dict[str, Any]) -> 
 
     required = {"format_version", "task_id", "invite_id", "schema_hash", "key_id", "algorithms", "encrypted_key_b64", "iv_b64", "ciphertext_b64", "sender_public_key_b64", "revision", "signature_b64"}
     if not isinstance(envelope, dict) or set(envelope) != required:
-        raise ValueError("提交包字段集合无效")
+        raise ValueError("SUBMISSION_REJECTED: 提交包字段集合无效")
     for key in required - {"algorithms", "revision"}:
         if not isinstance(envelope.get(key), str) or not envelope[key]:
-            raise ValueError(f"提交包缺少字段: {key}")
+            raise ValueError(f"SUBMISSION_REJECTED: 提交包缺少字段: {key}")
     if envelope["format_version"] != SUBMISSION_FORMAT_VERSION or envelope["format_version"] != task["format_version"] or envelope["task_id"] != task["task_id"]:
-        raise ValueError("提交包属于其他任务或格式版本")
+        raise ValueError("SUBMISSION_REJECTED: 提交包属于其他任务或格式版本")
     if envelope.get("algorithms") != {"content": "AES-256-GCM", "key_wrap": "RSA-OAEP-3072-SHA256"}:
-        raise ValueError("提交包算法套件不受支持")
+        raise ValueError("SUBMISSION_REJECTED: 提交包算法套件不受支持")
     if envelope["schema_hash"] != task["schema_hash"] or envelope["key_id"] != task["key_id"]:
-        raise ValueError("提交包字段模板或公钥不匹配")
+        raise ValueError("SUBMISSION_REJECTED: 提交包字段模板或公钥不匹配")
     invite_id = envelope["invite_id"]
     if not OPEN_INVITE_ID_RE.fullmatch(invite_id):
-        raise ValueError("回执编号格式无效")
+        raise ValueError("SUBMISSION_REJECTED: 回执编号格式无效")
     if type(envelope["revision"]) is not int or not 1 <= envelope["revision"] <= MAX_REVISION:
         raise ValueError("REVISION_INVALID: 更正序号必须为有效正整数")
     for key in ("encrypted_key_b64", "iv_b64", "ciphertext_b64"):
         value = base64.b64decode(envelope[key], validate=True)
         if base64.b64encode(value).decode("ascii") != envelope[key]:
-            raise ValueError("提交包编码不规范")
+            raise ValueError("SUBMISSION_REJECTED: 提交包编码不规范")
         if (key == "encrypted_key_b64" and len(value) != 384) or (key == "iv_b64" and len(value) != 12) or (key == "ciphertext_b64" and not 16 <= len(value) <= MAX_ENVELOPE_BYTES):
-            raise ValueError("提交包密文长度无效")
+            raise ValueError("SUBMISSION_REJECTED: 提交包密文长度无效")
     if derive_invite_id(envelope["task_id"], envelope["sender_public_key_b64"]) != invite_id:
         raise ValueError("SIGNATURE_INVALID: 回执编号与签名身份不匹配")
     try:
@@ -416,13 +423,13 @@ def normalize_value(field_type: str, value: str) -> str:
 
 def validate_scalar_values(values: Any, allowed_ids: set[str]) -> None:
     if not isinstance(values, dict) or len(values) > MAX_FIELDS:
-        raise ValueError("values 必须是字段数量受限的对象")
+        raise ValueError("VALUES_INVALID: values 必须是字段数量受限的对象")
     if set(values) - allowed_ids:
         raise ValueError("PAYLOAD_FIELDS_INVALID: 提交含模板外字段")
     for field_id, value in values.items():
         limit = MAX_NAME_CHARS if field_id == "name" else MAX_VALUE_CHARS
         if not isinstance(value, str) or len(value) > limit or ILLEGAL_XML_RE.search(value):
-            raise ValueError(f"字段必须是长度不超过 {limit} 的文本: {field_id}")
+            raise ValueError(f"VALUES_INVALID: 字段必须是长度不超过 {limit} 的文本: {field_id}")
 
 
 def validate_payload(task: dict[str, Any], payload: dict[str, Any]) -> tuple[list[str], list[str], list[dict[str, Any]]]:
@@ -430,7 +437,7 @@ def validate_payload(task: dict[str, Any], payload: dict[str, Any]) -> tuple[lis
 
     required = {"notice_hash", "template_version", "submitted_at", "consent_confirmed", "values", "attachments"}
     if not isinstance(payload, dict) or not required.issubset(payload):
-        raise ValueError("解密载荷字段集合无效")
+        raise ValueError("PAYLOAD_INVALID: 解密载荷字段集合无效")
     missing, conflicts, attachment_items = [], [], []
     if payload.get("notice_hash") != task["notice_hash"]:
         conflicts.append("notice_hash")
@@ -442,7 +449,7 @@ def validate_payload(task: dict[str, Any], payload: dict[str, Any]) -> tuple[lis
         conflicts.append("submitted_at")
     values, attachments = payload.get("values", {}), payload.get("attachments", {})
     if not isinstance(attachments, dict) or len(attachments) > MAX_FIELDS:
-        raise ValueError("values/attachments 格式无效")
+        raise ValueError("PAYLOAD_INVALID: values/attachments 格式无效")
     value_ids = {f['id'] for f in task['fields'] if f['type'] not in ATTACHMENT_TYPES}
     attachment_ids = {f['id'] for f in task['fields'] if f['type'] in ATTACHMENT_TYPES}
     validate_scalar_values(values, value_ids)
@@ -455,26 +462,26 @@ def validate_payload(task: dict[str, Any], payload: dict[str, Any]) -> tuple[lis
         if field_type in ATTACHMENT_TYPES:
             items = attachments.get(field_id, [])
             if not isinstance(items, list) or len(items) > 20:
-                raise ValueError(f"附件字段格式无效: {field_id}")
+                raise ValueError(f"ATTACHMENT_INVALID: 附件字段格式无效: {field_id}")
             total_attachments += len(items)
             if total_attachments > MAX_ATTACHMENTS:
-                raise ValueError(f"附件总数超过 {MAX_ATTACHMENTS} 个")
+                raise ValueError(f"ATTACHMENT_LIMIT: 附件总数超过 {MAX_ATTACHMENTS} 个")
             if field.get("required") and not items:
                 missing.append(field_id)
             if not field.get("multiple") and len(items) > 1:
                 conflicts.append(field_id)
             for item in items:
                 if not isinstance(item, dict):
-                    raise ValueError(f"附件项目格式无效: {field_id}")
+                    raise ValueError(f"ATTACHMENT_INVALID: 附件项目格式无效: {field_id}")
                 name = item.get("name", "")
                 if not isinstance(name, str) or len(name) > 255:
-                    raise ValueError(f"附件文件名无效: {field_id}")
+                    raise ValueError(f"ATTACHMENT_INVALID: 附件文件名无效: {field_id}")
                 raw = base64.b64decode(item.get("data_b64", ""), validate=True)
                 mime = item.get("type", "")
                 if len(raw) != int(item.get("size", -1)) or len(raw) > MAX_FILE_BYTES or sha256_bytes(raw) != item.get("sha256"):
-                    raise ValueError(f"附件大小或哈希无效: {field_id}")
+                    raise ValueError(f"ATTACHMENT_INVALID: 附件大小或哈希无效: {field_id}")
                 if field_type == "image_attachment" and mime not in {"image/jpeg", "image/png", "image/webp"}:
-                    raise ValueError(f"图片类型不支持: {mime}")
+                    raise ValueError(f"ATTACHMENT_INVALID: 图片类型不支持: {mime}")
                 if field_type == "pdf_attachment" and mime != "application/pdf":
                     raise ValueError("PDF 附件类型无效")
                 if field_type == "image_attachment":
@@ -484,7 +491,7 @@ def validate_payload(task: dict[str, Any], payload: dict[str, Any]) -> tuple[lis
                         with Image.open(io.BytesIO(raw)) as image:
                             expected = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}[mime]
                             if image.format != expected or image.width * image.height > MAX_IMAGE_PIXELS:
-                                raise ValueError(f"图片内容或像素尺寸无效: {field_id}")
+                                raise ValueError(f"ATTACHMENT_INVALID: 图片内容或像素尺寸无效: {field_id}")
                             image.verify()
                     except (OSError, Image.DecompressionBombError):
                         raise ValueError('ATTACHMENT_INVALID: 图片数据无效') from None
@@ -505,71 +512,138 @@ def validate_payload(task: dict[str, Any], payload: dict[str, Any]) -> tuple[lis
             if value and field_type == "single_choice" and value not in field.get("options", []):
                 conflicts.append(field_id)
     if total_size > MAX_TOTAL_BYTES:
-        raise ValueError("附件总大小超过 15MB")
+        raise ValueError("ATTACHMENT_LIMIT: 附件总大小超过 15MB")
     return sorted(set(missing)), sorted(set(conflicts)), attachment_items
 
 
 def error_report(exc: BaseException) -> dict[str, Any]:
     """只输出协议错误码和静态说明，异常原文可能含明文值、路径或第三方输出。"""
-    allowed = {
-        "ANSWERS_INVALID", "ANSWERS_PERMISSIONS", "ATTACHMENTS_INVALID", "ATTACHMENT_EXPORT_UNAVAILABLE",
-        "ATTACHMENT_INVALID", "ATTACHMENT_LIMIT", "CANCELLED", "CIPHERTEXT_CHANGED", "CONFIRMATION_CONSUME_FAILED",
-        "CONFIRMATION_EXISTS", "CONFIRMATION_EXPIRED", "CONFIRMATION_INVALID", "CONFIRMATION_LIMIT", "CONFIRMATION_STALE",
-        "CONFIG_INVALID", "CONFIG_MISSING_FIELDS", "DATABASE_MISSING", "DATABASE_WRITE_FAILED", "DEADLINE_INVALID", "EVIDENCE_LIMIT", "EVIDENCE_MISSING", "EXPORT_VALIDATION_FAILED", "FILE_LIMIT", "FORM_INVALID",
-        "GUI_UNAVAILABLE", "IDENTITY_INVALID", "IDENTITY_MISSING", "IMAGE_MISSING", "INBOX_LIMIT", "INGEST_IO", "KEY_MISMATCH", "KEY_UNLOCK_FAILED",
-        "LEGACY_TASK_UNSUPPORTED", "LOCAL_KEY_INVALID", "LOCAL_KEY_UNAVAILABLE", "LOCAL_OCR_UNAVAILABLE",
-        "MANUAL_NOT_ALLOWED", "MANUAL_REVIEW_UNAVAILABLE", "MAPPING_INVALID", "NOTICE_INVALID", "OCR_BINDING_INVALID",
-        "OPEN_INVITE_LIMIT", "OPEN_KEY_PACKAGE_INVALID", "OPEN_REQUEST_INVALID", "OPERATOR_INVALID", "OUTPUT_EXISTS",
-        "PATH_OUTSIDE", "PATH_UNSAFE", "PAYLOAD_FIELDS_INVALID", "PAYLOAD_INVALID", "PREVIOUS_INVALID", "RECEIPT_INVALID",
-        "PRIVATE_OUTPUT_UNAVAILABLE", "RECOVERY_CONFLICT", "RETENTION_INVALID", "SCHEMA_INVALID", "REPLY_ROLLBACK_FAILED", "REVISION_CONFLICT", "REVISION_INVALID", "REVISION_LIMIT", "SCHEMA_UNSUPPORTED",
-        "SECRET_TTY_REQUIRED", "SIGNATURE_INVALID", "STATE_CHANGED", "TASK_BUSY", "TASK_EXPIRED", "TASK_INVALID", "TASK_STORAGE_LIMIT",
-        "TIME_ZONE_REQUIRED", "TEXT_INPUT_INVALID", "TEXT_EXTRACTION_INVALID", "TEXT_FIELDS_EMPTY", "TEXT_VALUES_INVALID",
-        "VALUES_INVALID", "VAULT_ANSWERS_INVALID", "VAULT_ENTRY_INVALID", "VAULT_FIELDS_MISSING",
-        "VAULT_INVALID", "VAULT_KEY_INVALID", "VAULT_KEY_MISSING", "VAULT_LIMIT", "VAULT_LOCATION_UNAVAILABLE",
-        "VAULT_MISSING", "VAULT_PATH_COLLISION", "VAULT_PATH_INVALID", "VAULT_PERMISSIONS", "VAULT_ROLLBACK_FAILED",
-        "VAULT_STORAGE_INVALID", "VAULT_UNLOCK_FAILED", "VAULT_WRITE_FAILED", "VLM_MODEL_REQUIRED", "VLM_UNAVAILABLE",
-    }
-    match = re.match(r"([A-Z][A-Z0-9_]{1,63}):", str(exc))
-    code = match.group(1) if match and match.group(1) in allowed else type(exc).__name__
+    terminal_required_message = "无法打开安全控制终端；请在本机交互终端执行，密码不会写入日志。"
     messages = {
+        "ANSWERS_INVALID": "answers 临时文件必须是普通文件；请使用私有目录中的临时副本。",
+        "ANSWERS_PERMISSIONS": "answers 临时文件须位于 0700 目录且权限为 0600。",
+        "ATTACHMENTS_INVALID": "attachments 必须是 {字段id: 路径或路径数组}，且只引用本次请求的附件字段。",
+        "ATTACHMENT_EXPORT_UNAVAILABLE": "附件无法导出到本地目录；请检查输出位置权限后重试。",
+        "ATTACHMENT_INVALID": "附件路径、类型或内容无效；请确认是本人指定的 JPG/PNG/WebP/PDF 文件。",
+        "ATTACHMENT_LIMIT": "附件数量或大小超限：单文件 5MB、总计 15MB、每字段 20 个。",
+        "ATTACHMENT_MISSING": "指定的附件文件不存在；请核对路径。",
+        "CANCELLED": "操作已取消。",
+        "CIPHERTEXT_CHANGED": "已接收的回执文件与数据库记录不一致；请勿手工改动任务目录，必要时重新收件。",
         "CONFIG_INVALID": "任务配置必须是 JSON 对象，告知内容和模板版本须为非空文本；请检查 collection-config 参考。",
-        "CONFIG_MISSING_FIELDS": "任务配置缺少必填项；请检查 title、purpose、deadline、retention_until、contact、correction、template_version 和 fields。",
-        "DEADLINE_INVALID": "deadline 必须晚于当前时间；请使用带时区的未来时间。",
-        "RETENTION_INVALID": "retention_until 必须晚于 deadline；请调整保存期限。",
-        "TIME_ZONE_REQUIRED": "deadline 和 retention_until 须为有效 ISO 日期时间，包含 T 和时区偏移或 Z。",
-        "SCHEMA_INVALID": "字段定义无效；请检查唯一 id/label、受支持的类型、选项和布尔属性，并包含必填 text 字段 id=name。",
-        "OCR_BINDING_INVALID": "ocr_fields 只允许用于附件，且须引用不重复的已有值字段。",
-        "PATH_UNSAFE": "请使用不含 ..、符号链接或重解析点的真实路径；保险柜可用 YINTIAN_VAULT_DIR / YINTIAN_VAULT_KEY_DIR 指定。",
+        "CONFIG_MISSING_FIELDS": "任务配置缺少必填项；请检查 purpose、deadline、contact 和 fields。",
+        "CONFIRMATION_CONSUME_FAILED": "确认凭据无法删除，操作已完成；请手工清理该文件。",
+        "CONFIRMATION_EXISTS": "确认文件已存在；若上次已放弃请删除它，或更换 --confirmation-out 路径。",
+        "CONFIRMATION_EXPIRED": "确认已过期，请重新预览确认。",
+        "CONFIRMATION_INVALID": "确认凭据无效或不属于本操作，请重新预览确认。",
+        "CONFIRMATION_LIMIT": "确认凭据内容超限，请重新预览确认。",
+        "CONFIRMATION_STALE": "预览后内容或提交状态已变化，请重新预览确认。",
+        "DATABASE_MISSING": "任务数据库缺失；请恢复任务目录或重新导入交接包。",
         "DATABASE_WRITE_FAILED": "任务数据库写入失败，已停止导出；请保留原始回执，修复数据库或磁盘后重新收件，勿改用空目录导出旧记录。",
-        "PRIVATE_OUTPUT_UNAVAILABLE": "无法控制本地运行库输出，已停止推理；请检查本机运行环境。",
-        "SIGNATURE_INVALID": "回执签名或归属无效，请由原保险柜重新生成。",
+        "DEADLINE_INVALID": "deadline 必须晚于当前时间；请使用带时区的未来时间。",
+        "ENVELOPE_INVALID": "加密信封格式无效或损坏。",
+        "EVIDENCE_LIMIT": "待裁定附件数量或大小超限。",
+        "EVIDENCE_MISSING": "待裁定附件不存在；请重新 review 后再 decide。",
+        "EXPORT_VALIDATION_FAILED": "导出结果校验失败，已撤回本次输出；请重试，不要手工修补。",
+        "FILE_LIMIT": "文件超过安全大小上限。",
+        "FORM_INVALID": "请求包字段格式无效；请向发放方索取完整请求包。",
+        "GUI_UNAVAILABLE": "缺少图形环境，无法人工裁定；可在有图形环境的机器操作或退回员工重交。",
+        "IMAGE_INVALID": "图片数据无效或为空。",
+        "IMAGE_MISSING": "指定的图片文件不存在；请核对路径。",
+        "INBOX_LIMIT": "单次收件文件数量超限；请分批放入收件目录。",
+        "INGEST_IO": "已验证回执写入失败；请检查磁盘和权限，将原始回执放回收件目录后重试。",
+        "INSTALL_INCOMPLETE": "Skill 目录不完整；请重新复制整个 Skill 文件夹。",
+        "INVITE_ID_INVALID": "回执编号格式无效；请使用 status 返回的完整 invite_id。",
+        "INVITE_NOT_FOUND": "任务中不存在该回执编号；请用 status 核对。",
+        "IO_ERROR": "本地文件读写失败；请检查路径、磁盘和权限后重试。",
+        "KEY_MISMATCH": "请求包公钥与 key_id 不一致，文件可能被替换；请勿填写并联系发放方。",
+        "KEY_UNLOCK_FAILED": "本地密钥错误或私钥损坏；请在创建任务的机器操作或导入交接包。",
+        "LEGACY_TASK_UNSUPPORTED": "旧任务须由原版本完成；本版本只接受新建任务，不迁移旧任务。",
+        "LOCAL_KEY_INVALID": "本地密钥文件格式无效。",
+        "LOCAL_KEY_UNAVAILABLE": "本地密钥不可用；请在创建任务的机器操作或导入交接包。",
+        "LOCAL_OCR_UNAVAILABLE": "本地 OCR 不可用；可安装 requirements-ocr.txt，或改为对话补录。",
+        "MANUAL_NOT_ALLOWED": "该记录当前状态不允许人工裁定。",
+        "MANUAL_REVIEW_UNAVAILABLE": "无法人工裁定；请退回员工重交。",
+        "MAPPING_INVALID": "mapping 须为 {请求字段id: 保险柜条目id}，条目必须存在且类型相同。",
+        "NOTICE_INVALID": "补正通知格式无效；请向发放方重新索取。",
+        "OCR_BINDING_INVALID": "ocr_fields 只允许用于附件，且须引用不重复的已有值字段。",
+        "OPEN_INVITE_LIMIT": "任务接收的不同回执编号已达上限。",
+        "OPEN_KEY_PACKAGE_INVALID": "任务密钥材料无效。",
+        "OPEN_REQUEST_INVALID": "请求包不是发给 safefill-fill 的兼容请求；请升级或向发放方索取兼容版本。",
+        "OPERATOR_INVALID": "操作者标识无效。",
+        "OUTPUT_EXISTS": "输出已存在，请选择新的输出位置。",
+        "OUTPUT_PATH_INVALID": "导出路径不能位于任务目录内。",
+        "PATH_MISSING": "指定的文件或目录不存在；请核对路径。",
+        "PATH_OUTSIDE": "路径超出允许的目录范围。",
+        "PATH_UNSAFE": "请使用不含 ..、符号链接或重解析点的真实路径；保险柜可用 YINTIAN_VAULT_DIR / YINTIAN_VAULT_KEY_DIR 指定。",
+        "PAYLOAD_FIELDS_INVALID": "解密载荷字段与请求不符。",
+        "PAYLOAD_INVALID": "回执载荷无效。",
+        "PERMISSION_DENIED": "没有访问该路径的权限。",
         "PREVIOUS_INVALID": "旧回执无法验证或不属于当前保险柜，请使用本人原始回执。",
+        "PRIVATE_OUTPUT_UNAVAILABLE": "无法控制本地运行库输出，已停止推理；请检查本机运行环境。",
+        "RECEIPT_INVALID": "不是有效的回执文件。",
+        "RECEIPT_MISSING": "回执文件不存在；请核对路径。",
+        "RECOVERY_CONFLICT": "收件路径已存在不同内容；请勿手工改动任务目录。",
+        "REPLY_ROLLBACK_FAILED": "回执无法撤回，操作未完整完成；请停止重试并保留现场，核对现有回执后再处理。",
+        "REQUEST_INVALID": "不是有效的 SafeFill 请求包；请向发放方重新索取。",
+        "REQUEST_MISSING": "请求包文件不存在；请核对路径。",
+        "REQUEST_TAMPERED": "请求包摘要不匹配，文件可能被篡改；请勿填写并向发放方重新索取。",
+        "RETENTION_INVALID": "retention_until 必须晚于 deadline；请调整保存期限。",
+        "REVISION_CONFLICT": "同一更正序号存在不同回执，请持有人生成更高序号的补正回执。",
         "REVISION_INVALID": "更正序号无效，请重新预览并生成回执。",
         "REVISION_LIMIT": "本身份的更正序号已达上限，请新建任务。",
-        "REVISION_CONFLICT": "同一更正序号存在不同回执，请持有人生成更高序号的补正回执。",
-        "LEGACY_TASK_UNSUPPORTED": "旧任务须由原版本完成；本版本只接受新建任务，不迁移旧任务。",
+        "SCHEMA_INVALID": "字段定义无效；请检查唯一 id/label、受支持的类型、选项和布尔属性。",
         "SCHEMA_UNSUPPORTED": "任务数据库版本不受支持，请使用创建该任务的版本。",
-        "OUTPUT_EXISTS": "输出已存在，请选择新的输出位置。",
-        "CONFIRMATION_STALE": "预览后内容或提交状态已变化，请重新预览确认。",
-        "CONFIRMATION_EXPIRED": "确认已过期，请重新预览确认。",
+        "SECRET_TTY_REQUIRED": terminal_required_message,
+        "SIGNATURE_INVALID": "回执签名或归属无效，请由原保险柜重新生成。",
+        "STATE_CHANGED": "当前回执或任务状态已变化，请刷新状态后重试。",
+        "SUBMISSION_REJECTED": "回执文件不属于本任务或格式无效。",
+        "TASK_BUSY": "任务正在被其他操作占用，请稍后重试。",
         "TASK_EXPIRED": "任务已超过保存期限，请新建请求包。",
         "TASK_INVALID": "任务元数据无效或与摘要不一致；请恢复完整任务备份或重新导入可信交接包，勿手工改写摘要。",
-        "TASK_BUSY": "任务正在被其他操作占用，请稍后重试。",
+        "TASK_NOT_EXPIRED": "任务尚未到保存期限；确需提前删除请加 --allow-early。",
+        "TASK_PACKAGE_INVALID": "交接包格式或内容无效，拒绝导入。",
+        "TASK_PACKAGE_LIMIT": "交接包超过安全大小上限。",
+        "TASK_PACKAGE_UNLOCK_FAILED": "交接密码错误或交接包已被篡改，拒绝导入。",
         "TASK_STORAGE_LIMIT": "已验证回执无法保存，汇总已停止；请检查任务容量上限后重试。",
-        "INGEST_IO": "已验证回执写入失败；请检查磁盘和权限，将原始回执放回收件目录后重试。",
-        "STATE_CHANGED": "当前回执或任务状态已变化，请刷新状态后重试。",
-        "VAULT_KEY_MISSING": "保险柜密钥缺失，请恢复本人备份。",
-        "VAULT_UNLOCK_FAILED": "保险柜无法解锁，请核对本人密钥与备份。",
-        "VAULT_WRITE_FAILED": "保险柜状态保存失败，未完成提交；请检查存储后重新预览确认。",
-        "VAULT_ROLLBACK_FAILED": "保险柜回滚失败，提交状态不确定；请停止重试并保留保险柜、密钥和已经生成的回执。",
-        "REPLY_ROLLBACK_FAILED": "回执无法撤回，操作未完整完成；请停止重试并保留现场，核对现有回执后再处理。",
-        "TEXT_INPUT_INVALID": "文本入口须提供 --request、--model 和可读取的 UTF-8 .txt，最大 16 KiB；不与 --answers 混用。",
         "TEXT_EXTRACTION_INVALID": "本地模型输出不符合字段约束或引用了原文之外的值；请在原文本中明确标注字段后重试。",
         "TEXT_FIELDS_EMPTY": "本地文本未提取到可用字段；请补充请求中的字段标签和对应值。",
+        "TEXT_INPUT_INVALID": "文本入口须提供 --request、--model 和可读取的 UTF-8 .txt，最大 16 KiB；不与 --answers 混用。",
         "TEXT_VALUES_INVALID": "提取值未通过请求字段校验；请在原文本中检查手机号、证件号、日期和选项后重试。",
+        "TIME_ZONE_REQUIRED": "deadline 和 retention_until 须为有效 ISO 日期时间，包含 T 和时区偏移或 Z。",
+        "TTY_REQUIRED": "该操作须由 HR 本人在交互终端运行。",
+        "VALUES_INVALID": "字段值未通过校验；请按字段类型修正后重试。",
+        "VAULT_ANSWERS_INVALID": "answers 须为 {\"entries\":{id:{type,label,value|paths}}} 结构的 JSON。",
+        "VAULT_ENTRY_INVALID": "保险柜条目格式无效；请检查 type、label 和 value/paths。",
+        "VAULT_INVALID": "保险柜内容无效或损坏；请恢复备份。",
+        "VAULT_KEY_INVALID": "保险柜密钥文件无效或权限过宽。",
+        "VAULT_KEY_MISSING": "保险柜密钥缺失，请恢复本人备份。",
+        "VAULT_LIMIT": "保险柜条目数量或大小超限。",
+        "VAULT_LOCATION_UNAVAILABLE": "无法确定保险柜目录；请设置 YINTIAN_VAULT_DIR / YINTIAN_VAULT_KEY_DIR。",
+        "VAULT_MISSING": "保险柜尚未建立；请先通过 vault-stage/vault-apply 录入。",
+        "VAULT_PATH_COLLISION": "保险柜路径与其他文件冲突；请更换位置。",
+        "VAULT_PATH_INVALID": "自定义 --vault 必须同时指定 --key-file，且路径有效。",
+        "VAULT_PERMISSIONS": "保险柜或密钥目录权限过宽；POSIX 须为 0700/0600。",
+        "VAULT_ROLLBACK_FAILED": "保险柜回滚失败，提交状态不确定；请停止重试并保留保险柜、密钥和已经生成的回执。",
+        "VAULT_STORAGE_INVALID": "保险柜存储位置无效。",
+        "VAULT_UNLOCK_FAILED": "保险柜无法解锁，请核对本人密钥与备份。",
+        "VAULT_WRITE_FAILED": "保险柜状态保存失败，未完成提交；请检查存储后重新预览确认。",
+        "VLM_MODEL_MISSING": "所选模型未安装；请先运行 vlm-setup --model MODEL。",
+        "VLM_MODEL_REQUIRED": "请用 --model 指定已安装的本地模型。",
+        "VLM_OUTPUT_INVALID": "本地模型输出不是可解析的字段 JSON；请重试或改用对话补录。",
+        "VLM_SETUP_FAILED": "模型下载或校验失败；已保留部分下载，重新运行 vlm-setup 将断点续传。",
         "VLM_UNAVAILABLE": "本地模型不可用；请检查模型环境、已安装模型和设备。文本入口需要 LLMPipeline 兼容模型，不自动转云端或读取原文到会话。",
-        "CANCELLED": "操作已取消。",
     }
-    if code == "SECRET_TTY_REQUIRED":
-        return {"ok": False, "error": code, "message": "无法打开安全控制终端；请在本机交互终端执行，密码不会写入日志。"}
-    return {"ok": False, "error": code, "message": messages.get(code, "操作未完成，请根据错误码检查输入或运行 doctor；详细内容未输出以保护隐私。")}
+    match = re.match(r"([A-Z][A-Z0-9_]{1,63}):", str(exc))
+    if match and match.group(1) in messages:
+        code = match.group(1)
+    elif isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+        code = "PATH_MISSING"
+    elif isinstance(exc, PermissionError):
+        code = "PERMISSION_DENIED"
+    elif isinstance(exc, FileExistsError):
+        code = "OUTPUT_EXISTS"
+    elif isinstance(exc, OSError):
+        code = "IO_ERROR"
+    else:
+        code = type(exc).__name__
+    return {"ok": False, "error": code, "message": messages.get(code, "操作未完成；错误类型未列入协议，请核对输入或运行 doctor。")}

@@ -97,6 +97,6 @@ def _preprocess_image_bytes(image_bytes: bytes) -> bytes:
 def scan_bytes(image_bytes: bytes) -> dict[str, Any]:
     """对内存中的解密图片执行 OCR，不创建明文临时文件。自动纠偏移动端 EXIF 拍摄角度。"""
     if not image_bytes:
-        raise ValueError("图片数据为空")
+        raise ValueError("IMAGE_INVALID: 图片数据为空")
     with suppress_private_output():
         return _scan_content(_preprocess_image_bytes(image_bytes))

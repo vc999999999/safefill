@@ -49,6 +49,21 @@ Agent 负责需求理解、字段语义、命令编排与结果说明；确定�
 
 ## 安装与环境
 
+### 打包与单命令安装
+
+维护者运行 `python tools/build_skills.py`，先检查共享文件和协议同步，再将 Git 已跟踪的 Skill 源文件打包到 `dist/`。目录中包含两个 ZIP 格式的 `.skill` 包、`install.py` 和 `SHA256SUMS`，不包含未跟踪的模型、环境或用户资料。新增交付文件须先加入 Git 跟踪。SHA-256 用于检查下载一致性，不认证发布者。
+
+将可信来源的安装脚本与所需 `.skill` 包放在同一目录，用 Python 3.11–3.13 运行（`--dest` 指向宿主 Agent 的 Skills 目录）：
+
+```bash
+python dist/install.py --role fill --dest ~/.codex/skills
+python dist/install.py --role collect --dest ~/.codex/skills
+```
+
+Windows 可用 `py -3.12 dist/install.py --role fill --dest "$env:USERPROFILE/.codex/skills"`。安装会创建所选 Skill 的独立 `.venv`、联网安装核心依赖并运行 `doctor`；已有同名目录则停止，避免覆盖用户修改。依赖安装失败会清理本次新建的该端目录，已成功安装的另一端保留。`--no-deps` 仅解包，适合宿主已提供依赖的情况。重载宿主 Skills 后使用；OCR、OpenVINO 模型仍按需单独安装，不增加云端接口或自动下载模型。
+
+### 从源目录安装
+
 分别整体安装 `skills/safefill-collect` 或 `skills/safefill-fill`，不要只复制 `SKILL.md` 或把仓库根目录当作一个 Skill。每端已包含运行脚本和协议参考，不依赖另一端或仓库根文档。
 
 核心环境使用 Python 3.11–3.13，填写端不需要图形窗口；Tk 仅用于收集端原有的 OCR 人工裁定。以下是安装者的 macOS/Linux 示例，Agent 可使用宿主已有环境完成相同准备：
