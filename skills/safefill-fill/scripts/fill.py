@@ -122,6 +122,7 @@ def inspect_info(form: dict[str, Any]) -> dict[str, Any]:
                 "type": field["type"],
                 "required": bool(field.get("required")),
                 "sensitive": bool(field.get("sensitive")),
+                **({"notes": field["notes"]} if "notes" in field else {}),
                 **({"ocr_fields": field["ocr_fields"]} if field.get("ocr_fields") else {}),
                 **({"options": field["options"]} if field.get("type") == "single_choice" and field.get("options") else {}),
                 **({"multiple": bool(field.get("multiple"))} if field["type"] in collection.ATTACHMENT_TYPES else {}),
@@ -580,7 +581,8 @@ def cmd_vault_status(args) -> dict[str, Any]:
     form = load_form(args.request) if getattr(args, "request", None) else None
     vault_path, key_path = _storage_paths(args)
     if not vault_path.is_file():
-        result: dict[str, Any] = {"vault": False, "vault_path": str(vault_path), "key_path": str(key_path)}
+        result: dict[str, Any] = {"vault": False, "vault_path": str(vault_path), "key_path": str(key_path),
+                                  "wiki_path": str(vault_path.parent / "wiki.md")}
         if form is not None:
             result["fields"] = [
                 {"id": field["id"], "label": field["label"], "type": field["type"],
@@ -598,7 +600,7 @@ def cmd_vault_status(args) -> dict[str, Any]:
     except ValueError as exc:
         raise FillError(str(exc)) from exc
     result = vault.status_view(profile, form)
-    result.update(vault_path=str(vault_path), key_path=str(key_path))
+    result.update(vault_path=str(vault_path), key_path=str(key_path), wiki_path=str(vault_path.parent / "wiki.md"))
     if form is not None and result.get("missing"):
         result["same_type_entries"] = _same_type_entries(form, profile, result["missing"])
     return result

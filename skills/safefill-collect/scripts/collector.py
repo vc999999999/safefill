@@ -359,6 +359,7 @@ def create_request(config_path: Path, out_parent: Path) -> dict[str, Any]:
         saved_secret_path = save_local_task_secret(root, task_id, local_secret)
         ocr_bound = [field["id"] for field in config["fields"] if field.get("ocr_fields")]
         return {"task_id": task_id, "task_dir": str(root), "request": str(request_path), "key_fingerprint": key_id,
+                "wiki_path": str(root.parent / "wiki.md"),
                 "deadline": config["deadline"], "retention_until": config["retention_until"], "ocr_bound_fields": ocr_bound,
                 "reminder": (f"收件、汇总与查看必须在保存期限 {config['retention_until']} 之前完成，到期后按告知承诺不再解密任何回执"
                              + ("；已启用附件自动比对的字段：" + ", ".join(ocr_bound) + "，比对不通过的回执需要 HR 本人在终端运行 decide 逐项裁定" if ocr_bound else ""))}
@@ -924,6 +925,7 @@ def cmd_status(args) -> dict[str, Any]:
     root, task = load_task(args.task_dir)
     days_left = retention_days_left(task)
     result = {"task_id": task["task_id"], "deadline": task["deadline"],
+              "wiki_path": str(root.parent / "wiki.md"),
               "retention_until": task["retention_until"], "retention_days_left": days_left,
               "expired": task_expired(task), "counts": status_counts(root), "rows": progress_rows(root)}
     warning = retention_warning(task, days_left)
@@ -954,7 +956,7 @@ def cmd_list_tasks(args) -> dict[str, Any]:
             report = error_report(exc)
             entry = {"task_dir": str(child), "error": report["error"], "message": report["message"]}
         tasks.append(entry)
-    return {"tasks_dir": str(parent), "tasks": tasks}
+    return {"tasks_dir": str(parent), "wiki_path": str(parent / "wiki.md"), "tasks": tasks}
 
 
 def cmd_audit_log(args) -> dict[str, Any]:

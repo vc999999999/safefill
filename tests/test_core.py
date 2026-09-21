@@ -352,3 +352,65 @@ def test_vlm_setup_modelscope_source(tmp_path, monkeypatch):
 
     with pytest.raises(SystemExit):
         fill.build_parser().parse_args(["vlm-setup", "--model", "m", "--source", "unknown"])
+
+
+def test_wiki_paths_and_field_notes_roundtrip(tmp_path, isolated_vault):
+    status = run(["vault-status"])
+    employee_wiki = Path(status["wiki_path"])
+    assert employee_wiki == Path(status["vault_path"]).parent / "wiki.md"
+    assert not employee_wiki.exists() and not Path(status["vault_path"]).exists()
+    employee_wiki.write_text("LOCAL_EMPLOYEE_WIKI_ONLY", encoding="utf-8")
+    custom = run(["vault-status", "--vault", str(tmp_path / "custom" / "profile.enc"),
+                  "--key-file", str(tmp_path / "custom-key")])
+    assert custom["wiki_path"] == str(tmp_path / "custom" / "wiki.md")
+    assert not (tmp_path / "custom").exists()
+
+    tasks = private(tmp_path / "tasks")
+    collector_wiki = tasks / "wiki.md"
+    collector_wiki.write_text("LOCAL_COLLECTOR_WIKI_ONLY", encoding="utf-8")
+    notes = "仅统一订房时填写。\n- 自行安排住宿可留空。"
+    request, task_dir = make_request(tmp_path, [
+        {"id": "name", "label": "姓名", "type": "text", "required": True},
+        {"id": "room_type", "label": "房型偏好", "type": "text", "required": False, "notes": notes},
+    ])
+    for command in (["list-tasks", str(tasks)], ["status", str(task_dir)]):
+        args = collector.build_parser().parse_args(command)
+        assert args.func(args)["wiki_path"] == str(collector_wiki)
+    info = run(["inspect", str(request)])
+    assert info["fields"][1]["notes"] == notes
+    assert "notes" not in info["fields"][0]
+    stage(tmp_path, {"name": {"type": "text", "value": "Synthetic Person"}})
+    status = run(["vault-status", "--request", str(request)])
+    assert status["wiki_path"] == str(employee_wiki)
+    confirmation = tmp_path / "private" / "submit.confirm"
+    preview = run(["vault-preview", str(request), "--confirmation-out", str(confirmation)])
+    assert preview["ready"] and preview["optional_missing"] == ["room_type"]
+    incoming = private(tmp_path / "incoming")
+    submitted = run(["vault-fill", str(request), "--confirmation", str(confirmation), "--out-dir", str(incoming)])
+    exported = collector.collect_task(task_dir, incoming, tmp_path / "result.xlsx")
+    assert exported["rows"] == 1
+    for marker in ("LOCAL_EMPLOYEE_WIKI_ONLY", "LOCAL_COLLECTOR_WIKI_ONLY"):
+        assert marker not in request.read_text(encoding="utf-8")
+        assert marker not in Path(submitted["out"]).read_text(encoding="utf-8")
+        assert marker not in json.dumps([status, info, preview, exported])
+    assert employee_wiki.read_text(encoding="utf-8") == "LOCAL_EMPLOYEE_WIKI_ONLY"
+    assert collector_wiki.read_text(encoding="utf-8") == "LOCAL_COLLECTOR_WIKI_ONLY"
+
+    form = fill.load_form(request)
+    form["fields"][1]["required"] = True
+    # Advisory notes cannot exempt a structurally required field.
+    _, errors = fill._check_values(form, {"name": "Synthetic Person"})
+    assert errors
+    changed = json.loads(request.read_text(encoding="utf-8"))
+    changed["fields"][1]["notes"] = "changed note"
+    request.write_text(json.dumps(changed, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(fill.FillError, match="schema_hash"):
+        fill.load_form(request)
+
+
+@pytest.mark.parametrize("notes", [None, {}, [], 12, "x" * 2001, "bad\x00note"])
+def test_field_notes_reject_invalid_text(notes):
+    with pytest.raises(ValueError, match="notes"):
+        fill.collection.validate_field_definitions([
+            {"id": "name", "label": "姓名", "type": "text", "required": True, "notes": notes},
+        ])

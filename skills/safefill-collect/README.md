@@ -4,6 +4,8 @@ HR 说明用途、字段、截止时间和联系人，Agent 生成请求包，�
 
 完整指令见 [SKILL.md](SKILL.md)，格式和边界见随包携带的 [PROTOCOL.md](references/PROTOCOL.md)，字段定义见 [collection-config.md](references/collection-config.md)。安装整个 Skill 目录即可，不依赖填写端目录或仓库根文件。
 
+任务总目录可放一份供 Agent 读取的明文 `wiki.md`，记录各用途的业务背景与字段说明。Agent 只选取本次适用内容，将需要对外告知的说明写入请求字段 `notes`，不自动外发整份 Wiki。涉及免填条件时先确认与 `required` 一致；当前备注只供 AI 理解，不提供条件必填引擎。
+
 ```bash
 python scripts/collector.py create-request --config collection.json --out tasks
 python scripts/collector.py list-tasks tasks

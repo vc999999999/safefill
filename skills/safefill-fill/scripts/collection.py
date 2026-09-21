@@ -221,6 +221,8 @@ def validate_field_definitions(raw_fields: Any) -> list[dict[str, Any]]:
             raise ValueError(f"SCHEMA_INVALID: 字段 label 重复: {field['label']}")
         if any(key in field and not isinstance(field[key], bool) for key in ("required", "sensitive")):
             raise ValueError(f"SCHEMA_INVALID: 字段 required/sensitive 必须是布尔值: {field_id}")
+        if "notes" in field and (not isinstance(field["notes"], str) or len(field["notes"]) > 2000 or ILLEGAL_XML_RE.search(field["notes"])):
+            raise ValueError(f"SCHEMA_INVALID: 字段 notes 必须是不超过 2000 字符且无非法控制字符的文本: {field_id}")
         if field_type == "single_choice":
             options = field.get("options")
             if not isinstance(options, list) or not (1 <= len(options) <= MAX_OPTIONS) or any(not isinstance(value, str) or not value or len(value) > MAX_LABEL_CHARS or ILLEGAL_XML_RE.search(value) for value in options) or len(set(options)) != len(options):

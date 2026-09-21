@@ -4,6 +4,8 @@
 
 完整指令见 [SKILL.md](SKILL.md)，格式和边界见随包携带的 [PROTOCOL.md](references/PROTOCOL.md)。安装整个 Skill 目录即可，不依赖收集端目录或仓库根文件。
 
+可在 `vault-status` 返回的 `wiki_path` 保存业务背景和填写偏好。该 `wiki.md` 位于保险柜同目录，是允许 Agent 读取的明文备注，不是加密资料；Agent 结合本次目的和请求字段备注理解，不自动发给收集者，也不能用备注豁免必填校验。
+
 核心环境需要 Python 3.11–3.13。在 Skill 目录内，用所选环境的 Python 安装和检查：
 
 ```bash

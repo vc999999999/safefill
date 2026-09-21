@@ -15,6 +15,8 @@ SafeFill 是一对协作收集资料的 Agent Skills：HR Agent 把需求变成�
 
 Agent 负责需求理解、字段语义、命令编排与结果说明；确定性脚本负责加密、签名、修订选择、校验和确认绑定。通用环境准备、文件操作与获授权的发送交给宿主已有能力；没有网站、后台、账号或名单系统。
 
+两端支持可选本地 `wiki.md`：收集端放在任务总目录，填写端放在保险柜文件同目录。它是供各自 Agent 读取的明文业务备注，不在加密保险柜内部，不保存具体敏感值。Agent 按本次目的选用内容，仅在本人要求时维护；收集端可把选定的字段说明写入请求的 `fields[].notes`，填写端 `inspect` 会展示，原始 Wiki 不自动外发。备注不改变必填规则，冲突先澄清，不新增条件规则引擎。
+
 ## 工作流程
 
 1. HR 说明用途、字段、期限和联系人。收集 Agent 补齐缺失需求，使用[标准字段 ID](skills/safefill-collect/references/collection-config.md)生成 `REQUEST-{task_id}.yintian-request`，交 HR 或获授权的宿主工具原样转发。
@@ -70,6 +72,7 @@ Windows 使用 `.venv\Scripts\python.exe`。对话核心流程不需要 OCR/VLM 
 | `RECEIPT-{invite_id}-{revision}-{随机6位}.yintian` | 由员工本人交给 HR，内容加密 |
 | `vault.yintian-vault`、`vault.key`、确认凭据、本机登记 | 员工本机，不交给 HR 或贴入对话 |
 | 文本补录源文件、`REVIEW-*.txt` | 员工本机明文，本人自行查看；Agent 不读取，源文件由本人保管或删除 |
+| 两端各自的 `wiki.md` | 本地明文业务背景与偏好，允许各自 Agent 读取，不自动打包或同步 |
 | `result.xlsx`、同名附件目录 | 获授权的 HR 本机，Agent 不读取内容 |
 | HR 数据库、私钥与解密密钥 | HR 本机；跨设备只通过加密任务包交接 |
 

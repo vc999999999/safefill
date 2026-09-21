@@ -11,6 +11,18 @@
 
 Agent 自动补齐：`title` 从用途概括，`name` 设为必填，`retention_until` 默认为截止后 30 天，`correction` 默认为联系任务联系人后重新提交，`template_version` 为 `1.0`。完成后必须调用 `create-request`；不得把配置直接交给 HR，也不得生成 HTML 表单。
 
+## Wiki 与字段说明
+
+任务总目录的 `wiki.md` 可记录各用途的业务背景和惯例。Agent 按本次目的选取相关内容；仅把适合对外告知的整体背景写入 `purpose`，字段说明写入 `notes`，不自动附送整份 Wiki。`notes` 为可选 Markdown 文本，最多 2000 字符，随字段摘要校验并由填写端 `inspect` 展示。具体存储与隐私约定见 [PROTOCOL.md](PROTOCOL.md)。
+
+例如 HR 明确同意房型字段按说明自愿填写时：
+
+```json
+{"id":"room_type","label":"房型偏好","type":"text","required":false,"notes":"仅统一订房时填写；自行安排住宿可留空。"}
+```
+
+这里脚本对所有人都允许留空，AI 根据备注引导，不会判定是否统一订房。如果 HR 要求“订房者必须填、自理者免填”的强制条件校验，先说明当前版本不支持，不擅自弱化成可选字段。`required:true` 与“可以留空”的备注矛盾时，发包前请 HR 澄清；已发布请求需由收集方按澄清结果重新生成，不能让填写者修改原包。
+
 ## 时间必须带时区
 
 `deadline` 与 `retention_until` 必须是带时区偏移的 ISO 时间，例如 `2026-10-01T18:00:00+08:00`。纯日期（`2026-10-01`）或无时区时间会被 `create-request` 以 `TIME_ZONE_REQUIRED` 拒绝：不同机器会把它理解成不同时刻，员工 Agent 转述的截止时间会与 HR 本意相差数小时。HR 只说"10 月 1 日"时，Agent 按 HR 所在时区补成当天 18:00 或 23:59 并在转述时说明。
