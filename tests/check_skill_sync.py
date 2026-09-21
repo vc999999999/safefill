@@ -8,6 +8,7 @@ README「共享模块同步」）。本脚本既可直接运行，也可作为 p
 """
 from __future__ import annotations
 
+import io
 import re
 import sys
 from pathlib import Path
@@ -63,6 +64,8 @@ def test_shared_modules_in_sync():
 
 
 def main() -> int:
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(encoding="utf-8")
     problems = find_out_of_sync()
     if problems:
         for name, reason in problems:

@@ -14,7 +14,9 @@ import install  # noqa: E402
 
 def test_built_packages_install_without_repository_and_refuse_overwrite(tmp_path):
     out = tmp_path / "packages"
-    subprocess.run([sys.executable, str(ROOT / "tools/build_skills.py"), "--out", str(out)], check=True)
+    subprocess.run([sys.executable, str(ROOT / "tools/build_skills.py"), "--out", str(out)], check=True,
+                   capture_output=True, text=True, encoding="utf-8",
+                   env={**os.environ, "PYTHONIOENCODING": "cp1252"})
     for role in ("fill", "collect"):
         package = out / f"safefill-{role}.skill"
         with zipfile.ZipFile(package) as archive:
